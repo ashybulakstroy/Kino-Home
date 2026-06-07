@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>HomeKino</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#111;color:#eee;min-height:100vh;display:flex;flex-direction:column}
+.header{background:#1a1a2e;padding:14px 20px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #333}
+.header h1{font-size:20px;color:#e94560}
+.header a{color:#888;text-decoration:none;font-size:14px;margin-left:auto}
+.header a:hover{color:#fff}
+.player-wrap{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+video{max-width:100%;max-height:80vh;border-radius:4px;background:#000;box-shadow:0 0 40px rgba(0,0,0,.5);width:100%}
+video:not([src]){width:0;height:0;position:absolute;opacity:0}
+.info{text-align:center;margin-bottom:20px}
+.info h2{font-size:18px;color:#ccc;font-weight:400}
+.progress-wrap{width:100%;max-width:600px;margin-top:16px;text-align:center}
+.progress-bar{width:100%;height:6px;background:#333;border-radius:3px;overflow:hidden}
+.progress-fill{height:100%;background:#e94560;border-radius:3px;transition:width .3s}
+.progress-text{font-size:13px;color:#888;margin-top:6px}
+.status-msg{font-size:15px;color:#e94560;margin-top:10px}
+.error-msg{font-size:15px;color:#f55;margin-top:10px}
+.buffering{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#888;font-size:24px;z-index:5}
+.video-container{position:relative;display:inline-block;width:100%;max-width:900px}
+.play-overlay{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:64px;color:#fff;cursor:pointer;background:rgba(0,0,0,.3);z-index:10;transition:opacity .3s}
+.play-overlay:hover{background:rgba(0,0,0,.5)}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>HomeKino</h1>
+<a href="/">Каталог</a>
+</div>
+<div class="player-wrap">
+<div class="info">
+<h2 id="movie-title">Загрузка...</h2>
+</div>
+<div class="video-container">
+<div id="buffering" class="buffering hidden">⏳ Буферизация...</div>
+<div id="play-overlay" class="play-overlay hidden" onclick="startPlayback()">▶</div>
+<video id="player" controls autoplay></video>
+</div>
+<div id="progress-area" class="progress-wrap">
+<div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width:0%"></div></div>
+<div id="progress-text" class="progress-text">Ожидание начала загрузки...</div>
+<div id="status-msg" class="status-msg"></div>
+<div id="error-msg" class="error-msg"></div>
+</div>
+</div>
+
+<script>
+const player = document.getElementById('player');
+const buffering = document.getElementById('buffering');
+const playOverlay = document.getElementById('play-overlay');
+const progressFill = document.getElementById('progress-fill');
+const progressText = document.getElementById('progress-text');
+const statusMsg = document.getElementById('status-msg');
+const errorMsg = document.getElementById('error-msg');
+const movieTitle = document.getElementById('movie-title');
+const progressArea = document.getElementById('progress-area');
+
+function startPlayback() {
+    playOverlay.classList.add('hidden');
+    player.muted = false;
+    player.play().catch(() => {});
+}
+
+function formatBytes(b) {
+    if (!b) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(1) + ' ' + u[i];
+}
+
+function formatSpeed(s) {
+    if (!s) return '0 B/s';
+    return formatBytes(s) + '/с';
+}
+
+async function startWatching() {
+    const hash = window.location.hash.replace('#', '');
+    if (!hash) {
+        movieTitle.textContent = 'Перейдите из каталога, чтобы смотреть фильм';
+        return;
+    }
+
+    statusMsg.textContent = 'Загружаю...';
+
+    let pollCount = 0;
+    const poll = setInterval(async () => {
+        try {
+            const resp = await fetch('/status/' + hash);
+            if (!resp.ok) {
+                if (resp.status === 404 && pollCount < 30) {
+                    statusMsg.textContent = 'Ожидание добавления...';
+                    pollCount++;
+                    return;
+                }
+                statusMsg.textContent = 'Торрент не найден. Попробуйте снова.';
+                clearInterval(poll);
+                return;
+            }
+            const s = await resp.json();
+
+            movieTitle.textContent = s.name || 'Без названия';
+            progressFill.style.width = (s.progress * 100) + '%';
+            progressText.textContent = Math.round(s.progress * 100) + '% · '
+                + formatBytes(s.downloaded) + ' / ' + formatBytes(s.total)
+                + ' · ' + formatSpeed(s.download_rate);
+
+            if (s.error) {
+                errorMsg.textContent = s.error;
+                clearInterval(poll);
+                return;
+            }
+
+            if (s.state === 'pending') {
+                statusMsg.textContent = 'Получение метаданных...';
+                pollCount++;
+                return;
+            }
+
+            if (s.ready && !player.src) {
+                statusMsg.textContent = 'Видео готово к показу!';
+                buffering.classList.remove('hidden');
+
+                player.addEventListener('canplay', () => {
+                    buffering.classList.add('hidden');
+                }, { once: true });
+
+                player.addEventListener('playing', () => {
+                    buffering.classList.add('hidden');
+                    playOverlay.classList.add('hidden');
+                    player.muted = false;
+                }, { once: true });
+
+                player.onwaiting = () => buffering.classList.remove('hidden');
+
+                player.onerror = () => {
+                    buffering.classList.add('hidden');
+                    statusMsg.textContent = 'Ошибка воспроизведения. Возможно, видео ещё загружается.';
+                };
+
+                player.src = '/stream/' + hash;
+                progressArea.classList.add('hidden');
+
+                setTimeout(() => {
+                    if (player.paused) {
+                        buffering.classList.add('hidden');
+                        playOverlay.classList.remove('hidden');
+                    }
+                }, 3000);
+
+                clearInterval(poll);
+                return;
+            }
+
+            if (!s.ready) {
+                const pct = Math.round(s.progress * 100);
+                statusMsg.textContent = pct < 5
+                    ? 'Скачиваю начало и конец видео... ' + pct + '%'
+                    : 'Докачка... ' + pct + '%';
+            }
+
+            pollCount++;
+        } catch (e) {
+            if (pollCount > 10) {
+                statusMsg.textContent = 'Ошибка соединения с сервером';
+            }
+        }
+    }, 1500);
+}
+
+startWatching();
+</script>
+</body>
+</html>
