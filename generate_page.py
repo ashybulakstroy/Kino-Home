@@ -980,6 +980,8 @@ td{{padding:12px 16px;font-size:14px;vertical-align:middle}}
 .bm{{font-size:16px;text-decoration:none;color:#333}}
 .wb{{display:inline-block;padding:3px 10px;font-size:11px;font-weight:700;color:#fff;background:#e94560;border:none;border-radius:4px;cursor:pointer;white-space:nowrap;vertical-align:middle}}
 .wb:hover{{background:#d63850}}
+button.wb[data-container="avi"]{{background:#2563eb}}
+button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
 .eb{{display:inline-block;padding:2px 6px;font-size:12px;font-weight:700;color:#fff;background:#7c4dff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap;vertical-align:middle;line-height:1.4}}
 .eb:hover{{background:#651fff}}
 .eb:disabled{{opacity:.4;cursor:wait}}
