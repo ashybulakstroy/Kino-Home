@@ -28,7 +28,7 @@ TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
 MAX_TOPICS = 100
 PAGE_SIZE = 50
 
-DATA_DIR = "data"
+DATA_DIR = os.environ.get("LOCAL_KINO_DATA_DIR", "data")
 RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 RATINGS_CACHE = os.path.join(DATA_DIR, "imdb_ratings_cache.json")

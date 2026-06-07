@@ -6,6 +6,7 @@ import json
 import mimetypes
 import threading
 import subprocess
+import shutil
 from datetime import date
 from flask import Flask, request, Response, jsonify, send_file, abort, redirect
 
@@ -47,6 +48,17 @@ _daily_refresh_lock = threading.Lock()
 _daily_refresh_started = False
 DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
 DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
+REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
+REFRESH_FILES = [
+    'torrents_data.json',
+    'imdb_basics_cache.json',
+    'imdb_ratings_cache.json',
+    'imdb_search_cache.json',
+    'kp_search_cache.json',
+    'youtube_cache.json',
+    'index-kino.html',
+]
+REFRESH_DIRS = ['posters', 'topic_cache']
 
 
 def _today_stamp() -> str:
@@ -64,13 +76,45 @@ def _write_daily_refresh_stamp():
     atomic_write_text(DAILY_REFRESH_STAMP, _today_stamp())
 
 
+def _copy_existing_refresh_data(staging_dir):
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    for name in REFRESH_FILES:
+        src = DATA_DIR / name
+        if src.exists():
+            shutil.copy2(src, staging_dir / name)
+    for name in REFRESH_DIRS:
+        src = DATA_DIR / name
+        if src.exists():
+            shutil.copytree(src, staging_dir / name, dirs_exist_ok=True)
+
+
+def _publish_staging_refresh(staging_dir):
+    for name in REFRESH_DIRS:
+        src = staging_dir / name
+        dst = DATA_DIR / name
+        if src.exists():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+    for name in REFRESH_FILES:
+        src = staging_dir / name
+        dst = DATA_DIR / name
+        if src.exists():
+            with file_lock(dst):
+                os.replace(src, dst)
+
+
 def _run_refresh_process():
+    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+    env = os.environ.copy()
+    env['LOCAL_KINO_DATA_DIR'] = str(REFRESH_STAGING_DIR)
     return subprocess.Popen(
         [sys.executable, 'generate_page.py', '--refresh'],
         cwd=str(BASE_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
 
 
@@ -92,6 +136,7 @@ def _run_daily_refresh_if_due(reason: str = 'timer'):
             print(line, end='')
         code = proc.wait()
         if code == 0:
+            _publish_staging_refresh(REFRESH_STAGING_DIR)
             _write_daily_refresh_stamp()
             print(f'Автообновление: готово, метка {_today_stamp()}')
         else:
@@ -559,6 +604,7 @@ def refresh():
                 yield line
             code = proc.wait()
             if code == 0:
+                _publish_staging_refresh(REFRESH_STAGING_DIR)
                 _write_daily_refresh_stamp()
                 yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
             else:
