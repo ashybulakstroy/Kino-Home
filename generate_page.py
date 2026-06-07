@@ -21,6 +21,7 @@ COLLECTIONS = {
     'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22'},
     'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540'},
     'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252'},
+    'forum_1247':          {'name': 'Раздел f=1247',                   'url': 'https://rutracker.net/forum/viewforum.php?f=1247'},
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
