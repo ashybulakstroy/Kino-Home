@@ -205,9 +205,9 @@ def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
 
         keep = []
         for topic in topics:
-            topic_date = _parse_topic_date(topic.get('date_str', ''))
+            topic_date = _parse_topic_date(topic.get('added_at', ''))
             if not topic_date:
-                topic['date_str'] = now_text
+                topic['added_at'] = now_text
                 dated_topics += 1
                 keep.append(topic)
             elif topic_date < cutoff:

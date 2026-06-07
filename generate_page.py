@@ -49,6 +49,11 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
+
+def now_text():
+    return datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
 GENRE_TRANSLATION = {
     'Action': 'боевик', 'Adventure': 'приключения', 'Animation': 'мультфильм',
     'Biography': 'биография', 'Comedy': 'комедия', 'Crime': 'криминал',
@@ -667,6 +672,7 @@ def parse_forum_page(html, collection='nashe_kino'):
             'seeders': seeders,
             'leechers': leechers,
             'date_str': date_str,
+            'added_at': now_text(),
             'topic_url': TOPIC_URL_T.format(topic_id),
             'magnet': '',
             'imdb_id': None,
