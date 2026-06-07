@@ -62,10 +62,14 @@ GENRE_TRANSLATION = {
     'кинофантазия': 'фантастика',
 }
 GENRE_STOP = {'Betacam SP', 'DVDRemux', 'DVD', 'DVB', 'SATRip', 'TVRip', 'HDRip',
-              'WEB-DL', 'WEBRip', 'BDRip', 'AVI', 'MKV', 'MP4', 'Россия', 'Украина',
-              'США', 'Великобритания', 'Франция', 'Германия',
-              'ужасы', 'эротика', 'порно', 'для взрослых', 'взрослый',
-              'horror', 'erotica', 'porn', 'adult'}
+              'WEB-DL', 'WEBRip', 'BDRip', 'AVI', 'MKV', 'MP4'}
+COUNTRY_STOP = {'Россия', 'Украина', 'США', 'Великобритания', 'Франция', 'Германия',
+                'Ирландия', 'Испания', 'Канада', 'ОАЭ', 'Казахстан', 'Кыргызстан',
+                'Беларусь', 'Эстония', 'Грузия', 'Латвия', 'Литва', 'Армения',
+                'Азербайджан', 'Узбекистан', 'Таджикистан', 'Молдова', 'Польша',
+                'Италия', 'Швеция', 'Норвегия', 'Дания', 'Нидерланды', 'Бельгия',
+                'Австралия', 'Новая Зеландия', 'Китай', 'Япония', 'Корея',
+                'Индия', 'Турция', 'Мексика', 'Бразилия', 'Аргентина'}
 HIDDEN_GENRES = {'ужасы', 'эротика', 'порно', 'для взрослых', 'взрослый',
                  'horror', 'erotica', 'porn', 'adult'}
 
@@ -141,7 +145,7 @@ def parse_size(text):
 
 def parse_rutracker_title(raw):
     t = raw.strip()
-    suffix_parts = re.split(r'\s+(?<!\w)(Original|Rus|Sub|Line|AVC|HEVC|MEGA|PRoFX|HDTV)(?!\w)\s*', t, maxsplit=1, flags=re.I)
+    suffix_parts = re.split(r'\s+(?<!\w)(Original|Rus|Sub|Line|MEGA|PRoFX|HDTV)(?!\w)\s*', t, maxsplit=1, flags=re.I)
     t = suffix_parts[0].strip()
 
     year = ''
@@ -165,7 +169,7 @@ def parse_rutracker_title(raw):
                 year = p
             elif quality_keywords.match(p):
                 quality_parts.append(p)
-            elif p in GENRE_STOP:
+            elif p.lower() in {s.lower() for s in GENRE_STOP | COUNTRY_STOP}:
                 continue
             else:
                 genre_parts.append(p)
@@ -856,7 +860,8 @@ def generate_html(topics):
             poster = f"data/{poster}"
         cast_str = t.get('cast', '') or ''
         raw_genre = t.get('genre', '') or ''
-        if any(h in raw_genre.lower() for h in HIDDEN_GENRES):
+        hidden_source = f"{raw_genre} {t.get('title', '')}".lower()
+        if any(h in hidden_source for h in HIDDEN_GENRES):
             continue
         genre = clean_and_translate_genre(raw_genre)
         cont = t.get('format') or ''
