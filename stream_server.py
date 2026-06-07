@@ -6,6 +6,7 @@ import json
 import mimetypes
 import threading
 import subprocess
+from datetime import date
 from flask import Flask, request, Response, jsonify, send_file, abort, redirect
 
 from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES
@@ -42,6 +43,77 @@ _session_monitor_started = False
 
 _enrich_status: dict[str, str] = {}
 _enrich_lock = threading.Lock()
+_daily_refresh_lock = threading.Lock()
+_daily_refresh_started = False
+DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
+DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
+
+
+def _today_stamp() -> str:
+    return date.today().isoformat()
+
+
+def _daily_refresh_due() -> bool:
+    try:
+        return DAILY_REFRESH_STAMP.read_text('utf-8').strip() != _today_stamp()
+    except FileNotFoundError:
+        return True
+
+
+def _write_daily_refresh_stamp():
+    atomic_write_text(DAILY_REFRESH_STAMP, _today_stamp())
+
+
+def _run_refresh_process():
+    return subprocess.Popen(
+        [sys.executable, 'generate_page.py', '--refresh'],
+        cwd=str(BASE_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def _run_daily_refresh_if_due(reason: str = 'timer'):
+    if not _daily_refresh_due():
+        print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+        return
+    if not _daily_refresh_lock.acquire(blocking=False):
+        print('Автообновление: refresh уже выполняется')
+        return
+    try:
+        if not _daily_refresh_due():
+            print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+            return
+        print(f'Автообновление: запускаю refresh ({reason})')
+        proc = _run_refresh_process()
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end='')
+        code = proc.wait()
+        if code == 0:
+            _write_daily_refresh_stamp()
+            print(f'Автообновление: готово, метка {_today_stamp()}')
+        else:
+            print(f'Автообновление: ошибка refresh, код {code}; метка не обновлена')
+    except Exception as e:
+        print(f'Автообновление: ошибка {e}; метка не обновлена')
+    finally:
+        _daily_refresh_lock.release()
+
+
+def _daily_refresh_loop():
+    while True:
+        time.sleep(DAILY_REFRESH_CHECK_SECONDS)
+        _run_daily_refresh_if_due('timer')
+
+
+def _ensure_daily_refresh_loop():
+    global _daily_refresh_started
+    if _daily_refresh_started:
+        return
+    _daily_refresh_started = True
+    threading.Thread(target=_daily_refresh_loop, daemon=True).start()
 ENRICH_QUEUE: list[str] = []
 
 
@@ -475,18 +547,24 @@ def index():
 
 @app.route('/refresh')
 def refresh():
-    import subprocess, sys
     def generate():
+        if not _daily_refresh_lock.acquire(blocking=False):
+            yield '<html><body><h2>Обновление уже выполняется</h2><p><a href="/">Назад</a></p></body></html>'
+            return
         yield '<html><body><h2>Обновляю данные...</h2><pre>'
-        proc = subprocess.Popen(
-            [sys.executable, 'generate_page.py', '--refresh'],
-            cwd=str(BASE_DIR),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        for line in proc.stdout:
-            yield line
-        proc.wait()
-        yield '</pre><p><a href="/">Готово</a></p></body></html>'
+        try:
+            proc = _run_refresh_process()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                yield line
+            code = proc.wait()
+            if code == 0:
+                _write_daily_refresh_stamp()
+                yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
+            else:
+                yield f'</pre><p>Ошибка refresh, код {code}. Метка не обновлена.</p><p><a href="/">Назад</a></p></body></html>'
+        finally:
+            _daily_refresh_lock.release()
     return Response(generate(), content_type='text/html')
 
 
@@ -547,6 +625,7 @@ if __name__ == '__main__':
                 print(f'    - {p}')
         else:
             print('  Всё в порядке, ничего не удалено.')
+        _run_daily_refresh_if_due('startup')
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
@@ -555,4 +634,5 @@ if __name__ == '__main__':
     _ensure_session_monitor()
     _ensure_enrich_worker()
     _ensure_periodic_enrich()
+    _ensure_daily_refresh_loop()
     app.run(host='0.0.0.0', port=port, threaded=True)
