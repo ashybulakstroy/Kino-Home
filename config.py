@@ -28,6 +28,7 @@ _env = _read_env()
 TEMP_DIR = BASE_DIR / _env.get('TEMP_DIR', 'data/temp')
 MAX_TEMP_SIZE_GB = int(_env.get('MAX_TEMP_SIZE_GB', '10'))
 TEMP_MAX_AGE_DAYS = int(_env.get('TEMP_MAX_AGE_DAYS', '7'))
+TOPIC_MAX_AGE_DAYS = int(_env.get('TOPIC_MAX_AGE_DAYS', '90'))
 MAX_TEMP_SIZE_BYTES = MAX_TEMP_SIZE_GB * (1024 ** 3)
 TEMP_MAX_AGE_SECS = TEMP_MAX_AGE_DAYS * 86400
 MAX_TEMP_FILES = int(_env.get('MAX_TEMP_FILES', '5'))

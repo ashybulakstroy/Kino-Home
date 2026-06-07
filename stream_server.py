@@ -7,10 +7,10 @@ import mimetypes
 import threading
 import subprocess
 import shutil
-from datetime import date
+from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, abort, redirect
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -159,6 +159,96 @@ def _ensure_daily_refresh_loop():
         return
     _daily_refresh_started = True
     threading.Thread(target=_daily_refresh_loop, daemon=True).start()
+
+
+def _parse_topic_date(value: str):
+    if not value:
+        return None
+    value = str(value).strip()
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _poster_file_from_url(poster_url: str):
+    if not poster_url:
+        return None
+    poster_url = str(poster_url).replace('\\', '/')
+    marker = 'posters/'
+    if marker not in poster_url:
+        return None
+    filename = poster_url.rsplit(marker, 1)[-1].split('?', 1)[0].split('#', 1)[0]
+    if not filename or '/' in filename or '..' in filename:
+        return None
+    return DATA_DIR / 'posters' / filename
+
+
+def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
+    if max_age_days <= 0:
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0}
+    data_path = DATA_DIR / 'torrents_data.json'
+    if not data_path.exists():
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0}
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    removed = []
+    with file_lock(data_path):
+        try:
+            topics = json.loads(data_path.read_text('utf-8'))
+        except Exception:
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0}
+
+        keep = []
+        for topic in topics:
+            topic_date = _parse_topic_date(topic.get('date_str', ''))
+            if topic_date and topic_date < cutoff:
+                removed.append(topic)
+            else:
+                keep.append(topic)
+
+        if not removed:
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0}
+
+        atomic_write_json_unlocked(data_path, keep)
+        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(keep))
+
+    used_posters = {
+        str(t.get('poster_url') or '').replace('\\', '/')
+        for t in keep
+        if t.get('poster_url')
+    }
+    removed_cache = 0
+    removed_posters = 0
+    for topic in removed:
+        topic_id = str(topic.get('topic_id') or '').strip()
+        if topic_id:
+            cache_path = DATA_DIR / 'topic_cache' / f'{topic_id}.html'
+            try:
+                if cache_path.exists():
+                    cache_path.unlink()
+                    removed_cache += 1
+            except OSError:
+                pass
+
+        poster_url = str(topic.get('poster_url') or '').replace('\\', '/')
+        if poster_url and poster_url not in used_posters:
+            poster_path = _poster_file_from_url(poster_url)
+            try:
+                if poster_path and poster_path.exists():
+                    poster_path.unlink()
+                    removed_posters += 1
+            except OSError:
+                pass
+
+    return {
+        'removed_topics': len(removed),
+        'removed_cache': removed_cache,
+        'removed_posters': removed_posters,
+        'max_age_days': max_age_days,
+    }
 ENRICH_QUEUE: list[str] = []
 
 
@@ -617,7 +707,8 @@ def refresh():
 @app.route('/cleanup')
 def cleanup_trigger():
     removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
-    return jsonify(removed=removed, count=len(removed))
+    topics = cleanup_old_topics()
+    return jsonify(removed=removed, count=len(removed), topics=topics)
 
 
 @app.route('/torrents_data.json')
@@ -671,6 +762,14 @@ if __name__ == '__main__':
                 print(f'    - {p}')
         else:
             print('  Всё в порядке, ничего не удалено.')
+        topic_cleanup = cleanup_old_topics()
+        if topic_cleanup.get('removed_topics'):
+            print('Очистка старых тем:')
+            print(f'  Тем: {topic_cleanup["removed_topics"]}')
+            print(f'  Кешей: {topic_cleanup["removed_cache"]}')
+            print(f'  Постеров: {topic_cleanup["removed_posters"]}')
+        else:
+            print(f'Старых тем старше {TOPIC_MAX_AGE_DAYS} дней нет.')
         _run_daily_refresh_if_due('startup')
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()

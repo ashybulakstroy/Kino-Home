@@ -42,3 +42,5 @@ python stream_server.py
 - `data/*_cache.json`, `data/torrents_data.json`, `data/index-kino.html` - кеши и сгенерированный каталог.
 
 Перед запуском сервера проверь размер `data/temp/`: при превышении `MAX_TEMP_SIZE_GB` сервер может удалить старые файлы из этой папки.
+
+`TOPIC_MAX_AGE_DAYS` задаёт возраст тем в днях. При housekeeping сервер удаляет из каталога темы старше этого возраста, их topic-cache и неиспользуемые постеры.
