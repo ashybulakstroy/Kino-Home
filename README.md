@@ -36,9 +36,9 @@ python stream_server.py
 
 Эти файлы и папки генерируются локально и не попадают в git:
 
-- `temp/` - временные скачанные видео.
-- `posters/` - постеры.
-- `topic_cache/` - кеш страниц rutracker.
-- `*_cache.json`, `torrents_data.json`, `index-kino.html` - кеши и сгенерированный каталог.
+- `data/temp/` - временные скачанные видео.
+- `data/posters/` - постеры.
+- `data/topic_cache/` - кеш страниц rutracker.
+- `data/*_cache.json`, `data/torrents_data.json`, `data/index-kino.html` - кеши и сгенерированный каталог.
 
-Перед запуском сервера проверь размер `temp/`: при превышении `MAX_TEMP_SIZE_GB` сервер может удалить старые файлы из этой папки.
+Перед запуском сервера проверь размер `data/temp/`: при превышении `MAX_TEMP_SIZE_GB` сервер может удалить старые файлы из этой папки.

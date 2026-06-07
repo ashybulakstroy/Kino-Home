@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / 'data'
 ENV_FILE = BASE_DIR / '.env'
 
 
@@ -24,7 +25,7 @@ def _read_env():
 _env = _read_env()
 
 
-TEMP_DIR = BASE_DIR / _env.get('TEMP_DIR', 'temp')
+TEMP_DIR = BASE_DIR / _env.get('TEMP_DIR', 'data/temp')
 MAX_TEMP_SIZE_GB = int(_env.get('MAX_TEMP_SIZE_GB', '10'))
 TEMP_MAX_AGE_DAYS = int(_env.get('TEMP_MAX_AGE_DAYS', '7'))
 MAX_TEMP_SIZE_BYTES = MAX_TEMP_SIZE_GB * (1024 ** 3)

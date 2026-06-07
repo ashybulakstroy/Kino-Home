@@ -28,17 +28,19 @@ TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
 MAX_TOPICS = 100
 PAGE_SIZE = 50
 
+DATA_DIR = "data"
 RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
-RATINGS_CACHE = "imdb_ratings_cache.json"
-BASICS_CACHE = "imdb_basics_cache.json"
-SEARCH_CACHE = "imdb_search_cache.json"
-KP_SEARCH_CACHE = "kp_search_cache.json"
-YOUTUBE_CACHE = "youtube_cache.json"
-OUTPUT_FILE = "index-kino.html"
-TORRENTS_CACHE = "torrents_data.json"
-POSTERS_DIR = "posters"
-TOPIC_CACHE_DIR = "topic_cache"
+RATINGS_CACHE = os.path.join(DATA_DIR, "imdb_ratings_cache.json")
+BASICS_CACHE = os.path.join(DATA_DIR, "imdb_basics_cache.json")
+SEARCH_CACHE = os.path.join(DATA_DIR, "imdb_search_cache.json")
+KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
+YOUTUBE_CACHE = os.path.join(DATA_DIR, "youtube_cache.json")
+OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
+TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
+POSTERS_DIR = os.path.join(DATA_DIR, "posters")
+POSTERS_URL = "data/posters"
+TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -514,15 +516,17 @@ def download_poster(imdb_id, url):
     if not imdb_id or not url:
         return ''
     os.makedirs(POSTERS_DIR, exist_ok=True)
-    local_path = f"{POSTERS_DIR}/{imdb_id}.jpg"
+    filename = f"{imdb_id}.jpg"
+    local_path = os.path.join(POSTERS_DIR, filename)
+    poster_path = f"{POSTERS_URL}/{filename}"
     if os.path.exists(local_path):
-        return local_path
+        return poster_path
     try:
         r = SESSION.get(url, timeout=15)
         if r.status_code == 200:
             with open(local_path, 'wb') as f:
                 f.write(r.content)
-            return local_path
+            return poster_path
     except Exception:
         pass
     return url
@@ -722,15 +726,17 @@ def download_rutracker_poster(topic_id, url):
     if not topic_id or not url:
         return ''
     os.makedirs(POSTERS_DIR, exist_ok=True)
-    local_path = f"{POSTERS_DIR}/{topic_id}.jpg"
+    filename = f"{topic_id}.jpg"
+    local_path = os.path.join(POSTERS_DIR, filename)
+    poster_path = f"{POSTERS_URL}/{filename}"
     if os.path.exists(local_path):
-        return local_path
+        return poster_path
     try:
         r = SESSION.get(url, timeout=15)
         if r.status_code == 200:
             with open(local_path, 'wb') as f:
                 f.write(r.content)
-            return local_path
+            return poster_path
     except Exception:
         pass
     return url
@@ -846,6 +852,8 @@ def generate_html(topics):
         clean_t = escape(t['movie_title'].lower().strip())
 
         poster = t.get('poster_url', '') or ''
+        if poster.startswith('posters/'):
+            poster = f"data/{poster}"
         cast_str = t.get('cast', '') or ''
         raw_genre = t.get('genre', '') or ''
         if any(h in raw_genre.lower() for h in HIDDEN_GENRES):

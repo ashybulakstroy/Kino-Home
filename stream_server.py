@@ -8,7 +8,7 @@ import threading
 import subprocess
 from flask import Flask, request, Response, jsonify, send_file, abort, redirect
 
-from config import BASE_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -56,7 +56,7 @@ def _enrich_worker():
         if not topic_id:
             continue
         try:
-            data_path = BASE_DIR / 'torrents_data.json'
+            data_path = DATA_DIR / 'torrents_data.json'
             if not data_path.exists():
                 with _enrich_lock:
                     _enrich_status[topic_id] = 'error: no data'
@@ -70,7 +70,7 @@ def _enrich_worker():
                     continue
                 gp.enrich_topic(topic)
                 atomic_write_json_unlocked(data_path, topics)
-                gen_path = BASE_DIR / 'index-kino.html'
+                gen_path = DATA_DIR / 'index-kino.html'
                 html = gp.generate_html(topics)
                 atomic_write_text(gen_path, html)
             with _enrich_lock:
@@ -86,7 +86,7 @@ def _ensure_enrich_worker():
 
 
 def _enrich_missing(force: bool = False):
-    data_path = BASE_DIR / 'torrents_data.json'
+    data_path = DATA_DIR / 'torrents_data.json'
     if not data_path.exists():
         return
     try:
@@ -124,7 +124,7 @@ def _enrich_missing(force: bool = False):
                     print(f'    -> ещё не все данные')
             if changed:
                 atomic_write_json_unlocked(data_path, topics)
-                gen_path = BASE_DIR / 'index-kino.html'
+                gen_path = DATA_DIR / 'index-kino.html'
                 atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
                 print(f'  [enrich] сохранено ({sum(1 for t in topics if not t.get("_enrich_retries"))}/{len(topics)} готово)')
     except Exception:
@@ -463,7 +463,7 @@ def player():
 
 @app.route('/')
 def index():
-    index_path = BASE_DIR / 'index-kino.html'
+    index_path = DATA_DIR / 'index-kino.html'
 
     if not index_path.exists():
         return '<h1>HomeKino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
@@ -498,7 +498,7 @@ def cleanup_trigger():
 
 @app.route('/torrents_data.json')
 def torrents_data():
-    return send_file(str(BASE_DIR / 'torrents_data.json'))
+    return send_file(str(DATA_DIR / 'torrents_data.json'))
 
 
 @app.route('/enrich/all', methods=['POST'])

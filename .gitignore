@@ -7,6 +7,9 @@ __pycache__/
 *.tmp
 logs/
 
+data/*
+!data/.gitkeep
+
 temp/
 posters/
 topic_cache/
