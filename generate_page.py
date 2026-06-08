@@ -42,6 +42,7 @@ POSTERS_DIR = os.path.join(DATA_DIR, "posters")
 POSTERS_URL = "data/posters"
 POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.jpg"
 POSTER_RETRY_DAYS = 7
+UNRELIABLE_POSTER_HOSTS = ('lostpic.net',)
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
 
 HEADERS = {
@@ -783,6 +784,19 @@ def is_external_poster_url(poster_url):
     return poster_url.startswith('http://') or poster_url.startswith('https://')
 
 
+def is_unreliable_poster_url(poster_url):
+    poster_url = (poster_url or '').lower()
+    return any(host in poster_url for host in UNRELIABLE_POSTER_HOSTS)
+
+
+def should_try_unreliable_poster_fallback(topic):
+    return (
+        is_unreliable_poster_url(topic.get('poster_url'))
+        and not has_real_poster(topic)
+        and topic.get('_poster_fallback_failed_at') != today_text()
+    )
+
+
 def has_real_poster(topic):
     poster_url = topic.get('poster_url', '') or ''
     if not poster_url:
@@ -812,10 +826,13 @@ def should_retry_poster(topic):
 
 def mark_poster_failed(topic):
     topic['_poster_failed_at'] = today_text()
+    if is_unreliable_poster_url(topic.get('poster_url')):
+        topic['_poster_fallback_failed_at'] = today_text()
 
 
 def clear_poster_failed(topic):
     topic.pop('_poster_failed_at', None)
+    topic.pop('_poster_fallback_failed_at', None)
 
 
 def localize_existing_poster(topic):
@@ -1241,7 +1258,11 @@ def enrich_topic(topic, force_poster_retry=False):
     if not title:
         return topic
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    retry_poster = force_poster_retry or should_retry_poster(topic)
+    retry_poster = (
+        force_poster_retry
+        or should_retry_poster(topic)
+        or should_try_unreliable_poster_fallback(topic)
+    )
 
     if not has_real_poster(topic) and retry_poster:
         localize_existing_poster(topic)
