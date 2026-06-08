@@ -25,7 +25,7 @@ COLLECTIONS = {
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
-MAX_TOPICS = 100
+MAX_TOPICS = 30
 PAGE_SIZE = 50
 
 DATA_DIR = os.environ.get("LOCAL_KINO_DATA_DIR", "data")
@@ -786,6 +786,18 @@ def fetch_magnets(topics):
     return topics
 
 
+def prune_unplayable_topics(topics):
+    playable = [t for t in topics if t.get('magnet')]
+    removed = len(topics) - len(playable)
+    if removed:
+        print(f"  Удалено тем без magnet: {removed}")
+    return playable
+
+
+def clean_catalog_topics(topics):
+    return prune_unplayable_topics(topics)
+
+
 def enrich(topics, ratings, basics):
     total = len(topics)
     yt_cache = load_json(YOUTUBE_CACHE) or {}
@@ -842,6 +854,8 @@ def generate_html(topics):
 <span class="gl">Дата:</span><select class="gs" onchange="af()" id="ds"><option value="0">Все</option><option value="7">Неделя</option><option value="14">2 недели</option><option value="30">Месяц</option><option value="60">2 месяца</option><option value="180">Полгода</option></select></div>'''
 
     for t in topics:
+        if not t.get('magnet'):
+            continue
         rating = t['kp_rating'] or t['imdb_rating'] or '—'
         rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
         rating_cls = ''
@@ -1252,7 +1266,11 @@ def main():
 
     if not refresh and os.path.exists(TORRENTS_CACHE):
         print("Загружаю кеш...")
-        topics = load_json(TORRENTS_CACHE)
+        topics = load_json(TORRENTS_CACHE) or []
+        cleaned_topics = clean_catalog_topics(topics)
+        if len(cleaned_topics) != len(topics):
+            topics = cleaned_topics
+            save_json(TORRENTS_CACHE, topics)
     else:
         print(f"1. Парсинг {coll_info['name']}...")
         all_topics = []
@@ -1346,7 +1364,9 @@ def main():
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} тем...")
                 fetch_magnets(need_fetch)
 
-        topics = merged if not generate_html_only else topics
+        topics = clean_catalog_topics(merged) if not generate_html_only else clean_catalog_topics(topics)
+        topic_ids = {t.get('topic_id') for t in topics}
+        new_topics = [t for t in new_topics if t.get('topic_id') in topic_ids]
         save_json(TORRENTS_CACHE, topics)
 
         if not generate_html_only:

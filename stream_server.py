@@ -307,6 +307,10 @@ def _enrich_missing(force: bool = False):
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
             changed = False
+            cleaned_topics = gp.clean_catalog_topics(topics)
+            if len(cleaned_topics) != len(topics):
+                topics = cleaned_topics
+                changed = True
             MAX_RETRIES = 3
             for topic in topics:
                 need = (not topic.get('magnet') or topic.get('_magnet_failed')
