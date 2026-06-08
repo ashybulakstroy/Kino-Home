@@ -104,18 +104,48 @@ def _publish_staging_refresh(staging_dir):
                 os.replace(src, dst)
 
 
-def _run_refresh_process():
-    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+def _run_refresh_process(collection=None):
     env = os.environ.copy()
     env['LOCAL_KINO_DATA_DIR'] = str(REFRESH_STAGING_DIR)
+    args = [sys.executable, 'generate_page.py', '--refresh']
+    if collection:
+        args.append(f'--collection={collection}')
     return subprocess.Popen(
-        [sys.executable, 'generate_page.py', '--refresh'],
+        args,
         cwd=str(BASE_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
     )
+
+
+def _run_all_collections_refresh():
+    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+    for collection in gp.COLLECTIONS:
+        print(f'Автообновление: коллекция {collection}')
+        proc = _run_refresh_process(collection)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end='')
+        code = proc.wait()
+        if code != 0:
+            return code
+    return 0
+
+
+def _iter_all_collections_refresh_output():
+    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+    for collection in gp.COLLECTIONS:
+        yield f'Автообновление: коллекция {collection}\n'
+        proc = _run_refresh_process(collection)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            yield line
+        code = proc.wait()
+        if code != 0:
+            return code
+    return 0
 
 
 def _run_daily_refresh_if_due(reason: str = 'timer'):
@@ -130,11 +160,7 @@ def _run_daily_refresh_if_due(reason: str = 'timer'):
             print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
             return
         print(f'Автообновление: запускаю refresh ({reason})')
-        proc = _run_refresh_process()
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end='')
-        code = proc.wait()
+        code = _run_all_collections_refresh()
         if code == 0:
             _publish_staging_refresh(REFRESH_STAGING_DIR)
             _write_daily_refresh_stamp()
@@ -710,11 +736,14 @@ def refresh():
             return
         yield '<html><body><h2>Обновляю данные...</h2><pre>'
         try:
-            proc = _run_refresh_process()
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                yield line
-            code = proc.wait()
+            refresh_output = _iter_all_collections_refresh_output()
+            code = 0
+            while True:
+                try:
+                    yield next(refresh_output)
+                except StopIteration as done:
+                    code = done.value or 0
+                    break
             if code == 0:
                 _publish_staging_refresh(REFRESH_STAGING_DIR)
                 _write_daily_refresh_stamp()

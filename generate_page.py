@@ -1143,9 +1143,7 @@ button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
 .tile-grid{{display:none;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}}
 .tile-card{{border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;transition:box-shadow .2s}}
 .tile-card:hover{{box-shadow:0 2px 12px rgba(0,0,0,.1)}}
-.tile-card .pc{{display:flex;width:100%;aspect-ratio:2/3;align-items:center;justify-content:center;background:#f3f4f6;overflow:hidden}}
-.tps{{width:100%;height:100%;display:block;border-radius:0;object-fit:contain}}
-.tps.small-poster{{width:auto;height:auto;max-width:72%;max-height:72%;border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.18)}}
+.tps{{width:100%;display:block;border-radius:0}}
 .tile-body{{padding:8px 10px}}
 .tile-title{{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}}
 .tile-title:hover{{text-decoration:underline}}
@@ -1234,9 +1232,8 @@ function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].f
 function fh(){{hideSaved('#tbl tbody tr')}}
 function fht(){{hideSaved('.tile-card')}}
 var sx=/(?:\\bhorror\\b|\\b(?:sex|porn|xxx|erotic|adult|nsfw|onlyfans)\\b)/i;
-function markPosterSizes(){{[].forEach.call(document.querySelectorAll('img.tps'),function(img){{function m(){{if(img.naturalWidth&&img.naturalHeight&&(img.naturalWidth<420||img.naturalHeight<620))img.classList.add('small-poster')}}if(img.complete)m();else img.addEventListener('load',m,{{once:true}})}})}}
 function updateStats(){{var rows=Array.from(document.querySelectorAll('#tbl tbody tr')).filter(function(r){{return r.style.display!=='none'}}),total=document.getElementById('stat-total'),rated=document.getElementById('stat-rated');if(total)total.textContent=rows.length;if(rated)rated.textContent=rows.filter(function(r){{return r.getAttribute('data-rated')==='1'}}).length}}
-(function(){{markPosterSizes();var dv=localStorage.getItem('dv');if(dv)document.getElementById('ds').value=dv;af();sortTiles();
+(function(){{var dv=localStorage.getItem('dv');if(dv)document.getElementById('ds').value=dv;af();sortTiles();
 var isTile=localStorage.getItem('tv')==='tile';if(isTile){{document.body.classList.add('tile');document.getElementById('tvb').textContent='Вид: список';sortTiles()}}
 var isMob=localStorage.getItem('mb')==='1';if(isMob){{document.body.classList.add('mobile');document.getElementById('mdb').textContent='🖥'}}}})()
 function tv(){{var b=document.body;b.classList.toggle('tile');var isTile=b.classList.contains('tile');localStorage.setItem('tv',isTile?'tile':'list');document.getElementById('tvb').textContent=isTile?'Вид: список':'Вид: плитка';if(isTile)sortTiles()}}
