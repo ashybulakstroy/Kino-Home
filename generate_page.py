@@ -776,6 +776,11 @@ def normalize_poster_url(poster_url):
     return poster_url
 
 
+def is_external_poster_url(poster_url):
+    poster_url = (poster_url or '').lower()
+    return poster_url.startswith('http://') or poster_url.startswith('https://')
+
+
 def has_real_poster(topic):
     poster_url = topic.get('poster_url', '') or ''
     if not poster_url:
@@ -811,10 +816,22 @@ def clear_poster_failed(topic):
     topic.pop('_poster_failed_at', None)
 
 
+def localize_existing_poster(topic):
+    poster_url = topic.get('poster_url', '') or ''
+    if not is_external_poster_url(poster_url):
+        return False
+    local_url = download_rutracker_poster(topic.get('topic_id'), poster_url)
+    if not local_url:
+        return False
+    topic['poster_url'] = local_url
+    clear_poster_failed(topic)
+    return True
+
+
 def fetch_magnets(topics):
     total = len(topics)
     for i, t in enumerate(topics, 1):
-        if t.get('magnet') and t.get('poster_url'):
+        if t.get('magnet') and has_real_poster(t):
             continue
         if t.get('_magnet_failed'):
             continue
@@ -1213,6 +1230,9 @@ def enrich_topic(topic):
         return topic
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
     retry_poster = should_retry_poster(topic)
+
+    if not has_real_poster(topic) and retry_poster:
+        localize_existing_poster(topic)
 
     if not topic.get('magnet') or topic.get('_magnet_failed'):
         try:

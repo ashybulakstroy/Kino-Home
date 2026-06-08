@@ -323,7 +323,7 @@ def _enrich_missing(force: bool = False):
                 if not need:
                     continue
                 retries = topic.get('_enrich_retries', 0)
-                if not force and retries >= MAX_RETRIES:
+                if not force and retries >= MAX_RETRIES and not poster_due:
                     continue
                 title = topic.get('movie_title') or topic.get('title', '?')
                 print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
