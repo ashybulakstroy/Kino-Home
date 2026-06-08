@@ -315,7 +315,7 @@ def _enrich_missing(force: bool = False):
             for topic in topics:
                 poster_due = (
                     not gp.has_real_poster(topic)
-                    and (gp.should_retry_poster(topic) or gp.should_try_unreliable_poster_fallback(topic))
+                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
                 )
                 rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
                 need = (not topic.get('magnet') or topic.get('_magnet_failed')
@@ -338,7 +338,7 @@ def _enrich_missing(force: bool = False):
                 changed = True
                 poster_still_due = (
                     not gp.has_real_poster(topic)
-                    and (gp.should_retry_poster(topic) or gp.should_try_unreliable_poster_fallback(topic))
+                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
                 )
                 rating_still_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
                 still_missing = (not topic.get('magnet') or topic.get('_magnet_failed')
