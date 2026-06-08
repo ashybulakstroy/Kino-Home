@@ -9,9 +9,12 @@ logs/
 
 data/*
 !data/.gitkeep
+!data/posters/
+data/posters/*
+!data/posters/placeholder.jpg
 
 temp/
-posters/
+/posters/
 topic_cache/
 
 torrents_data.json

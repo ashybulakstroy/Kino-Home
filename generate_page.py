@@ -40,6 +40,8 @@ OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
 POSTERS_DIR = os.path.join(DATA_DIR, "posters")
 POSTERS_URL = "data/posters"
+POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.jpg"
+POSTER_RETRY_DAYS = 7
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
 
 HEADERS = {
@@ -52,6 +54,10 @@ SESSION.headers.update(HEADERS)
 
 def now_text():
     return datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
+def today_text():
+    return datetime.now().date().isoformat()
 
 
 GENRE_TRANSLATION = {
@@ -752,6 +758,63 @@ def download_rutracker_poster(topic_id, url):
     return url
 
 
+def local_poster_path(poster_url):
+    poster_url = (poster_url or '').replace('\\', '/')
+    if poster_url.startswith('data/posters/'):
+        filename = poster_url.rsplit('/', 1)[-1]
+    elif poster_url.startswith('posters/'):
+        filename = poster_url.rsplit('/', 1)[-1]
+    else:
+        return None
+    return os.path.join(POSTERS_DIR, filename)
+
+
+def normalize_poster_url(poster_url):
+    poster_url = (poster_url or '').replace('\\', '/')
+    if poster_url.startswith('posters/'):
+        return f"data/{poster_url}"
+    return poster_url
+
+
+def has_real_poster(topic):
+    poster_url = topic.get('poster_url', '') or ''
+    if not poster_url:
+        return False
+    local_path = local_poster_path(poster_url)
+    if local_path:
+        return os.path.exists(local_path)
+    return True
+
+
+def display_poster_url(topic):
+    poster_url = topic.get('poster_url', '') or ''
+    if not poster_url:
+        return POSTER_PLACEHOLDER_URL
+    local_path = local_poster_path(poster_url)
+    if local_path and not os.path.exists(local_path):
+        return POSTER_PLACEHOLDER_URL
+    return normalize_poster_url(poster_url) or POSTER_PLACEHOLDER_URL
+
+
+def should_retry_poster(topic):
+    failed_at = topic.get('_poster_failed_at')
+    if not failed_at:
+        return True
+    try:
+        failed_date = datetime.strptime(failed_at, '%Y-%m-%d').date()
+    except Exception:
+        return True
+    return datetime.now().date() - failed_date >= timedelta(days=POSTER_RETRY_DAYS)
+
+
+def mark_poster_failed(topic):
+    topic['_poster_failed_at'] = today_text()
+
+
+def clear_poster_failed(topic):
+    topic.pop('_poster_failed_at', None)
+
+
 def fetch_magnets(topics):
     total = len(topics)
     for i, t in enumerate(topics, 1):
@@ -875,9 +938,8 @@ def generate_html(topics):
         trailer_url = t.get('youtube_url') or f"https://www.youtube.com/results?search_query={trailer_q}"
         clean_t = escape(t['movie_title'].lower().strip())
 
-        poster = t.get('poster_url', '') or ''
-        if poster.startswith('posters/'):
-            poster = f"data/{poster}"
+        real_poster_missing = not has_real_poster(t)
+        poster = display_poster_url(t)
         cast_str = t.get('cast', '') or ''
         raw_genre = t.get('genre', '') or ''
         hidden_source = f"{raw_genre} {t.get('title', '')}".lower()
@@ -895,7 +957,7 @@ def generate_html(topics):
         else:
             container = ''
         fmt_html = f'<span class="tile-format">Формат: {escape(cont)}</span>' if cont else ''
-        poster_html = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="ps" alt=""><span class="pb">▶</span></div>' if poster else ''
+        poster_html = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="ps" alt=""><span class="pb">▶</span></div>'
         cast_html = f'<p class="ca">{escape(cast_str)}</p>' if cast_str else ''
         genre_html = f'<p class="gn">{escape(genre)}</p>' if genre else ''
         fmt_row = f'<p class="ff">Формат: {escape(cont)}</p>' if cont else ''
@@ -905,7 +967,7 @@ def generate_html(topics):
         movie_year = escape(str(t.get('movie_year') or ''))
         seeders = int(t.get('seeders') or 0)
         topic_title = escape(t.get('title', ''))
-        missing = not poster or not t.get('kp_rating') or not t.get('youtube_url')
+        missing = real_poster_missing or not t.get('kp_rating') or not t.get('youtube_url')
         enrich_btn = f'<button class="eb" data-tid="{escape(t["topic_id"])}" onclick="enrich(this)">◈</button>' if missing else ''
 
         watch_attrs = f'data-magnet="{escape(magnet)}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-topic-title="{topic_title}" data-collection="{collection}"'
@@ -927,7 +989,7 @@ def generate_html(topics):
 <td data-s="{rating or '0'}"><a href="{escape(magnet)}" class="bm" title="Скачать kino">🧲</a><button class="wb" {watch_attrs} onclick="watch(this)">▶ Смотреть</button></td>
 </tr>''')
 
-        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>' if poster else ''
+        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
         cast_short = escape(cast_str)[:120] + '…' if len(cast_str) > 120 else escape(cast_str)
 
         tiles.append(f'''<div class="tile-card" data-date="0" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}">
@@ -1154,6 +1216,7 @@ def enrich_topic(topic):
     if not title:
         return topic
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
+    retry_poster = should_retry_poster(topic)
 
     if not topic.get('magnet') or topic.get('_magnet_failed'):
         try:
@@ -1163,8 +1226,10 @@ def enrich_topic(topic):
                 if data.get('magnet'):
                     topic['magnet'] = data['magnet']
                     topic.pop('_magnet_failed', None)
-                    if data.get('poster') and not topic.get('poster_url'):
+                    if data.get('poster') and not has_real_poster(topic) and retry_poster:
                         topic['poster_url'] = download_rutracker_poster(topic['topic_id'], data['poster'])
+                        if has_real_poster(topic):
+                            clear_poster_failed(topic)
                     if data.get('imdb') and not topic.get('imdb_id'):
                         topic['imdb_id'] = data['imdb']
                     if data.get('format') and not topic.get('format'):
@@ -1172,13 +1237,15 @@ def enrich_topic(topic):
         except Exception:
             topic['_magnet_failed'] = True
 
-    if not topic.get('poster_url') or not topic.get('format'):
+    if (not has_real_poster(topic) and retry_poster) or not topic.get('format'):
         try:
             html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
             if html:
                 data = parse_topic_for_magnet(html)
-                if data.get('poster') and not topic.get('poster_url'):
+                if data.get('poster') and not has_real_poster(topic) and retry_poster:
                     topic['poster_url'] = download_rutracker_poster(topic['topic_id'], data['poster'])
+                    if has_real_poster(topic):
+                        clear_poster_failed(topic)
                 if data.get('format') and not topic.get('format'):
                     topic['format'] = data['format']
         except Exception:
@@ -1193,9 +1260,14 @@ def enrich_topic(topic):
                 topic['imdb_id'] = result
             else:
                 topic['imdb_id'] = result.get('id')
-                if not topic.get('poster_url') and result.get('poster'):
+                if not has_real_poster(topic) and retry_poster and result.get('poster'):
                     topic['poster_url'] = download_poster(topic['imdb_id'], result['poster'])
+                    if has_real_poster(topic):
+                        clear_poster_failed(topic)
                 topic['cast'] = result.get('cast', '')
+
+    if not has_real_poster(topic) and retry_poster:
+        mark_poster_failed(topic)
 
     cache_key = f"{title}|{year}".lower()
     kp_key = f"{russian_title}|{year}".lower()
@@ -1359,7 +1431,7 @@ def main():
               f"из других коллекций: {len(other)}, всего: {len(merged)}")
 
         if not generate_html_only:
-            need_fetch = [t for t in merged if not t.get('_magnet_failed') and (not t.get('magnet') or not t.get('poster_url'))]
+            need_fetch = [t for t in merged if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
             if need_fetch:
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} тем...")
                 fetch_magnets(need_fetch)

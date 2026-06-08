@@ -313,8 +313,9 @@ def _enrich_missing(force: bool = False):
                 changed = True
             MAX_RETRIES = 3
             for topic in topics:
+                poster_due = not gp.has_real_poster(topic) and gp.should_retry_poster(topic)
                 need = (not topic.get('magnet') or topic.get('_magnet_failed')
-                        or not topic.get('poster_url')
+                        or poster_due
                         or not topic.get('kp_rating')
                         or not topic.get('youtube_url')
                         or not topic.get('imdb_id')
@@ -329,8 +330,9 @@ def _enrich_missing(force: bool = False):
                 topic['_enrich_retries'] = retries + 1
                 gp.enrich_topic(topic)
                 changed = True
+                poster_still_due = not gp.has_real_poster(topic) and gp.should_retry_poster(topic)
                 still_missing = (not topic.get('magnet') or topic.get('_magnet_failed')
-                                 or not topic.get('poster_url')
+                                 or poster_still_due
                                  or not topic.get('kp_rating')
                                  or not topic.get('youtube_url')
                                  or not topic.get('imdb_id')
