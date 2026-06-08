@@ -1143,6 +1143,7 @@ button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
 .tile-grid{{display:none;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}}
 .tile-card{{border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;transition:box-shadow .2s}}
 .tile-card:hover{{box-shadow:0 2px 12px rgba(0,0,0,.1)}}
+.tile-card>.pc{{display:block;width:100%}}
 .tps{{width:100%;display:block;border-radius:0}}
 .tile-body{{padding:8px 10px}}
 .tile-title{{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}}
