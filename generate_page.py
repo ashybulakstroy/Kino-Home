@@ -18,10 +18,10 @@ from bs4 import BeautifulSoup
 from project_io import atomic_write_json, atomic_write_text
 
 COLLECTIONS = {
-    'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22'},
-    'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540'},
-    'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252'},
-    'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247'},
+    'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22', 'age_cleanup': True},
+    'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False},
+    'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252', 'age_cleanup': True},
+    'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False},
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"

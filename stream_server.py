@@ -214,38 +214,73 @@ def _poster_file_from_url(poster_url: str):
 
 def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
     if max_age_days <= 0:
-        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0}
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
     data_path = DATA_DIR / 'torrents_data.json'
     if not data_path.exists():
-        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0}
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
 
     cutoff = datetime.now() - timedelta(days=max_age_days)
     now_text = datetime.now().strftime('%Y-%m-%d %H:%M')
     removed = []
     dated_topics = 0
+    skipped_topics = 0
     with file_lock(data_path):
         try:
             topics = json.loads(data_path.read_text('utf-8'))
         except Exception:
-            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0}
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
 
+        collection_counts = {}
+        for topic in topics:
+            collection = topic.get('collection', 'nashe_kino')
+            collection_counts[collection] = collection_counts.get(collection, 0) + 1
         keep = []
         for topic in topics:
+            collection = topic.get('collection', 'nashe_kino')
             topic_date = _parse_topic_date(topic.get('added_at', ''))
             if not topic_date:
                 topic['added_at'] = now_text
                 dated_topics += 1
                 keep.append(topic)
             elif topic_date < cutoff:
-                removed.append(topic)
+                collection_info = gp.COLLECTIONS.get(collection, {})
+                age_cleanup = bool(collection_info.get('age_cleanup', False))
+                if age_cleanup and collection_counts.get(collection, 0) > gp.MAX_TOPICS:
+                    removed.append(topic)
+                    collection_counts[collection] -= 1
+                else:
+                    skipped_topics += 1
+                    keep.append(topic)
             else:
                 keep.append(topic)
 
         if not removed and not dated_topics:
-            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0}
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': skipped_topics}
 
         atomic_write_json_unlocked(data_path, keep)
         atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(keep))
+
+    if removed:
+        try:
+            archive_path = DATA_DIR / 'topics_archive.json'
+            archive = []
+            if archive_path.exists():
+                archive = json.loads(archive_path.read_text('utf-8'))
+                if not isinstance(archive, list):
+                    archive = []
+            archived_ids = {str(t.get('topic_id')) for t in archive if isinstance(t, dict)}
+            archived_at = datetime.now().strftime('%Y-%m-%d %H:%M')
+            for topic in removed:
+                topic_id = str(topic.get('topic_id') or '')
+                if topic_id in archived_ids:
+                    continue
+                archived_topic = dict(topic)
+                archived_topic['archived_at'] = archived_at
+                archived_topic['archive_reason'] = f'age>{max_age_days}'
+                archive.append(archived_topic)
+            atomic_write_json_unlocked(archive_path, archive)
+        except Exception:
+            pass
 
     used_posters = {
         str(t.get('poster_url') or '').replace('\\', '/')
@@ -280,6 +315,7 @@ def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
         'removed_cache': removed_cache,
         'removed_posters': removed_posters,
         'dated_topics': dated_topics,
+        'skipped_topics': skipped_topics,
         'max_age_days': max_age_days,
     }
 ENRICH_QUEUE: list[str] = []
@@ -814,10 +850,11 @@ if __name__ == '__main__':
         else:
             print('  Всё в порядке, ничего не удалено.')
         topic_cleanup = cleanup_old_topics()
-        if topic_cleanup.get('removed_topics') or topic_cleanup.get('dated_topics'):
+        if topic_cleanup.get('removed_topics') or topic_cleanup.get('dated_topics') or topic_cleanup.get('skipped_topics'):
             print('Очистка старых тем:')
             print(f'  Тем: {topic_cleanup["removed_topics"]}')
             print(f'  Тем с новой датой: {topic_cleanup["dated_topics"]}')
+            print(f'  Старых оставлено политикой коллекций: {topic_cleanup["skipped_topics"]}')
             print(f'  Кешей: {topic_cleanup["removed_cache"]}')
             print(f'  Постеров: {topic_cleanup["removed_posters"]}')
         else:
