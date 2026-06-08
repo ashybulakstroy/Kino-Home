@@ -1143,9 +1143,9 @@ button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
 .tile-grid{{display:none;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}}
 .tile-card{{border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;transition:box-shadow .2s}}
 .tile-card:hover{{box-shadow:0 2px 12px rgba(0,0,0,.1)}}
-.tile-card .pc{{display:flex;width:100%;aspect-ratio:2/3;align-items:center;justify-content:center;background:#171717;overflow:hidden}}
+.tile-card .pc{{display:flex;width:100%;aspect-ratio:2/3;align-items:center;justify-content:center;background:#f3f4f6;overflow:hidden}}
 .tps{{width:100%;height:100%;display:block;border-radius:0;object-fit:contain}}
-.tps.small-poster{{width:auto;height:auto;max-width:72%;max-height:72%;box-shadow:0 6px 22px rgba(0,0,0,.45)}}
+.tps.small-poster{{width:auto;height:auto;max-width:72%;max-height:72%;border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.18)}}
 .tile-body{{padding:8px 10px}}
 .tile-title{{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}}
 .tile-title:hover{{text-decoration:underline}}
