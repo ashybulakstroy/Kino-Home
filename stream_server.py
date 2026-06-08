@@ -282,7 +282,7 @@ def _enrich_worker():
                     with _enrich_lock:
                         _enrich_status[topic_id] = 'error: not found'
                     continue
-                gp.enrich_topic(topic)
+                gp.enrich_topic(topic, force_poster_retry=True)
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
                 html = gp.generate_html(topics)
@@ -331,7 +331,7 @@ def _enrich_missing(force: bool = False):
                 title = topic.get('movie_title') or topic.get('title', '?')
                 print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
                 topic['_enrich_retries'] = retries + 1
-                gp.enrich_topic(topic)
+                gp.enrich_topic(topic, force_poster_retry=force)
                 changed = True
                 poster_still_due = not gp.has_real_poster(topic) and gp.should_retry_poster(topic)
                 rating_still_due = not topic.get('kp_rating') and not topic.get('imdb_rating')

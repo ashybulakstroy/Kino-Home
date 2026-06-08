@@ -394,8 +394,10 @@ def search_imdb_ids(topics):
                 poster = result.get('poster', '')
                 cast = result.get('cast', '')
             t['imdb_id'] = imdb_id
-            if not t.get('poster_url') and poster:
-                t['poster_url'] = download_poster(imdb_id, poster)
+            if not has_real_poster(t) and poster:
+                local_url = download_poster(imdb_id, poster)
+                if local_url:
+                    t['poster_url'] = local_url
             t['cast'] = cast
             print(f"ID {imdb_id}", end='')
         else:
@@ -828,6 +830,15 @@ def localize_existing_poster(topic):
     return True
 
 
+def set_local_poster_from_url(topic, url):
+    local_url = download_rutracker_poster(topic.get('topic_id'), url)
+    if not local_url:
+        return False
+    topic['poster_url'] = local_url
+    clear_poster_failed(topic)
+    return True
+
+
 def fetch_magnets(topics):
     total = len(topics)
     for i, t in enumerate(topics, 1):
@@ -844,9 +855,8 @@ def fetch_magnets(topics):
             t['magnet'] = data['magnet']
             if data['magnet']:
                 print("OK", end='')
-                if data.get('poster') and not t.get('poster_url'):
-                    t['poster_url'] = download_rutracker_poster(t['topic_id'], data['poster'])
-                    if t['poster_url']:
+                if data.get('poster') and not has_real_poster(t):
+                    if set_local_poster_from_url(t, data['poster']):
                         print(", постер ✓", end='')
             else:
                 print("нет магнета", end='')
@@ -892,8 +902,10 @@ def enrich(topics, ratings, basics):
                 rating_data = fetch_imdb_rating(imdb_id)
                 if rating_data.get('genres'):
                     genre = rating_data['genres']
-                if not t.get('poster_url') and rating_data.get('poster'):
-                    t['poster_url'] = download_poster(imdb_id, rating_data['poster'])
+                if not has_real_poster(t) and rating_data.get('poster'):
+                    local_url = download_poster(imdb_id, rating_data['poster'])
+                    if local_url:
+                        t['poster_url'] = local_url
                 if rating_data.get('rating'):
                     t['imdb_rating'] = rating_data['rating']
                     t['imdb_votes'] = rating_data.get('votes', '')
@@ -1220,7 +1232,7 @@ async function enrich(el){{var tid=el.getAttribute('data-tid');if(!tid)return;el
     return html
 
 
-def enrich_topic(topic):
+def enrich_topic(topic, force_poster_retry=False):
     """Enrich a single topic dict with missing data (poster, magnet, ratings, trailers)."""
     title = topic.get('orig_title') or topic['movie_title']
     russian_title = topic['movie_title']
@@ -1229,7 +1241,7 @@ def enrich_topic(topic):
     if not title:
         return topic
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    retry_poster = should_retry_poster(topic)
+    retry_poster = force_poster_retry or should_retry_poster(topic)
 
     if not has_real_poster(topic) and retry_poster:
         localize_existing_poster(topic)
@@ -1243,9 +1255,7 @@ def enrich_topic(topic):
                     topic['magnet'] = data['magnet']
                     topic.pop('_magnet_failed', None)
                     if data.get('poster') and not has_real_poster(topic) and retry_poster:
-                        topic['poster_url'] = download_rutracker_poster(topic['topic_id'], data['poster'])
-                        if has_real_poster(topic):
-                            clear_poster_failed(topic)
+                        set_local_poster_from_url(topic, data['poster'])
                     if data.get('imdb') and not topic.get('imdb_id'):
                         topic['imdb_id'] = data['imdb']
                     if data.get('format') and not topic.get('format'):
@@ -1259,9 +1269,7 @@ def enrich_topic(topic):
             if html:
                 data = parse_topic_for_magnet(html)
                 if data.get('poster') and not has_real_poster(topic) and retry_poster:
-                    topic['poster_url'] = download_rutracker_poster(topic['topic_id'], data['poster'])
-                    if has_real_poster(topic):
-                        clear_poster_failed(topic)
+                    set_local_poster_from_url(topic, data['poster'])
                 if data.get('format') and not topic.get('format'):
                     topic['format'] = data['format']
         except Exception:
@@ -1277,8 +1285,9 @@ def enrich_topic(topic):
             else:
                 topic['imdb_id'] = result.get('id')
                 if not has_real_poster(topic) and retry_poster and result.get('poster'):
-                    topic['poster_url'] = download_poster(topic['imdb_id'], result['poster'])
-                    if has_real_poster(topic):
+                    local_url = download_poster(topic['imdb_id'], result['poster'])
+                    if local_url:
+                        topic['poster_url'] = local_url
                         clear_poster_failed(topic)
                 topic['cast'] = result.get('cast', '')
 
