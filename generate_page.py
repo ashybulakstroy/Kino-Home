@@ -1526,33 +1526,34 @@ def main():
         save_json(TORRENTS_CACHE, topics)
 
         if not generate_html_only:
-            print("\n4. Поиск IMDB ID...")
-            search_imdb_ids(new_topics if new_topics else topics)
+            if new_topics:
+                print("\n4. Поиск IMDB ID...")
+                search_imdb_ids(new_topics)
 
-            print("\n5. Поиск Кинопоиск рейтинга...")
-            search_kinopoisk_ids(new_topics if new_topics else topics)
+                print("\n5. Поиск Кинопоиск рейтинга...")
+                search_kinopoisk_ids(new_topics)
 
-            needed_ids = set()
-            for t in topics:
-                if t.get('imdb_id'):
-                    needed_ids.add(t['imdb_id'])
+                needed_ids = set()
+                for t in new_topics:
+                    if t.get('imdb_id'):
+                        needed_ids.add(t['imdb_id'])
 
-            if needed_ids:
-                print(f"\n6. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
-                ratings = load_ratings(needed_ids)
-                print(f"   Получено рейтингов: {sum(1 for k in needed_ids if k in ratings)}/{len(needed_ids)}")
+                if needed_ids:
+                    print(f"\n6. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
+                    ratings = load_ratings(needed_ids)
+                    print(f"   Получено рейтингов: {sum(1 for k in needed_ids if k in ratings)}/{len(needed_ids)}")
 
-                print(f"\n7. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
-                basics = load_basics(needed_ids)
-                print(f"   Получено жанров: {sum(1 for k in needed_ids if k in basics)}/{len(needed_ids)}")
-            else:
-                ratings = {}
-                basics = {}
+                    print(f"\n7. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
+                    basics = load_basics(needed_ids)
+                    print(f"   Получено жанров: {sum(1 for k in needed_ids if k in basics)}/{len(needed_ids)}")
+                else:
+                    ratings = {}
+                    basics = {}
 
-            targets = new_topics if new_topics else topics
-            if targets:
                 print(f"\n8. Обогащение данных...")
-                enrich(targets, ratings, basics)
+                enrich(new_topics, ratings, basics)
+            else:
+                print("\n4-8. Новых тем нет, тяжелое обогащение пропущено")
 
             topics.sort(key=lambda t: t.get('seeders', 0) or 0, reverse=True)
 
