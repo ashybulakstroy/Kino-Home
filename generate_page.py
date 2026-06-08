@@ -550,6 +550,35 @@ def download_poster(imdb_id, url):
     return ''
 
 
+def download_kinopoisk_poster(kp_id):
+    if not kp_id:
+        return ''
+    os.makedirs(POSTERS_DIR, exist_ok=True)
+    filename = f"kp_{kp_id}.jpg"
+    local_path = os.path.join(POSTERS_DIR, filename)
+    poster_path = f"{POSTERS_URL}/{filename}"
+    if os.path.exists(local_path):
+        return poster_path
+    urls = [
+        f"https://st.kp.yandex.net/images/film_big/{kp_id}.jpg",
+        f"https://st.kp.yandex.net/images/film_iphone/iphone360_{kp_id}.jpg",
+        f"https://st.kp.yandex.net/images/film/{kp_id}.jpg",
+    ]
+    headers = dict(HEADERS)
+    headers["Referer"] = "https://www.kinopoisk.ru/"
+    for url in urls:
+        try:
+            r = SESSION.get(url, timeout=15, headers=headers)
+            content_type = r.headers.get('content-type', '').lower()
+            if r.status_code == 200 and 'image' in content_type and r.content.startswith(b'\xff\xd8'):
+                with open(local_path, 'wb') as f:
+                    f.write(r.content)
+                return poster_path
+        except Exception:
+            continue
+    return ''
+
+
 def clean_and_translate_genre(genre_text):
     if not genre_text:
         return ''
@@ -1312,9 +1341,6 @@ def enrich_topic(topic, force_poster_retry=False):
                         clear_poster_failed(topic)
                 topic['cast'] = result.get('cast', '')
 
-    if not has_real_poster(topic) and retry_poster:
-        mark_poster_failed(topic)
-
     cache_key = f"{title}|{year}".lower()
     kp_key = f"{russian_title}|{year}".lower()
     if not topic.get('kp_rating') and russian_title:
@@ -1328,6 +1354,15 @@ def enrich_topic(topic, force_poster_retry=False):
             topic['kp_id'] = result['kp_id']
             topic['kp_rating'] = result['kp_rating']
             topic['kp_votes'] = result['kp_votes']
+
+    if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
+        local_url = download_kinopoisk_poster(topic['kp_id'])
+        if local_url:
+            topic['poster_url'] = local_url
+            clear_poster_failed(topic)
+
+    if not has_real_poster(topic) and retry_poster:
+        mark_poster_failed(topic)
 
     if not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
