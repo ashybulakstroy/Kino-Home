@@ -544,7 +544,7 @@ def download_poster(imdb_id, url):
             return poster_path
     except Exception:
         pass
-    return url
+    return ''
 
 
 def clean_and_translate_genre(genre_text):
@@ -755,7 +755,7 @@ def download_rutracker_poster(topic_id, url):
             return poster_path
     except Exception:
         pass
-    return url
+    return ''
 
 
 def local_poster_path(poster_url):
@@ -781,19 +781,15 @@ def has_real_poster(topic):
     if not poster_url:
         return False
     local_path = local_poster_path(poster_url)
-    if local_path:
-        return os.path.exists(local_path)
-    return True
+    return bool(local_path and os.path.exists(local_path))
 
 
 def display_poster_url(topic):
     poster_url = topic.get('poster_url', '') or ''
-    if not poster_url:
-        return POSTER_PLACEHOLDER_URL
     local_path = local_poster_path(poster_url)
-    if local_path and not os.path.exists(local_path):
-        return POSTER_PLACEHOLDER_URL
-    return normalize_poster_url(poster_url) or POSTER_PLACEHOLDER_URL
+    if local_path and os.path.exists(local_path):
+        return normalize_poster_url(poster_url)
+    return POSTER_PLACEHOLDER_URL
 
 
 def should_retry_poster(topic):
