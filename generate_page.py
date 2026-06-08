@@ -1459,6 +1459,10 @@ def main():
 
         print(f"\nВсего найдено тем: {len(all_topics)}")
 
+        if limit and len(all_topics) > limit:
+            all_topics = all_topics[:limit]
+            print(f"  (лимит --limit={limit} применён к свежему набору)")
+
         if not all_topics:
             print("  Новых тем нет, сохраняем кеш как есть")
             topics = load_json(TORRENTS_CACHE) or []
@@ -1471,8 +1475,15 @@ def main():
         cached = load_json(TORRENTS_CACHE) or []
         cache_by_id = {t['topic_id']: t for t in cached if t.get('topic_id')}
 
-        # Keep cached topics from OTHER collections, merge current topics
+        # Refresh adds/updates fetched topics; existing valid topics in the same
+        # collection stay until housekeeping removes them by age.
+        fetched_ids = {nt['topic_id'] for nt in all_topics}
         other = [t for t in cached if t.get('collection', 'nashe_kino') != collection]
+        existing_current = [
+            t for t in cached
+            if t.get('collection', 'nashe_kino') == collection
+            and t.get('topic_id') not in fetched_ids
+        ]
 
         new_current = []
         merged_current = []
@@ -1494,11 +1505,7 @@ def main():
             else:
                 new_current.append(t)
                 merged_current.append(t)
-
-        if limit and len(merged_current) > limit:
-            merged_current = merged_current[:limit]
-            new_current = [t for t in merged_current if t['topic_id'] not in cache_by_id]
-            print(f"  (лимит --limit={limit})")
+        merged_current.extend(existing_current)
 
         merged = other + merged_current
         new_topics = new_current
