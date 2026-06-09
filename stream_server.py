@@ -781,7 +781,7 @@ def index():
         return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
 
     stat = index_path.stat()
-    INJECT_VER = 'v3'
+    INJECT_VER = 'v6'
     etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
 
     if request.if_none_match.contains(etag_val):
@@ -791,7 +791,8 @@ def index():
     refresh_btn = '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
     browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
-    html = html.replace('</div>\n\n<table id="tbl">', f'</div>\n{browse_links}<table id="tbl">')
+    if 'class="bl"' not in html:
+        html = html.replace('<table id="tbl">', f'{browse_links}<table id="tbl">', 1)
     bl_style = '<style>.bl{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}.bl a{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}.bl a:hover{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}</style>'
     html = html.replace('</head>', f'{bl_style}</head>', 1)
 
@@ -1612,12 +1613,17 @@ input[type=text]::placeholder{{color:#666}}
 <script>
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
+function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
+function card(m){{const h=hash(m);return '<div class="card" data-hash="'+h+'" style="background-image:url('+pu(m)+')"><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 function render(q){{
 const ql=q.toLowerCase().trim();
 const filtered=ql?MOVIES.filter(m=>(m.movie_title||'').toLowerCase().includes(ql)||(m.orig_title||'').toLowerCase().includes(ql)):MOVIES;
 document.getElementById('cnt').textContent='Найдено: '+filtered.length;
-document.getElementById('results').innerHTML=filtered.length?filtered.map(m=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join(''):'<div class="no">Ничего не найдено</div>';
+document.getElementById('results').innerHTML=filtered.length?filtered.map(card).join(''):'<div class="no">Ничего не найдено</div>';
 }}
+document.getElementById('results').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 document.getElementById('q').addEventListener('input',function(){{render(this.value);}});
 render('');
 </script></body></html>'''
@@ -1660,7 +1666,11 @@ h1{{font-size:24px}}
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function rt(m){{return Math.max(parseFloat(m.kp_rating)||0,parseFloat(m.imdb_rating)||0)}}
-document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join('');
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
+function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
+document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>'<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')"><span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>').join('');
+document.getElementById('grid').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 </script></body></html>'''
 
 
@@ -1706,7 +1716,12 @@ const GROUPS={coll_json};
 const LABELS={labels_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function label(k){{return LABELS[k]||k}}
-document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2 onclick="(function(el){{var g=el.nextElementSibling;g.style.display=g.style.display===\'none\'?\'\':\'none\';el.querySelector(\'.arrow\').classList.toggle(\'open\');}})(this)"><span class="arrow">&#9660;</span>'+label(key)+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(m=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join('')+'</div></div>').join('');
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
+function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
+function card(m){{return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')"><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2><span class="arrow'+(gi===0?' open':'')+'">&#9660;</span>'+esc(label(key))+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(card).join('')+'</div></div>').join('');
+document.getElementById('root').addEventListener('click',e=>{{const h=e.target.closest('h2');if(h){{const g=h.nextElementSibling;g.style.display=g.style.display==='none'?'':'none';h.querySelector('.arrow').classList.toggle('open');return}}const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 </script></body></html>'''
 
 
