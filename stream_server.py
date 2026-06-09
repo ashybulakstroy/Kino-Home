@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import json
+import gzip
 import mimetypes
 import socket
 import threading
@@ -52,6 +53,10 @@ _enrich_lock = threading.Lock()
 _daily_refresh_lock = threading.Lock()
 _daily_refresh_started = False
 DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
+
+# HTML cache: stores (mtime, processed_html) for the index page
+_html_cache: tuple[float, str, str] | None = None  # (mtime, etag, html)
+_html_cache_lock = threading.Lock()
 DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
 REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
 REFRESH_FILES = [
@@ -847,11 +852,16 @@ def index():
         return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
 
     stat = index_path.stat()
-    INJECT_VER = 'v7'
+    INJECT_VER = 'v8'
     etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
 
     if request.if_none_match.contains(etag_val):
         return Response(status=304)
+
+    global _html_cache
+    with _html_cache_lock:
+        if _html_cache is not None and _html_cache[0] == stat.st_mtime and _html_cache[1] == etag_val:
+            return Response(_html_cache[2], content_type='text/html; charset=utf-8')
 
     html = index_path.read_text('utf-8')
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
@@ -862,6 +872,9 @@ def index():
     public_style = '.rmv,.eb{display:none!important}' if PUBLIC_MODE else ''
     bl_style = f'<style>.bl{{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}}.bl a{{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}}.bl a:hover{{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}}{public_style}</style>'
     html = html.replace('</head>', f'{bl_style}</head>', 1)
+
+    with _html_cache_lock:
+        _html_cache = (stat.st_mtime, etag_val, html)
 
     resp = Response(html, content_type='text/html')
     resp.set_etag(etag_val)
@@ -986,10 +999,21 @@ def unhide_topic(topic_id):
 
 
 @app.after_request
-def add_cors(response):
+def add_cors_and_gzip(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     if request.path.startswith('/data/posters/'):
         response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
+    if (response.status_code == 200
+        and isinstance(response.data, bytes)
+        and len(response.data) > 512
+        and response.content_type
+        and response.content_type.startswith('text/')
+        and 'gzip' in request.accept_encodings):
+        compressed = gzip.compress(response.data)
+        if len(compressed) < len(response.data) * 0.9:
+            response.data = compressed
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Length'] = str(len(response.data))
     return response
 
 

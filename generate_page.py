@@ -1577,7 +1577,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 <td data-s="{rating or '0'}"><a href="{escape(magnet)}" class="bm" title="Скачать kino">🧲</a><button class="wb" {watch_attrs} onclick="watch(this)">▶ Смотреть</button></td>
 </tr>''')
 
-        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
+        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" data-src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
         cast_short = escape(cast_str)[:120] + '…' if len(cast_str) > 120 else escape(cast_str)
 
         tiles.append(f'''<div class="tile-card" data-date="{date_ts}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
@@ -1758,9 +1758,9 @@ function fht(){{hideSaved('.tile-card')}}
 var sx=/(?:\\bhorror\\b|\\b(?:sex|porn|xxx|erotic|adult|nsfw|onlyfans)\\b)/i;
 function updateStats(){{var rows=Array.from(document.querySelectorAll('#tbl tbody tr')).filter(function(r){{return r.style.display!=='none'}}),total=document.getElementById('stat-total'),rated=document.getElementById('stat-rated');if(total)total.textContent=rows.length;if(rated)rated.textContent=rows.filter(function(r){{return r.getAttribute('data-rated')==='1'}}).length}}
 (function(){{var dv=localStorage.getItem('dv');if(dv)document.getElementById('ds').value=dv;af();sortTiles();
-var isTile=localStorage.getItem('tv')==='tile';if(isTile){{document.body.classList.add('tile');document.getElementById('tvb').textContent='Вид: список';sortTiles()}}
+var isTile=localStorage.getItem('tv')==='tile';if(isTile){{document.body.classList.add('tile');document.getElementById('tvb').textContent='Вид: список';sortTiles();document.querySelectorAll('#tile-grid img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}})}}
 var isMob=localStorage.getItem('mb')==='1';if(isMob){{document.body.classList.add('mobile');document.getElementById('mdb').textContent='🖥'}}}})()
-function tv(){{var b=document.body;b.classList.toggle('tile');var isTile=b.classList.contains('tile');localStorage.setItem('tv',isTile?'tile':'list');document.getElementById('tvb').textContent=isTile?'Вид: список':'Вид: плитка';if(isTile)sortTiles()}}
+function tv(){{var b=document.body;b.classList.toggle('tile');var isTile=b.classList.contains('tile');localStorage.setItem('tv',isTile?'tile':'list');document.getElementById('tvb').textContent=isTile?'Вид: список':'Вид: плитка';if(isTile){{sortTiles();document.querySelectorAll('#tile-grid img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}})}}}}
 function md(){{var b=document.body;b.classList.toggle('mobile');var isMob=b.classList.contains('mobile');localStorage.setItem('mb',isMob?'1':'0');document.getElementById('mdb').textContent=isMob?'🖥':'📱'}}
 function bgf(){{var gs={{}};[].forEach.call(document.querySelectorAll('#tbl tbody tr,.tile-card'),function(r){{if(r.style.display==='none')return;var rg=(r.getAttribute('data-genre')||'').toLowerCase();rg.split(',').forEach(function(g){{g=g.trim();if(g)gs[g]=1}})}});var sel=document.getElementById('gs'),v=sel.value;sel.innerHTML='<option value=\\"\\">Все</option>';Object.keys(gs).sort().forEach(function(g){{var s=g.charAt(0).toUpperCase()+g.slice(1);sel.innerHTML+='<option value=\\"'+g+'\\">'+s+'</option>'}});sel.value=v}}
 var playerPoll=null;
