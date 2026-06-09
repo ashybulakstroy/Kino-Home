@@ -217,18 +217,18 @@ def parse_rutracker_title(raw):
     year = ''
     genre = ''
     quality = ''
+    quality_keywords = re.compile(
+        r'^(WEB|BluRay|HDTV|DVDRip|HDRip|WEB-DL|WEBRip|BDRip|DVD|SATRip|TVRip|CamRip|'
+        r'TS|TC|Screener|WEB-DLRip|BDRip-AVC|DVDRip-AVC|HDTVRip|'
+        r'Betacam\s*SP|DVDRemux|DVDRip-AVC|BDRemux|WEBRip-AVC|'
+        r'AVI|MKV|MP4|MPEG|TS|M2TS|BluRay\s*Remux|WEB\s*Rip|'
+        r'BDRip-AVC|BDRemux)', re.I)
     bracket_m = re.search(r'\[([^\]]*\d{4}[^\]]*)\]', t)
     if bracket_m:
         meta_text = bracket_m.group(1)
         parts = [p.strip() for p in meta_text.split(',')]
         genre_parts = []
         quality_parts = []
-        quality_keywords = re.compile(
-            r'^(WEB|BluRay|HDTV|DVDRip|HDRip|WEB-DL|WEBRip|BDRip|DVD|SATRip|TVRip|CamRip|'
-            r'TS|TC|Screener|WEB-DLRip|BDRip-AVC|DVDRip-AVC|HDTVRip|'
-            r'Betacam\s*SP|DVDRemux|DVDRip-AVC|BDRemux|WEBRip-AVC|'
-            r'AVI|MKV|MP4|MPEG|TS|M2TS|BluRay\s*Remux|WEB\s*Rip|'
-            r'BDRip-AVC|BDRemux)', re.I)
         for p in parts:
             p = p.strip()
             if re.match(r'^(19\d{2}|20\d{2})$', p):
@@ -238,12 +238,47 @@ def parse_rutracker_title(raw):
             elif p.lower() in {s.lower() for s in GENRE_STOP | COUNTRY_STOP}:
                 continue
             else:
-                genre_parts.append(p)
+                # Check if this part contains a year like 2022 (2021)
+                ym = re.search(r'\b(19\d{2}|20\d{2})\b', p)
+                if ym and not year:
+                    year = ym.group(1)
+                elif not re.match(r'^\(?\d{4}\)?$', p):
+                    genre_parts.append(p)
         genre = ', '.join(genre_parts)
         quality = ' / '.join(quality_parts)
         title_part = t[:bracket_m.start()].strip()
+        title_part = re.sub(r'\s*\[[^\]]*\]', '', title_part).strip()
     else:
+        # Truncated title without closing bracket — try to extract anyway
         title_part = t
+        bracket_open = t.find('[')
+        if bracket_open >= 0:
+            title_part = t[:bracket_open].strip()
+            content = t[bracket_open+1:].rstrip('.] ')
+            parts = [x.strip() for x in content.split(',')]
+            genre_parts = []
+            quality_parts = []
+            for p in parts:
+                p = p.strip().rstrip('.')
+                if re.match(r'^(19\d{2}|20\d{2})$', p):
+                    year = p
+                elif quality_keywords.match(p):
+                    quality_parts.append(p)
+                elif p.lower() not in {s.lower() for s in GENRE_STOP | COUNTRY_STOP}:
+                    if not re.match(r'^\.{2,}$', p) and p:
+                        ym = re.search(r'\b(19\d{2}|20\d{2})\b', p)
+                        if ym and not year:
+                            year = ym.group(1)
+                        elif not re.match(r'^\(?\d{4}\)?$', p):
+                            genre_parts.append(p)
+            if genre_parts:
+                genre = ', '.join(genre_parts)
+            if quality_parts:
+                quality = ' / '.join(quality_parts)
+            if not year:
+                ym = re.search(r'\b(19\d{2}|20\d{2})\b', t)
+                if ym:
+                    year = ym.group(1)
 
     title_part = re.sub(r'\([^)]*\)', '', title_part).strip()
 
@@ -543,6 +578,14 @@ def search_kinopoisk(title, year):
         return None
 
 
+def _extract_year_from_title(topic):
+    raw = topic.get('title', '') or topic.get('movie_title', '')
+    if not raw:
+        return ''
+    m = re.search(r'\b(19\d{2}|20\d{2})\b', raw)
+    return m.group(1) if m else ''
+
+
 def search_kinopoisk_ids(topics):
     total = len(topics)
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
@@ -550,6 +593,8 @@ def search_kinopoisk_ids(topics):
         title, year = t['movie_title'], t['movie_year']
         if not title:
             continue
+        if not year:
+            year = _extract_year_from_title(t)
         cache_key = f"{title}|{year}".lower()
         if cache_key in kp_cache and kp_cache[cache_key] is not None:
             result = kp_cache[cache_key]
@@ -811,6 +856,31 @@ def search_imdb_trailer(imdb_id):
     return None
 
 
+def search_youtube_full_movie(title, year):
+    """Поиск полного фильма на YouTube как fallback для трейлера."""
+    queries = [
+        f'{title} {year} полный фильм',
+        f'{title} {year} фильм',
+        f'{title} {year} full movie',
+        f'{title} {year} movie',
+    ]
+    best = None
+    for query in queries:
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        try:
+            r = SESSION.get(url, timeout=10)
+        except Exception:
+            continue
+        for candidate in _youtube_candidates(r.text):
+            score = _score_youtube_candidate(candidate, title, year)
+            if not best or score > best['score']:
+                best = {**candidate, 'score': score}
+        time.sleep(0.1)
+    if isinstance(best, dict) and best.get('score', 0) >= 15:
+        return f"https://www.youtube.com/watch?v={best['video_id']}"
+    return None
+
+
 def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
     if kp_id and str(kp_id) != '0':
         kp_cache = load_json(KP_TRAILER_CACHE) or {}
@@ -836,7 +906,10 @@ def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
         if imdb_url:
             return imdb_url
 
-    return search_youtube_trailer(title, year)
+    result = search_youtube_trailer(title, year)
+    if result:
+        return result
+    return search_youtube_full_movie(title, year)
 
 
 def download_poster(imdb_id, url):
@@ -1210,6 +1283,81 @@ def mark_poster_failed(topic):
     topic['_poster_failed_at'] = today_text()
     if is_external_poster_url(topic.get('poster_url')):
         topic['_poster_fallback_failed_at'] = today_text()
+
+
+def fix_bad_topics(topics):
+    """Перепарсить все записи, где movie_title содержит мусор из обрезанного заголовка."""
+    count = 0
+    need_re_enrich = []
+    for t in topics:
+        mt = t.get('movie_title', '')
+        raw = t.get('title', '')
+        if not raw:
+            continue
+        needs_fix = False
+        if '[' in mt or mt.rstrip().endswith(','):
+            needs_fix = True
+        elif not t.get('movie_year') and re.search(r'\b(19\d{2}|20\d{2})\b', raw):
+            needs_fix = True
+        if not needs_fix:
+            # Re-parse and compare — if stored title differs, it was truncated before
+            parsed = parse_rutracker_title(raw)
+            if parsed[0] and parsed[0] != mt and '[' not in parsed[0]:
+                needs_fix = True
+        if needs_fix:
+            parsed = parse_rutracker_title(raw)
+            if parsed[0] and '[' not in parsed[0]:
+                old = mt
+                old_year = t.get('movie_year') or ''
+                t['movie_title'] = parsed[0]
+                t['orig_title'] = parsed[1] or ''
+                if parsed[2]:
+                    t['movie_year'] = parsed[2]
+                if parsed[3]:
+                    t['genre'] = parsed[3]
+                if parsed[4]:
+                    t['quality'] = parsed[4]
+                if old != t['movie_title'] or (parsed[2] and old_year != parsed[2]):
+                    count += 1
+                    print(f"  Исправлен: {old[:50]} -> {t['movie_title']} ({t.get('movie_year','')})")
+                    t['kp_id'] = None
+                    t['kp_rating'] = None
+                    t['kp_votes'] = None
+                    t['imdb_id'] = None
+                    t['imdb_rating'] = None
+                    t['imdb_votes'] = None
+                    t['poster_url'] = ''
+                    need_re_enrich.append((old, old_year, t))
+    if not count:
+        print("  Битых записей не найдено")
+    if need_re_enrich:
+        print(f"\n  Повторный поиск Кинопоиска для {len(need_re_enrich)} исправленных...")
+        kp_cache = load_json(KP_SEARCH_CACHE) or {}
+        for old_title, old_year, t in need_re_enrich:
+            title = t['movie_title']
+            year = t.get('movie_year', '')
+            if not year:
+                year = _extract_year_from_title(t)
+            cache_key = f"{title}|{year}".lower()
+            old_cache_key = f"{old_title}|{old_year}".lower()
+            if old_cache_key in kp_cache:
+                del kp_cache[old_cache_key]
+            result = search_kinopoisk(title, year)
+            if result:
+                t['kp_id'] = result['kp_id']
+                t['kp_rating'] = result['kp_rating']
+                t['kp_votes'] = result['kp_votes']
+                kp_cache[cache_key] = result
+                save_json(KP_SEARCH_CACHE, kp_cache)
+                print(f"    {title} ({year}): КП {result['kp_id']} рейтинг {result['kp_rating'] or '—'}")
+                kp_local = download_kinopoisk_poster(result['kp_id'])
+                if kp_local:
+                    t['poster_url'] = kp_local
+                    print(f"    Постер: {kp_local}")
+            else:
+                print(f"    {title} ({year}): не найдено")
+            time.sleep(0.3)
+    return topics
 
 
 def clear_poster_failed(topic):
@@ -1999,6 +2147,10 @@ def main():
 
         topics.sort(key=lambda t: t.get('seeders', 0) or 0, reverse=True)
         save_json(TORRENTS_CACHE, topics)
+
+    print("\nИсправление битых заголовков (весь кеш)...")
+    fix_bad_topics(topics)
+    save_json(TORRENTS_CACHE, topics)
 
     hidden_ids = load_hidden_topic_ids()
     print(f"\n{'='*60}")
