@@ -58,6 +58,8 @@ http://localhost:14876
 
 Чтобы веб-сервис продолжал работать во время обновления, refresh использует staging-каталог `data/staging_refresh`, а затем переносит готовые данные в основную папку.
 
+Кеш страниц форума (`data/topic_cache/f*_p*.html`) используется только как fallback при ошибке сети. При refresh сервис сначала пытается скачать свежий listing с rutracker. Максимальный возраст fallback-кеша задаёт `.env` параметр `LISTING_CACHE_MAX_AGE_DAYS`, по умолчанию `1`.
+
 ## Housekeeping
 
 `TOPIC_MAX_AGE_DAYS` в `.env` задает возраст темы в днях, по умолчанию `90`.
@@ -99,6 +101,10 @@ data/posters/placeholder.png
 - `project_io.py` - пути проекта и атомарная запись JSON.
 - `.env.example` - шаблон настроек.
 
+## Публикация
+
+Для публикации наружу включается `PUBLIC_MODE=1` в `.env`. В этом режиме сервер не раздаёт корень проекта как static, наружу доступны только явно разрешённые файлы (`/`, `/player.html`, `/data/posters/*`) и browse-страницы. Админские ручки `/refresh`, `/cleanup`, `/hide`, `/unhide`, `/enrich/*` отключены, а `/watch` принимает только magnet из текущего каталога.
+
 ## Рабочие данные
 
 Эти файлы и папки генерируются локально и не попадают в git:
@@ -106,6 +112,7 @@ data/posters/placeholder.png
 - `data/temp/` - временные скачанные видео.
 - `data/posters/` - постеры и заглушка.
 - `data/topic_cache/` - кеш страниц rutracker.
+- `data/imdb/` - локальные IMDB справочники `title.ratings.tsv.gz` и `title.basics.tsv.gz`; если ID не найден в старом файле, скачивается свежий файл и становится основным.
 - `data/staging_refresh/` - временные данные refresh.
 - `data/torrents_data.json` - основной каталог.
 - `data/topics_archive.json` - архив удаленных старых тем.

@@ -9,9 +9,9 @@ import threading
 import subprocess
 import shutil
 from datetime import date, datetime, timedelta
-from flask import Flask, request, Response, jsonify, send_file, abort, redirect
+from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -35,7 +35,7 @@ class _LazyEngine:
 
 engine = _LazyEngine()
 
-app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path='')
+app = Flask(__name__, static_folder=None)
 
 STREAM_IDLE_TIMEOUT = 30
 SESSION_SWEEP_INTERVAL = 10
@@ -61,9 +61,10 @@ REFRESH_FILES = [
     'imdb_search_cache.json',
     'kp_search_cache.json',
     'youtube_cache.json',
+    'hidden_topics.json',
     'index-kino.html',
 ]
-REFRESH_DIRS = ['posters', 'topic_cache']
+REFRESH_DIRS = ['posters', 'topic_cache', 'imdb']
 
 
 def _today_stamp() -> str:
@@ -121,6 +122,8 @@ def _run_refresh_process(collection=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         env=env,
     )
 
@@ -139,9 +142,11 @@ def _run_all_collections_refresh():
     return 0
 
 
-def _iter_all_collections_refresh_output():
+def _iter_collections_refresh_output(collections=None):
+    if collections is None:
+        collections = gp.COLLECTIONS.keys()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
-    for collection in gp.COLLECTIONS:
+    for collection in collections:
         yield f'Автообновление: коллекция {collection}\n'
         proc = _run_refresh_process(collection)
         assert proc.stdout is not None
@@ -151,6 +156,10 @@ def _iter_all_collections_refresh_output():
         if code != 0:
             return code
     return 0
+
+
+def _iter_all_collections_refresh_output():
+    return _iter_collections_refresh_output()
 
 
 def _run_daily_refresh_if_due(reason: str = 'timer'):
@@ -448,6 +457,44 @@ def _rate_limit(key: str, seconds: float = RATE_LIMIT_SECONDS) -> bool:
     return True
 
 
+INFO_HASH_RE = re.compile(r'btih:([A-Fa-f0-9]{40})')
+
+
+def _info_hash_from_magnet(magnet: str) -> str:
+    match = INFO_HASH_RE.search(magnet or '')
+    return match.group(1).lower() if match else ''
+
+
+def _catalog_info_hashes() -> set[str]:
+    data_path = DATA_DIR / 'torrents_data.json'
+    if not data_path.exists():
+        return set()
+    try:
+        topics = json.loads(data_path.read_text('utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    hashes = set()
+    for topic in topics:
+        info_hash = _info_hash_from_magnet(str(topic.get('magnet') or ''))
+        if info_hash:
+            hashes.add(info_hash)
+    return hashes
+
+
+def _catalog_allows_magnet(magnet: str) -> bool:
+    info_hash = _info_hash_from_magnet(magnet)
+    return bool(info_hash and info_hash in _catalog_info_hashes())
+
+
+def _catalog_allows_hash(info_hash: str) -> bool:
+    return bool(info_hash and info_hash.lower() in _catalog_info_hashes())
+
+
+def _reject_public_admin():
+    if PUBLIC_MODE:
+        abort(403, description='Disabled in public mode')
+
+
 def _mark_stream_session(info_hash: str) -> str:
     with _sessions_lock:
         if len(_stream_sessions) >= MAX_STREAM_SESSIONS:
@@ -525,6 +572,8 @@ def watch():
         return jsonify(error='magnet required'), 400
 
     magnet = data['magnet']
+    if PUBLIC_MODE and not _catalog_allows_magnet(magnet):
+        return jsonify(error='magnet not allowed'), 403
     try:
         info_hash = engine.add_magnet(magnet)
     except TimeoutError as e:
@@ -538,6 +587,8 @@ def start_torrent():
     magnet = request.form.get('magnet')
     if not magnet:
         return 'magnet required', 400
+    if PUBLIC_MODE and not _catalog_allows_magnet(magnet):
+        return 'magnet not allowed', 403
     try:
         info_hash = engine.add_magnet_async(magnet)
     except ValueError as e:
@@ -551,6 +602,8 @@ def watch_sync():
     if not data or 'magnet' not in data:
         return jsonify(error='magnet required'), 400
     magnet = data['magnet']
+    if PUBLIC_MODE and not _catalog_allows_magnet(magnet):
+        return jsonify(error='magnet not allowed'), 403
     try:
         info_hash = engine.add_magnet(magnet, timeout=7)
     except TimeoutError:
@@ -561,6 +614,8 @@ def watch_sync():
 
 @app.route('/status/<info_hash>')
 def status(info_hash):
+    if PUBLIC_MODE and not _catalog_allows_hash(info_hash):
+        return jsonify(error='not allowed'), 403
     s = engine.get_status(info_hash)
     if s is None:
         return jsonify(error='not found'), 404
@@ -574,6 +629,8 @@ STREAM_READ_CHUNK = 1024 * 1024
 
 @app.route('/stream/<info_hash>')
 def stream(info_hash):
+    if PUBLIC_MODE and not _catalog_allows_hash(info_hash):
+        abort(403, description='Not allowed')
     try:
         sid = _mark_stream_session(info_hash)
     except RuntimeError as e:
@@ -716,6 +773,8 @@ def _wait_for_pieces(handle, start_piece, end_piece, timeout=120, interval=0.5, 
 
 @app.route('/transcode/<info_hash>')
 def transcode(info_hash):
+    if PUBLIC_MODE and not _catalog_allows_hash(info_hash):
+        abort(403, description='Not allowed')
     sid = _mark_stream_session(info_hash)
     filepath = engine.get_file_path(info_hash)
     if not filepath:
@@ -773,6 +832,11 @@ def player():
     return send_file(str(BASE_DIR / 'player.html'))
 
 
+@app.route('/data/posters/<path:filename>')
+def poster_asset(filename):
+    return send_from_directory(str(DATA_DIR / 'posters'), filename)
+
+
 @app.route('/')
 def index():
     index_path = DATA_DIR / 'index-kino.html'
@@ -781,19 +845,20 @@ def index():
         return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
 
     stat = index_path.stat()
-    INJECT_VER = 'v6'
+    INJECT_VER = 'v7'
     etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
 
     if request.if_none_match.contains(etag_val):
         return Response(status=304)
 
     html = index_path.read_text('utf-8')
-    refresh_btn = '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🔄</a>'
+    refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
     browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
     if 'class="bl"' not in html:
         html = html.replace('<table id="tbl">', f'{browse_links}<table id="tbl">', 1)
-    bl_style = '<style>.bl{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}.bl a{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}.bl a:hover{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}</style>'
+    public_style = '.rmv,.eb{display:none!important}' if PUBLIC_MODE else ''
+    bl_style = f'<style>.bl{{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}}.bl a{{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}}.bl a:hover{{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}}{public_style}</style>'
     html = html.replace('</head>', f'{bl_style}</head>', 1)
 
     resp = Response(html, content_type='text/html')
@@ -806,13 +871,24 @@ def index():
 
 @app.route('/refresh')
 def refresh():
+    _reject_public_admin()
+    collection = (request.args.get('collection') or '').strip()
+    if collection and collection not in gp.COLLECTIONS:
+        return Response(
+            '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head>'
+            '<body><h2>Неизвестная коллекция</h2><p><a href="/">Назад</a></p></body></html>',
+            status=400,
+            content_type='text/html; charset=utf-8',
+        )
+
     def generate():
         if not _daily_refresh_lock.acquire(blocking=False):
-            yield '<html><body><h2>Обновление уже выполняется</h2><p><a href="/">Назад</a></p></body></html>'
+            yield '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head><body><h2>Обновление уже выполняется</h2><p><a href="/">Назад</a></p></body></html>'
             return
-        yield '<html><body><h2>Обновляю данные...</h2><pre>'
+        label = gp.COLLECTIONS[collection]['name'] if collection else 'все коллекции'
+        yield f'<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head><body><h2>Обновляю: {label}</h2><pre>'
         try:
-            refresh_output = _iter_all_collections_refresh_output()
+            refresh_output = _iter_collections_refresh_output([collection] if collection else None)
             code = 0
             while True:
                 try:
@@ -822,17 +898,21 @@ def refresh():
                     break
             if code == 0:
                 _publish_staging_refresh(REFRESH_STAGING_DIR)
-                _write_daily_refresh_stamp()
-                yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
+                if collection:
+                    yield '</pre><p>Обновлена выбранная коллекция. Общая дневная метка не изменялась.</p><p><a href="/">Готово</a></p></body></html>'
+                else:
+                    _write_daily_refresh_stamp()
+                    yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
             else:
                 yield f'</pre><p>Ошибка refresh, код {code}. Метка не обновлена.</p><p><a href="/">Назад</a></p></body></html>'
         finally:
             _daily_refresh_lock.release()
-    return Response(generate(), content_type='text/html')
+    return Response(generate(), content_type='text/html; charset=utf-8')
 
 
 @app.route('/cleanup')
 def cleanup_trigger():
+    _reject_public_admin()
     if not _rate_limit(f'cleanup:{request.remote_addr}', seconds=10):
         return jsonify(error='rate limited'), 429
     removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
@@ -842,11 +922,14 @@ def cleanup_trigger():
 
 @app.route('/torrents_data.json')
 def torrents_data():
+    if PUBLIC_MODE:
+        abort(404)
     return send_file(str(DATA_DIR / 'torrents_data.json'))
 
 
 @app.route('/enrich/all', methods=['POST'])
 def enrich_all():
+    _reject_public_admin()
     if not _rate_limit(f'enrich:{request.remote_addr}', seconds=30):
         return jsonify(error='rate limited'), 429
     threading.Thread(target=_enrich_missing, args=[True], daemon=True).start()
@@ -855,6 +938,7 @@ def enrich_all():
 
 @app.route('/enrich/<topic_id>', methods=['POST'])
 def enrich_topic(topic_id):
+    _reject_public_admin()
     with _enrich_lock:
         if _enrich_status.get(topic_id) == 'in_progress':
             return jsonify(status='in_progress')
@@ -867,6 +951,7 @@ def enrich_topic(topic_id):
 
 @app.route('/enrich/status/<topic_id>')
 def enrich_status(topic_id):
+    _reject_public_admin()
     with _enrich_lock:
         status = _enrich_status.get(topic_id, 'unknown')
     return jsonify(status=status)
@@ -874,6 +959,7 @@ def enrich_status(topic_id):
 
 @app.route('/hide/<topic_id>', methods=['POST'])
 def hide_topic(topic_id):
+    _reject_public_admin()
     if not _rate_limit(f'hide:{request.remote_addr}'):
         return jsonify(error='rate limited'), 429
     gp.add_hidden_topic(topic_id)
@@ -886,6 +972,7 @@ def hide_topic(topic_id):
 
 @app.route('/unhide/<topic_id>', methods=['POST'])
 def unhide_topic(topic_id):
+    _reject_public_admin()
     if not _rate_limit(f'unhide:{request.remote_addr}'):
         return jsonify(error='rate limited'), 429
     gp.remove_hidden_topic(topic_id)

@@ -12,6 +12,10 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 
 Порт берётся из `.env` (`SERVER_PORT`). Если переменная не задана, код использует значение по умолчанию из `config.py`.
 
+## Рабочее правило
+
+Перед отчётом пользователю, что задача сделана, нужно сначала проверить результат: компиляцией, HTTP-проверкой, чтением данных, логами или другим подходящим способом по смыслу изменения.
+
 ## Команды
 
 | Команда | Назначение |
@@ -60,6 +64,8 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 
 Refresh должен сливать новые темы с существующим кешем, а не обрезать коллекцию до последних 30. Если новых тем нет, тяжёлое обогащение можно пропускать.
 
+Кеш листинга форума `data/topic_cache/f*_p*.html` не должен скрывать новые темы. При refresh сначала скачивается свежий `viewforum.php`; локальный listing-cache используется только как fallback при сетевой ошибке и только если он не старше `LISTING_CACHE_MAX_AGE_DAYS` из `.env` (по умолчанию 1 день).
+
 Pipeline при `--refresh`:
 1. Парсинг страниц форума
 2. Слияние с кешем (только новые темы)
@@ -85,6 +91,10 @@ Pipeline при `--refresh`:
 5. Дальше сервер повторяет проверку примерно каждые 12 часов.
 
 Чтобы сервис работал во время обновления, refresh выполняется через staging-папку `data/staging_refresh`, после чего готовые файлы переносятся в основную `data/`.
+
+## Public Mode
+
+`PUBLIC_MODE=1` в `.env` предназначен для публикации наружу. В этом режиме Flask не раздаёт корень проекта как static; доступны только явно разрешённые файлы (`/`, `/player.html`, `/data/posters/*`) и browse-страницы. Админские endpoints `/refresh`, `/cleanup`, `/hide`, `/unhide`, `/enrich/*` отключены. `/watch` и `/watch_sync` принимают только magnet, чей info-hash уже есть в `data/torrents_data.json`.
 
 ## Housekeeping
 
@@ -189,6 +199,7 @@ data/posters/placeholder.png
 - `data/torrents_data.json` — каталог.
 - `data/posters/` — постеры.
 - `data/topic_cache/` — кеш тем.
+- `data/imdb/` — полные локальные IMDB справочники `title.ratings.tsv.gz` и `title.basics.tsv.gz`; JSON-кеши хранят выжимку по найденным ID.
 - `data/temp/` — временные видеофайлы.
 - `data/staging_refresh/` — staging во время refresh.
 - `data/topics_archive.json` — архив старых удалённых тем.

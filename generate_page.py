@@ -2,7 +2,6 @@
 """Парсинг rutracker f=22, обогащение IMDB, генерация index-kino.html."""
 
 import gzip
-import io
 import json
 import os
 import re
@@ -10,11 +9,12 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from html import escape
+from html import escape, unescape
 
 import requests
 from bs4 import BeautifulSoup
 
+from config import LISTING_CACHE_MAX_AGE_DAYS
 from project_io import atomic_write_json, atomic_write_text
 
 COLLECTIONS = {
@@ -33,6 +33,9 @@ RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 RATINGS_CACHE = os.path.join(DATA_DIR, "imdb_ratings_cache.json")
 BASICS_CACHE = os.path.join(DATA_DIR, "imdb_basics_cache.json")
+IMDB_DATA_DIR = os.path.join(DATA_DIR, "imdb")
+RATINGS_DATASET = os.path.join(IMDB_DATA_DIR, "title.ratings.tsv.gz")
+BASICS_DATASET = os.path.join(IMDB_DATA_DIR, "title.basics.tsv.gz")
 
 FORBIDDEN_GENRES = {'ужасы', 'horror', 'секс', 'sex', 'эротика', 'erotica', 'порно', 'porn'}
 
@@ -87,6 +90,27 @@ def now_text():
 
 def today_text():
     return datetime.now().date().isoformat()
+
+
+def listing_cache_is_valid(path):
+    if LISTING_CACHE_MAX_AGE_DAYS < 0:
+        return False
+    if not os.path.exists(path):
+        return False
+    age_seconds = time.time() - os.path.getmtime(path)
+    return age_seconds <= LISTING_CACHE_MAX_AGE_DAYS * 86400
+
+
+def date_to_timestamp(value):
+    if not value:
+        return 0
+    value = str(value).strip()
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return int(datetime.strptime(value, fmt).timestamp())
+        except ValueError:
+            pass
+    return 0
 
 
 GENRE_TRANSLATION = {
@@ -545,7 +569,146 @@ def search_kinopoisk_ids(topics):
     return topics
 
 
-def search_youtube_trailer(title, year):
+TRAILER_POSITIVE = ('trailer', 'трейлер', 'official', 'официальный')
+TRAILER_NEGATIVE = (
+    'review', 'reaction', 'explained', 'ending', 'soundtrack', 'clip', 'scene',
+    'обзор', 'реакция', 'разбор', 'саундтрек', 'песня', 'клип', 'сцена',
+    'прохождение', 'gameplay', 'game trailer',
+    'серия', 'сезон', 'выпуск', 'episode',
+)
+
+
+def _yt_json_text(value):
+    if not value:
+        return ''
+    try:
+        return unescape(json.loads(f'"{value}"'))
+    except Exception:
+        return unescape(value)
+
+
+def _title_tokens(value):
+    value = (value or '').lower()
+    return {
+        token for token in re.findall(r'[a-zа-яё0-9]+', value, flags=re.I)
+        if len(token) >= 3
+    }
+
+
+def _youtube_candidates(html):
+    candidates = []
+    seen = set()
+    for match in re.finditer(r'"videoId":"([a-zA-Z0-9_-]{11})"', html):
+        video_id = match.group(1)
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        chunk = html[match.start():match.start() + 3000]
+        title = ''
+        title_match = re.search(r'"title":\{"runs":\[\{"text":"(.*?)"', chunk)
+        if not title_match:
+            title_match = re.search(r'"title":\{"simpleText":"(.*?)"', chunk)
+        if title_match:
+            title = _yt_json_text(title_match.group(1))
+        channel = ''
+        channel_match = re.search(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', chunk)
+        if channel_match:
+            channel = _yt_json_text(channel_match.group(1))
+        length = ''
+        length_match = re.search(r'"lengthText":\{"[^}]*"simpleText":"(.*?)"', chunk)
+        if length_match:
+            length = _yt_json_text(length_match.group(1))
+        if title:
+            candidates.append({
+                'video_id': video_id,
+                'title': title,
+                'channel': channel,
+                'length': length,
+            })
+        if len(candidates) >= 10:
+            break
+    return candidates
+
+
+def _duration_seconds(value):
+    parts = [int(p) for p in re.findall(r'\d+', value or '')]
+    if not parts:
+        return 0
+    if len(parts) == 1:
+        return parts[0]
+    total = 0
+    for part in parts:
+        total = total * 60 + part
+    return total
+
+
+def _score_youtube_candidate(candidate, title, year):
+    cand_title = (candidate.get('title') or '').lower()
+    cand_channel = (candidate.get('channel') or '').lower()
+    wanted = (title or '').lower().strip()
+    wanted_tokens = _title_tokens(wanted)
+    cand_tokens = _title_tokens(cand_title)
+    if not wanted_tokens or all(token.isdigit() for token in wanted_tokens):
+        return 0
+
+    overlap = len(wanted_tokens & cand_tokens) / max(len(wanted_tokens), 1)
+    score = 0
+    if wanted and wanted in cand_title:
+        score += 45
+    score += int(overlap * 40)
+    if any(word in cand_title for word in ('trailer', 'трейлер')):
+        score += 25
+    if any(word in cand_title for word in ('official', 'официальный')):
+        score += 10
+    if year and str(year) in cand_title:
+        score += 15
+    title_years = set(re.findall(r'\b(19\d{2}|20\d{2})\b', cand_title))
+    if year and title_years and str(year) not in title_years:
+        score -= 70
+    if any(name in cand_channel for name in (
+        'кинопоиск', 'kinopoisk', 'movieclips', 'amazon mgm', 'warner bros',
+        'universal pictures', 'paramount pictures', 'sony pictures',
+        'netflix', 'disney', '20th century studios',
+    )):
+        score += 18
+    if any(name in cand_channel for name in ('rapid trailer', 'kinocheck')):
+        score -= 5
+    if any(word in cand_title for word in TRAILER_NEGATIVE):
+        score -= 35
+    duration = _duration_seconds(candidate.get('length') or '')
+    if duration and duration > 8 * 60:
+        score -= 15
+    if overlap < 0.6 and wanted not in cand_title:
+        score -= 40
+    if not any(word in cand_title for word in TRAILER_POSITIVE[:2]):
+        score -= 30
+    return score
+
+
+def search_youtube_trailer_verified(title, year):
+    queries = [
+        f'{title} {year} official trailer',
+        f'{title} {year} трейлер',
+        f'"{title}" {year} трейлер фильм',
+    ]
+    best = None
+    for query in queries:
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        try:
+            r = SESSION.get(url, timeout=10)
+        except Exception:
+            continue
+        for candidate in _youtube_candidates(r.text):
+            score = _score_youtube_candidate(candidate, title, year)
+            if not best or score > best['score']:
+                best = {**candidate, 'score': score}
+        time.sleep(0.1)
+    if best and best['score'] >= 80:
+        return f"https://www.youtube.com/watch?v={best['video_id']}"
+    return None
+
+
+def search_youtube_trailer_legacy(title, year):
     query = f"{title} {year} official trailer"
     url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
     try:
@@ -556,6 +719,13 @@ def search_youtube_trailer(title, year):
     except Exception:
         pass
     return None
+
+
+def search_youtube_trailer(title, year):
+    verified = search_youtube_trailer_verified(title, year)
+    if verified:
+        return verified
+    return search_youtube_trailer_legacy(title, year)
 
 
 def download_poster(imdb_id, url):
@@ -626,27 +796,81 @@ def clean_and_translate_genre(genre_text):
     return ', '.join(clean)
 
 
+def download_imdb_dataset(url, path, label):
+    print(f"Скачиваю IMDB {label} dataset...")
+    r = SESSION.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.download"
+    with open(tmp_path, 'wb') as f:
+        f.write(r.content)
+    return tmp_path
+
+
+def promote_imdb_dataset(tmp_path, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.replace(tmp_path, path)
+
+
+def remove_file_quietly(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def scan_ratings_dataset(path, needed_ids):
+    found = {}
+    if not os.path.exists(path):
+        return found
+    with gzip.open(path, mode='rt', encoding='utf-8') as f:
+        f.readline()
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) >= 3:
+                tid = parts[0]
+                if tid in needed_ids:
+                    found[tid] = {'rating': parts[1], 'votes': parts[2]}
+                    if len(found) == len(needed_ids):
+                        break
+    return found
+
+
+def scan_basics_dataset(path, needed_ids):
+    found = {}
+    if not os.path.exists(path):
+        return found
+    with gzip.open(path, mode='rt', encoding='utf-8') as f:
+        f.readline()
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            if len(parts) >= 9:
+                tid = parts[0]
+                if tid in needed_ids:
+                    genres = parts[8] if parts[8] != r'\N' else ''
+                    found[tid] = {'type': parts[1], 'genres': genres}
+                    if len(found) == len(needed_ids):
+                        break
+    return found
+
+
 def load_ratings(needed_ids):
     cached = load_json(RATINGS_CACHE) or {}
     if cached and needed_ids.issubset(cached.keys()):
         return {k: v for k, v in cached.items() if k in needed_ids and v is not None}
+    missing_ids = set(needed_ids) - set(cached.keys())
     try:
-        print("Скачиваю IMDB ratings dataset (~8MB)...")
-        r = SESSION.get(RATINGS_URL, stream=True, timeout=120)
-        r.raise_for_status()
-        keep_ids = set(cached.keys()) | needed_ids
-        ratings = {}
-        buf = io.BytesIO(r.content)
-        with gzip.GzipFile(fileobj=buf, mode='rb') as gz:
-            with io.TextIOWrapper(gz, encoding='utf-8') as f:
-                f.readline()
-                for line in f:
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 3:
-                        tid = parts[0]
-                        if tid in keep_ids:
-                            ratings[tid] = {'rating': parts[1], 'votes': parts[2]}
-        for tid in keep_ids:
+        ratings = scan_ratings_dataset(RATINGS_DATASET, missing_ids)
+        if missing_ids and not missing_ids.issubset(ratings.keys()):
+            tmp_path = download_imdb_dataset(RATINGS_URL, RATINGS_DATASET, "ratings")
+            fresh_ratings = scan_ratings_dataset(tmp_path, missing_ids)
+            if fresh_ratings:
+                promote_imdb_dataset(tmp_path, RATINGS_DATASET)
+                ratings = fresh_ratings
+            else:
+                remove_file_quietly(tmp_path)
+                print("   Свежий ratings dataset не содержит нужные ID; оставляю текущий файл")
+        for tid in missing_ids:
             if tid not in ratings:
                 ratings[tid] = None
         ratings = {**cached, **ratings}
@@ -663,24 +887,19 @@ def load_basics(needed_ids):
     cached = load_json(BASICS_CACHE) or {}
     if cached and needed_ids.issubset(cached.keys()):
         return {k: v for k, v in cached.items() if k in needed_ids and v is not None}
+    missing_ids = set(needed_ids) - set(cached.keys())
     try:
-        print("Скачиваю IMDB basics dataset (жанры, ~8MB)...")
-        r = SESSION.get(BASICS_URL, stream=True, timeout=120)
-        r.raise_for_status()
-        keep_ids = set(cached.keys()) | needed_ids
-        basics = {}
-        buf = io.BytesIO(r.content)
-        with gzip.GzipFile(fileobj=buf, mode='rb') as gz:
-            with io.TextIOWrapper(gz, encoding='utf-8') as f:
-                f.readline()
-                for line in f:
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 9:
-                        tid = parts[0]
-                        g = parts[8] if parts[8] != r'\N' else ''
-                        if tid in keep_ids:
-                            basics[tid] = {'type': parts[1], 'genres': g}
-        for tid in keep_ids:
+        basics = scan_basics_dataset(BASICS_DATASET, missing_ids)
+        if missing_ids and not missing_ids.issubset(basics.keys()):
+            tmp_path = download_imdb_dataset(BASICS_URL, BASICS_DATASET, "basics")
+            fresh_basics = scan_basics_dataset(tmp_path, missing_ids)
+            if fresh_basics:
+                promote_imdb_dataset(tmp_path, BASICS_DATASET)
+                basics = fresh_basics
+            else:
+                remove_file_quietly(tmp_path)
+                print("   Свежий basics dataset не содержит нужные ID; оставляю текущий файл")
+        for tid in missing_ids:
             if tid not in basics:
                 basics[tid] = None
         basics = {**cached, **basics}
@@ -992,7 +1211,9 @@ def enrich(topics, ratings, basics):
             if kp_local:
                 t['poster_url'] = kp_local
                 print(f", KP постер ✓", end='')
-        if cache_key in yt_cache:
+        if t.get('youtube_url'):
+            pass
+        elif cache_key in yt_cache:
             t['youtube_url'] = yt_cache[cache_key]
         else:
             yt_url = search_youtube_trailer(eng_title, year)
@@ -1070,6 +1291,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         movie_year = escape(str(t.get('movie_year') or ''))
         seeders = int(t.get('seeders') or 0)
         topic_title = escape(t.get('title', ''))
+        date_ts = date_to_timestamp(t.get('date_str') or t.get('added_at'))
         missing = real_poster_missing or not t.get('kp_rating') or not t.get('youtube_url')
         enrich_btn = f'<button class="eb" data-tid="{escape(t["topic_id"])}" onclick="enrich(this)">◈</button>' if missing else ''
 
@@ -1077,7 +1299,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 
         rated_attr = '1' if t.get('kp_rating') or t.get('imdb_rating') else '0'
 
-        rows.append(f'''<tr data-date="0" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
+        rows.append(f'''<tr data-date="{date_ts}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
 <td><a href="{escape(t['topic_url'])}" class="tn" target="_blank">{escape(t['title'])}</a>
 <div class="ml">
 <span class="tg" onclick="td(this)">+</span>
@@ -1097,7 +1319,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
         cast_short = escape(cast_str)[:120] + '…' if len(cast_str) > 120 else escape(cast_str)
 
-        tiles.append(f'''<div class="tile-card" data-date="0" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
+        tiles.append(f'''<div class="tile-card" data-date="{date_ts}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
 {poster_card}
 <div class="tile-body">
 <a href="{escape(t['topic_url'])}" class="tile-title" target="_blank">{escape(t['title'])}</a>
@@ -1516,26 +1738,28 @@ def main():
                 start = page * PAGE_SIZE
                 url = base_url if start == 0 else f"{base_url}&start={start}"
                 listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
-                if not os.path.exists(listing_cache_path):
-                    print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
-                    try:
-                        r = SESSION.get(url, timeout=30)
-                        r.raise_for_status()
-                        raw = r.content
-                        html = raw.decode('cp1251', errors='replace')
-                        page_topics = parse_forum_page(html, collection=collection)
-                        if page_topics:
-                            with open(listing_cache_path, 'wb') as f:
-                                f.write(raw)
-                    except Exception as e:
-                        print(f"ошибка: {e}")
-                        continue
-                else:
-                    with open(listing_cache_path, 'rb') as f:
-                        raw = f.read()
+                page_topics = []
+                print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
+                try:
+                    r = SESSION.get(url, timeout=30)
+                    r.raise_for_status()
+                    raw = r.content
                     html = raw.decode('cp1251', errors='replace')
                     page_topics = parse_forum_page(html, collection=collection)
-                    print(f"  Страница {page + 1} (start={start}) — из кеша", end=' ', flush=True)
+                    if page_topics:
+                        os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                        with open(listing_cache_path, 'wb') as f:
+                            f.write(raw)
+                except Exception as e:
+                    if listing_cache_is_valid(listing_cache_path):
+                        with open(listing_cache_path, 'rb') as f:
+                            raw = f.read()
+                        html = raw.decode('cp1251', errors='replace')
+                        page_topics = parse_forum_page(html, collection=collection)
+                        print(f"ошибка: {e}; используем кеш", end=' ', flush=True)
+                    else:
+                        print(f"ошибка: {e}; свежего кеша нет")
+                        continue
                 print(f"{len(page_topics)} тем")
                 all_topics.extend(page_topics)
                 if topics_limit and len(all_topics) >= topics_limit:
