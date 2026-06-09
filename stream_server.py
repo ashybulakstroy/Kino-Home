@@ -61,6 +61,8 @@ REFRESH_FILES = [
     'imdb_search_cache.json',
     'kp_search_cache.json',
     'youtube_cache.json',
+    'kinopoisk_trailer_cache.json',
+    'imdb_trailer_cache.json',
     'hidden_topics.json',
     'index-kino.html',
 ]
@@ -1152,7 +1154,7 @@ document.getElementById('poster').style.backgroundImage='url('+p+')';
 document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
 document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
 document.getElementById('cast').textContent=m.cast||'';
-document.getElementById('btns').innerHTML=(m.magnet?'<a href="player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank">▶ Трейлер</a>':'');
+document.getElementById('btns').innerHTML=(m.magnet?'<a href="player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank"'+(m.youtube_url.indexOf('/results?')!==-1?' style="background:#e67e22"':'')+'>▶ Трейлер</a>':'');
 }}
 function next(){{idx=(idx+1)%MOVIES.length;show(idx)}}
 function prev(){{idx=(idx-1+MOVIES.length)%MOVIES.length;show(idx)}}

@@ -23,6 +23,7 @@ imdb_ratings_cache.json
 imdb_search_cache.json
 kp_search_cache.json
 youtube_cache.json
+imdb_trailer_cache.json
 index-kino.html
 
 .pytest_cache/

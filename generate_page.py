@@ -67,6 +67,8 @@ def sanitize_topic(topic):
 SEARCH_CACHE = os.path.join(DATA_DIR, "imdb_search_cache.json")
 KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
 YOUTUBE_CACHE = os.path.join(DATA_DIR, "youtube_cache.json")
+KP_TRAILER_CACHE = os.path.join(DATA_DIR, "kinopoisk_trailer_cache.json")
+IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
 HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
@@ -690,6 +692,9 @@ def search_youtube_trailer_verified(title, year):
         f'{title} {year} official trailer',
         f'{title} {year} трейлер',
         f'"{title}" {year} трейлер фильм',
+        f'{title} {year} trailer',
+        f'{title} official trailer',
+        f'{title} трейлер',
     ]
     best = None
     for query in queries:
@@ -705,27 +710,133 @@ def search_youtube_trailer_verified(title, year):
         time.sleep(0.1)
     if best and best['score'] >= 80:
         return f"https://www.youtube.com/watch?v={best['video_id']}"
-    return None
+    return best
 
 
-def search_youtube_trailer_legacy(title, year):
+def search_youtube_trailer_legacy(title, year, best=None):
+    if best and isinstance(best, dict) and best.get('score', 0) >= 40:
+        return f"https://www.youtube.com/watch?v={best['video_id']}"
     query = f"{title} {year} official trailer"
     url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
     try:
         r = SESSION.get(url, timeout=10)
-        m = re.search(r'/watch\?v=([a-zA-Z0-9_-]{11})', r.text)
-        if m:
-            return f"https://www.youtube.com/watch?v={m.group(1)}"
+        for candidate in _youtube_candidates(r.text):
+            score = _score_youtube_candidate(candidate, title, year)
+            if not best or (isinstance(best, dict) and score > best['score']):
+                best = {**candidate, 'score': score}
+    except Exception:
+        pass
+    if isinstance(best, dict) and best.get('score', 0) >= 20:
+        return f"https://www.youtube.com/watch?v={best['video_id']}"
+    return None
+
+
+def search_youtube_trailer(title, year):
+    best = search_youtube_trailer_verified(title, year)
+    if isinstance(best, str):
+        return best
+    return search_youtube_trailer_legacy(title, year, best)
+
+
+def search_kinopoisk_trailer(kp_id):
+    kp_id = str(kp_id or '').strip()
+    if not kp_id or kp_id == '0':
+        return None
+
+    urls = [
+        f"https://www.kinopoisk.ru/film/{kp_id}/video/type/0/",
+        f"https://www.kinopoisk.ru/film/{kp_id}/video/",
+    ]
+    trailer_words = ('трейлер', 'тизер', 'trailer', 'teaser')
+    try:
+        for url in urls:
+            r = SESSION.get(url, timeout=12, headers={**HEADERS, 'Referer': 'https://www.kinopoisk.ru/'})
+            html = r.text or ''
+            if 'passport.yandex' in r.url or 'sso.kinopoisk' in html:
+                continue
+
+            soup = BeautifulSoup(html, 'html.parser')
+            candidates = []
+            for link in soup.select('a[href*="/video/"]'):
+                href = link.get('href') or ''
+                match = re.search(rf'/film/{re.escape(kp_id)}/video/(\d+)/', href)
+                if not match:
+                    continue
+                text = link.get_text(' ', strip=True).lower()
+                full_url = urllib.parse.urljoin('https://www.kinopoisk.ru/', href)
+                score = 10
+                if any(word in text for word in trailer_words):
+                    score += 50
+                if any(word in text for word in ('фрагмент', 'интервью', 'съемк', 'реклама', 'тв-ролик')):
+                    score -= 40
+                candidates.append((score, full_url))
+
+            if candidates:
+                candidates.sort(reverse=True)
+                best_score, best_url = candidates[0]
+                if best_score >= 50:
+                    return best_url
+
     except Exception:
         pass
     return None
 
 
-def search_youtube_trailer(title, year):
-    verified = search_youtube_trailer_verified(title, year)
-    if verified:
-        return verified
-    return search_youtube_trailer_legacy(title, year)
+def search_imdb_trailer(imdb_id):
+    imdb_id = str(imdb_id or '').strip()
+    if not imdb_id or imdb_id == '0' or not imdb_id.startswith('tt'):
+        return None
+    url = f"https://www.imdb.com/title/{imdb_id}/"
+    try:
+        r = SESSION.get(url, timeout=12, headers={
+            **HEADERS,
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+        html = r.text or ''
+        match = re.search(
+            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        if match:
+            data = json.loads(match.group(1))
+            trailer = data.get('trailer') or {}
+            if isinstance(trailer, dict):
+                embed_url = trailer.get('embedUrl') or ''
+                if 'youtube.com/embed/' in embed_url:
+                    vid_match = re.search(r'/embed/([a-zA-Z0-9_-]{11})', embed_url)
+                    if vid_match:
+                        return f"https://www.youtube.com/watch?v={vid_match.group(1)}"
+    except Exception:
+        pass
+    return None
+
+
+def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
+    if kp_id and str(kp_id) != '0':
+        kp_cache = load_json(KP_TRAILER_CACHE) or {}
+        kp_key = str(kp_id)
+        kp_url = kp_cache.get(kp_key)
+        if not kp_url:
+            kp_url = search_kinopoisk_trailer(kp_id)
+            if kp_url:
+                kp_cache[kp_key] = kp_url
+                save_json(KP_TRAILER_CACHE, kp_cache)
+        if kp_url:
+            return kp_url
+
+    if imdb_id and str(imdb_id) != '0':
+        imdb_cache = load_json(IMDB_TRAILER_CACHE) or {}
+        imdb_key = str(imdb_id)
+        imdb_url = imdb_cache.get(imdb_key)
+        if not imdb_url:
+            imdb_url = search_imdb_trailer(imdb_id)
+            if imdb_url:
+                imdb_cache[imdb_key] = imdb_url
+                save_json(IMDB_TRAILER_CACHE, imdb_cache)
+        if imdb_url:
+            return imdb_url
+
+    return search_youtube_trailer(title, year)
 
 
 def download_poster(imdb_id, url):
@@ -1213,10 +1324,10 @@ def enrich(topics, ratings, basics):
                 print(f", KP постер ✓", end='')
         if t.get('youtube_url'):
             pass
-        elif cache_key in yt_cache:
+        elif yt_cache.get(cache_key):
             t['youtube_url'] = yt_cache[cache_key]
         else:
-            yt_url = search_youtube_trailer(eng_title, year)
+            yt_url = resolve_trailer_url(eng_title, year, t.get('kp_id'), t.get('imdb_id'))
             t['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
@@ -1260,6 +1371,8 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         votes_title = f' title="{votes} голосов"' if votes else ''
         trailer_q = urllib.parse.quote(f"{t['movie_title']} {t['movie_year']} official trailer")
         trailer_url = t.get('youtube_url') or f"https://www.youtube.com/results?search_query={trailer_q}"
+        trailer_is_fallback = '/results?' in trailer_url or not t.get('youtube_url')
+        trailer_cls = 'bt bt-warn' if trailer_is_fallback else 'bt'
         clean_t = escape(t['movie_title'].lower().strip())
 
         real_poster_missing = not has_real_poster(t)
@@ -1304,7 +1417,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 <div class="ml">
 <span class="tg" onclick="td(this)">+</span>
 <span class="un">{escape(t['author'])}</span>
-<a href="{trailer_url}" onclick="window.open(this.href,'tr','width=960,height=540,menubar=no,toolbar=no,location=no');return false" class="bt">▶ Трейлер</a>
+<a href="{trailer_url}" onclick="window.open(this.href,'tr','width=960,height=540,menubar=no,toolbar=no,location=no');return false" class="{trailer_cls}">▶ Трейлер</a>
 <a href="{rating_url}" target="_blank"{votes_title}><span class="rb {rating_cls}">{rating_label} {escape(str(rating))}{escape(votes_str)}</span></a>
 {enrich_btn}
 <span class="rmv" onclick="hm(this)">✕</span>
@@ -1332,7 +1445,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 {'' if not cast_short else f'<div class="tile-cast">{cast_short}</div>'}
 <div class="tile-actions">
 {enrich_btn}
-<a href="{trailer_url}" onclick="window.open(this.href,'tr','width=960,height=540,menubar=no,toolbar=no,location=no');return false" class="bt">▶ Трейлер</a>
+<a href="{trailer_url}" onclick="window.open(this.href,'tr','width=960,height=540,menubar=no,toolbar=no,location=no');return false" class="{trailer_cls}">▶ Трейлер</a>
 <button class="wb" {watch_attrs} onclick="watch(this)">▶ Смотреть</button>
 <a href="{escape(magnet)}" class="bm" title="Скачать kino">🧲</a>
 <a href="{rating_url}" target="_blank" class="tile-imdb">{rating_label}</a>
@@ -1383,6 +1496,8 @@ td{{padding:12px 16px;font-size:14px;vertical-align:middle}}
 .ml{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 8px}}
 .bt{{display:inline-block;padding:2px 8px;font-size:11px;font-weight:600;color:#fff;background:#da3633;border-radius:4px;text-decoration:none;white-space:nowrap}}
 .bt:hover{{background:#b62324}}
+.bt-warn{{background:#e67e22}}
+.bt-warn:hover{{background:#d35400}}
 .rb{{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none}}
 .rbi .rb{{font-size:33px}}
 .rh{{background:#f5c518;color:#000}}
@@ -1624,10 +1739,10 @@ def enrich_topic(topic, force_poster_retry=False):
 
     if not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
-        if cache_key in yt_cache:
+        if yt_cache.get(cache_key):
             topic['youtube_url'] = yt_cache[cache_key]
         else:
-            yt_url = search_youtube_trailer(title, year)
+            yt_url = resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
             topic['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
