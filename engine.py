@@ -45,7 +45,7 @@ PIECE_PRIORITY_NONE = 0
 PIECE_PRIORITY_HIGH = 7
 PIECE_PRIORITY_LOW = 1
 HIGH_PRIORITY_COUNT = 2
-READY_THRESHOLD = 0.03
+READY_THRESHOLD = 0.01
 
 
 class TorrentEngine:
@@ -77,12 +77,16 @@ class TorrentEngine:
             if existing:
                 try:
                     existing.status()
-                    return info_hash
+                    if self._video_file_missing(existing):
+                        self.ses.remove_torrent(existing)
+                        self.handles.pop(info_hash, None)
+                    else:
+                        self._start_handle(existing)
+                        return info_hash
                 except RuntimeError:
                     pass
 
-        params = lt.parse_magnet_uri(magnet_url)
-        params.save_path = self.temp_dir
+        params = self._magnet_params(magnet_url)
         handle = self.ses.add_torrent(params)
         deadline = time.monotonic() + timeout
         while not handle.status().has_metadata:
@@ -93,6 +97,7 @@ class TorrentEngine:
         info = handle.torrent_file()
         info_hash = str(info.info_hash())
         self._prioritize_streaming_file(handle)
+        self._start_handle(handle)
 
         self.handles[info_hash] = handle
         return info_hash
@@ -107,12 +112,16 @@ class TorrentEngine:
         if existing:
             try:
                 existing.status()
-                return info_hash
+                if self._video_file_missing(existing):
+                    self.ses.remove_torrent(existing)
+                    self.handles.pop(info_hash, None)
+                else:
+                    self._start_handle(existing)
+                    return info_hash
             except RuntimeError:
                 self.handles.pop(info_hash, None)
 
-        params = lt.parse_magnet_uri(magnet_url)
-        params.save_path = self.temp_dir
+        params = self._magnet_params(magnet_url)
         handle = self.ses.add_torrent(params)
         self.handles[info_hash] = handle
 
@@ -126,15 +135,46 @@ class TorrentEngine:
                 time.sleep(0.1)
             info = handle.torrent_file()
             self._prioritize_streaming_file(handle)
+            self._start_handle(handle)
 
         t = threading.Thread(target=_wait_metadata, daemon=True)
         t.start()
         return info_hash
 
+    def _magnet_params(self, magnet_url: str):
+        params = lt.parse_magnet_uri(magnet_url)
+        params.save_path = self.temp_dir
+        params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        params.flags &= ~lt.torrent_flags.paused
+        params.flags &= ~lt.torrent_flags.auto_managed
+        params.flags &= ~lt.torrent_flags.stop_when_ready
+        params.flags |= lt.torrent_flags.sequential_download
+        return params
+
+    @staticmethod
+    def _start_handle(handle: lt.torrent_handle):
+        try:
+            handle.auto_managed(False)
+            handle.resume()
+        except RuntimeError:
+            pass
+
+    def _video_file_missing(self, handle: lt.torrent_handle) -> bool:
+        try:
+            if not handle.status().has_metadata:
+                return False
+            video_path = self._get_video_path(handle)
+            return bool(video_path and not os.path.exists(video_path))
+        except RuntimeError:
+            return False
+
     def get_status(self, info_hash: str) -> dict | None:
         handle = self.handles.get(info_hash)
         if not handle:
             return None
+
+        self.ensure_file_integrity(info_hash)
+
         s = handle.status()
         if not s.has_metadata:
             return {
@@ -151,6 +191,7 @@ class TorrentEngine:
                 'file_size': 0,
                 'name': 'Получение метаданных...',
             }
+
         total = s.total_wanted
         downloaded = s.total_wanted_done
         progress = (downloaded / total) if total > 0 else 0
@@ -163,14 +204,41 @@ class TorrentEngine:
             ext = os.path.splitext(video_path)[1].lower()
             if ext:
                 video_format = ext.lstrip('.')
+            if s.total_wanted_done > 0 and not os.path.exists(video_path):
+                return {
+                    'progress': 0,
+                    'downloaded': 0,
+                    'total': total if total > 0 else 1,
+                    'download_rate': 0,
+                    'upload_rate': s.upload_rate,
+                    'num_peers': s.num_peers,
+                    'num_seeds': s.num_seeds,
+                    'state': 'file_missing',
+                    'ready': False,
+                    'video_path': video_path,
+                    'file_size': 0,
+                    'name': handle.torrent_file().name(),
+                    'format': video_format,
+                }
 
         streamable = video_format in ('mkv', 'mp4')
         num_pieces = handle.torrent_file().num_pieces()
-        check_count = min(HIGH_PRIORITY_COUNT, num_pieces)
-        first_done = all(handle.have_piece(i) for i in range(check_count))
-        last_done = all(handle.have_piece(i) for i in range(num_pieces - check_count, num_pieces))
+        video = self._get_video_file(handle)
+        if video:
+            vindex, vsize, _ = video
+            tm = handle.torrent_file()
+            vstart = tm.map_file(vindex, 0, 1).piece
+            vend = tm.map_file(vindex, max(0, vsize - 1), 1).piece
+            check_count = min(HIGH_PRIORITY_COUNT, vend - vstart + 1)
+            first_done = all(handle.have_piece(i) for i in range(vstart, vstart + check_count))
+            last_done = all(handle.have_piece(i) for i in range(vend - check_count + 1, vend + 1))
+        else:
+            check_count = min(HIGH_PRIORITY_COUNT, num_pieces)
+            first_done = all(handle.have_piece(i) for i in range(check_count))
+            last_done = all(handle.have_piece(i) for i in range(num_pieces - check_count, num_pieces))
         enough_overall = progress >= READY_THRESHOLD
         ready = (progress >= 1.0) if not streamable else (first_done and (last_done or enough_overall))
+        state = 'downloading' if s.download_rate > 0 else str(s.state)
 
         return {
             'progress': round(progress, 4),
@@ -180,7 +248,7 @@ class TorrentEngine:
             'upload_rate': s.upload_rate,
             'num_peers': s.num_peers,
             'num_seeds': s.num_seeds,
-            'state': str(s.state),
+            'state': state,
             'ready': ready,
             'video_path': video_path,
             'file_size': file_size,
@@ -213,6 +281,28 @@ class TorrentEngine:
         if piece_index < 0 or piece_index >= handle.torrent_file().num_pieces():
             return False
         return handle.have_piece(piece_index)
+
+    def ensure_file_integrity(self, info_hash: str):
+        handle = self.handles.get(info_hash)
+        if not handle:
+            return
+        try:
+            s = handle.status()
+            if not s.has_metadata or s.total_wanted_done <= 0:
+                return
+            if s.checking_files or s.queued_for_checking:
+                return
+            video_path = self._get_video_path(handle)
+            if not video_path:
+                return
+            if not os.path.exists(video_path):
+                handle.force_recheck()
+                return
+            if os.path.getsize(video_path) == 0:
+                handle.force_recheck()
+                return
+        except RuntimeError:
+            pass
 
     def prioritize_piece_range(self, info_hash: str, start_piece: int, end_piece: int):
         handle = self.handles.get(info_hash)
@@ -248,7 +338,19 @@ class TorrentEngine:
             if need_next_block and block_end < num_pieces - 1:
                 horizon = min(block_end + readahead_pieces, num_pieces - 1)
 
-            priorities = [PIECE_PRIORITY_NONE] * num_pieces
+            priorities = [PIECE_PRIORITY_LOW] * num_pieces
+
+            video = self._get_video_file(handle)
+            if video:
+                vindex, vsize, _ = video
+                tm = handle.torrent_file()
+                vstart = tm.map_file(vindex, 0, 1).piece
+                vend = tm.map_file(vindex, max(0, vsize - 1), 1).piece
+                for i in range(vstart, min(vstart + HIGH_PRIORITY_COUNT, vend + 1)):
+                    priorities[i] = PIECE_PRIORITY_HIGH
+                for i in range(max(vstart, vend - HIGH_PRIORITY_COUNT + 1), vend + 1):
+                    priorities[i] = PIECE_PRIORITY_HIGH
+
             for i in range(block_start, horizon + 1):
                 priorities[i] = PIECE_PRIORITY_HIGH
             handle.prioritize_pieces(priorities)
@@ -429,20 +531,19 @@ class TorrentEngine:
     def _prioritize_streaming_file(self, handle: lt.torrent_handle):
         info = handle.torrent_file()
         num_pieces = info.num_pieces()
-        priorities = [PIECE_PRIORITY_LOW] * num_pieces
+        priorities = [PIECE_PRIORITY_NONE] * num_pieces
         video = self._get_video_file(handle)
         if not video:
             handle.prioritize_pieces(priorities)
             return
 
         file_index, file_size, _path = video
-        file_priorities = [0] * info.files().num_files()
-        file_priorities[file_index] = PIECE_PRIORITY_LOW
-        handle.prioritize_files(file_priorities)
 
         start_piece = info.map_file(file_index, 0, 1).piece
         end_piece = info.map_file(file_index, max(0, file_size - 1), 1).piece
 
+        for i in range(start_piece, end_piece + 1):
+            priorities[i] = PIECE_PRIORITY_LOW
         for i in range(start_piece, min(start_piece + HIGH_PRIORITY_COUNT, end_piece + 1)):
             priorities[i] = PIECE_PRIORITY_HIGH
         for i in range(max(start_piece, end_piece - HIGH_PRIORITY_COUNT + 1), end_piece + 1):

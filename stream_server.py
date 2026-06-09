@@ -834,6 +834,10 @@ def stop_session():
     _stop_stream_session(str(sid) if sid else None)
     if hash:
         engine.pause(str(hash))
+        with _sessions_lock:
+            expired = [sid for sid, item in _stream_sessions.items() if item.get('hash') == str(hash)]
+            for esid in expired:
+                _stream_sessions.pop(esid, None)
     if not sid and not hash:
         with _sessions_lock:
             for sid, item in list(_stream_sessions.items()):
