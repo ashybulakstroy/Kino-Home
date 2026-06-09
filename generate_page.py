@@ -33,14 +33,43 @@ RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 RATINGS_CACHE = os.path.join(DATA_DIR, "imdb_ratings_cache.json")
 BASICS_CACHE = os.path.join(DATA_DIR, "imdb_basics_cache.json")
+
+FORBIDDEN_GENRES = {'ужасы', 'horror', 'секс', 'sex', 'эротика', 'erotica', 'порно', 'porn'}
+
+
+def is_forbidden_topic(topic):
+    for g in topic.get('genre', '').split(','):
+        if g.strip().lower() in FORBIDDEN_GENRES:
+            return True
+    title = (topic.get('movie_title', '') + ' ' + topic.get('orig_title', '')).lower()
+    for kw in FORBIDDEN_GENRES:
+        if kw in title:
+            return True
+    return False
+
+
+def sanitize_topic(topic):
+    topic['poster_url'] = 'data/posters/placeholder.png'
+    topic['kp_rating'] = '0'
+    topic['kp_votes'] = '0'
+    topic['imdb_rating'] = '0'
+    topic['imdb_votes'] = '0'
+    topic['kp_id'] = '0'
+    topic['imdb_id'] = '0'
+    topic['youtube_url'] = '0'
+    topic['magnet'] = '0'
+    topic['_sanitized'] = True
+    add_hidden_topic(topic['topic_id'])
+    return topic
 SEARCH_CACHE = os.path.join(DATA_DIR, "imdb_search_cache.json")
 KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
 YOUTUBE_CACHE = os.path.join(DATA_DIR, "youtube_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
+HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
 POSTERS_DIR = os.path.join(DATA_DIR, "posters")
 POSTERS_URL = "data/posters"
-POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.jpg"
+POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.png"
 POSTER_RETRY_DAYS = 7
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
 
@@ -958,6 +987,11 @@ def enrich(topics, ratings, basics):
                 print(f"IMDB {rdata['rating']}", end='')
             elif not t.get('imdb_rating'):
                 print(f"ID {imdb_id} — нет рейтинга", end='')
+        if not has_real_poster(t) and t.get('kp_id'):
+            kp_local = download_kinopoisk_poster(t['kp_id'])
+            if kp_local:
+                t['poster_url'] = kp_local
+                print(f", KP постер ✓", end='')
         if cache_key in yt_cache:
             t['youtube_url'] = yt_cache[cache_key]
         else:
@@ -972,7 +1006,9 @@ def enrich(topics, ratings, basics):
     return topics
 
 
-def generate_html(topics):
+def generate_html(topics, hidden_ids: set[str] | None = None):
+    if hidden_ids is None:
+        hidden_ids = load_hidden_topic_ids()
     rows = []
     tiles = []
 
@@ -983,6 +1019,8 @@ def generate_html(topics):
 
     for t in topics:
         if not t.get('magnet'):
+            continue
+        if str(t.get('topic_id', '')) in hidden_ids:
             continue
         rating = t['kp_rating'] or t['imdb_rating'] or '—'
         rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
@@ -1022,7 +1060,7 @@ def generate_html(topics):
         else:
             container = ''
         fmt_html = f'<span class="tile-format">Формат: {escape(cont)}</span>' if cont else ''
-        poster_html = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="ps" alt=""><span class="pb">▶</span></div>'
+        poster_html = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" data-src="{escape(poster)}" class="ps" alt=""><span class="pb">▶</span></div>'
         cast_html = f'<p class="ca">{escape(cast_str)}</p>' if cast_str else ''
         genre_html = f'<p class="gn">{escape(genre)}</p>' if genre else ''
         fmt_row = f'<p class="ff">Формат: {escape(cont)}</p>' if cont else ''
@@ -1039,7 +1077,7 @@ def generate_html(topics):
 
         rated_attr = '1' if t.get('kp_rating') or t.get('imdb_rating') else '0'
 
-        rows.append(f'''<tr data-date="0" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
+        rows.append(f'''<tr data-date="0" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
 <td><a href="{escape(t['topic_url'])}" class="tn" target="_blank">{escape(t['title'])}</a>
 <div class="ml">
 <span class="tg" onclick="td(this)">+</span>
@@ -1056,10 +1094,10 @@ def generate_html(topics):
 <td data-s="{rating or '0'}"><a href="{escape(magnet)}" class="bm" title="Скачать kino">🧲</a><button class="wb" {watch_attrs} onclick="watch(this)">▶ Смотреть</button></td>
 </tr>''')
 
-        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
+        poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
         cast_short = escape(cast_str)[:120] + '…' if len(cast_str) > 120 else escape(cast_str)
 
-        tiles.append(f'''<div class="tile-card" data-date="0" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
+        tiles.append(f'''<div class="tile-card" data-date="0" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
 {poster_card}
 <div class="tile-body">
 <a href="{escape(t['topic_url'])}" class="tile-title" target="_blank">{escape(t['title'])}</a>
@@ -1225,10 +1263,10 @@ function st(c,t){{var tb=document.querySelector('#tbl tbody'),r=Array.from(tb.ch
 r.sort(function(x,y){{var va=x.children[c].getAttribute('data-s')||(t==='n'?x.getAttribute('data-date')||'0':x.children[c].textContent.trim()),vb=y.children[c].getAttribute('data-s')||(t==='n'?y.getAttribute('data-date')||'0':y.children[c].textContent.trim());if(t==='n'){{return a*(parseFloat(va)-parseFloat(vb))}}return a*va.localeCompare(vb)}});
 r.forEach(function(r){{tb.appendChild(r)}});sd.i=c;sd.d=a;
 document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});document.querySelectorAll('th')[c].querySelector('.ar').textContent=a>0?'▲':'▼';sortTiles()}}
-function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';r.style.display=on?'none':'';el.textContent=on?'+':'−'}}
+function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
-function hm(el){{var t=el.closest('tr').getAttribute('data-title');if(!t)return;var h=JSON.parse(localStorage.getItem('ph')||'[]');if(h.indexOf(t)===-1)h.push(t);localStorage.setItem('ph',JSON.stringify(h));af()}}
-function htm(el){{var t=el.closest('.tile-card').getAttribute('data-title');if(!t)return;var h=JSON.parse(localStorage.getItem('ph')||'[]');if(h.indexOf(t)===-1)h.push(t);localStorage.setItem('ph',JSON.stringify(h));af()}}
+function hm(el){{var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
+function htm(el){{var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}
 function fh(){{hideSaved('#tbl tbody tr')}}
 function fht(){{hideSaved('.tile-card')}}
@@ -1276,6 +1314,8 @@ async function enrich(el){{var tid=el.getAttribute('data-tid');if(!tid)return;el
 
 def enrich_topic(topic, force_poster_retry=False):
     """Enrich a single topic dict with missing data (poster, magnet, ratings, trailers)."""
+    if topic.get('_sanitized') or topic.get('imdb_id') == '0':
+        return topic
     title = topic.get('orig_title') or topic['movie_title']
     russian_title = topic['movie_title']
     year = topic['movie_year']
@@ -1373,18 +1413,42 @@ def enrich_topic(topic, force_poster_retry=False):
     return topic
 
 
+def load_hidden_topic_ids() -> set[str]:
+    try:
+        data = json.loads(open(HIDDEN_TOPICS_FILE, encoding='utf-8').read())
+        return set(str(t) for t in data if t)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_hidden_topic_ids(ids: set[str]):
+    atomic_write_json(HIDDEN_TOPICS_FILE, sorted(ids))
+
+
+def add_hidden_topic(topic_id: str):
+    ids = load_hidden_topic_ids()
+    ids.add(str(topic_id))
+    save_hidden_topic_ids(ids)
+
+
+def remove_hidden_topic(topic_id: str):
+    ids = load_hidden_topic_ids()
+    ids.discard(str(topic_id))
+    save_hidden_topic_ids(ids)
+
+
 def main():
     refresh = '--refresh' in sys.argv
     quick = '--quick' in sys.argv
     pages_flag = False
     pages_count = 10
     topics_limit = MAX_TOPICS
-    collection = 'nashe_kino'
+    collection_arg = None
 
     limit = 0
     for arg in sys.argv[1:]:
         if arg.startswith('--collection='):
-            collection = arg.split('=')[1]
+            collection_arg = arg.split('=')[1]
         elif arg.startswith('--limit='):
             limit = int(arg.split('=')[1])
         elif arg == '--limit':
@@ -1402,165 +1466,205 @@ def main():
                 pages_flag = True
                 topics_limit = 0
 
-    if collection not in COLLECTIONS:
-        print(f"Неизвестная коллекция '{collection}'. Доступны: {', '.join(COLLECTIONS.keys())}")
+    if collection_arg and collection_arg not in COLLECTIONS:
+        print(f"Неизвестная коллекция '{collection_arg}'. Доступны: {', '.join(COLLECTIONS.keys())}")
         sys.exit(1)
 
     if quick:
         pages_count = 1
         topics_limit = 0
 
-    coll_info = COLLECTIONS[collection]
-    print(f"Коллекция: {coll_info['name']}")
-
+    # Determine which collections to process
     if not refresh and os.path.exists(TORRENTS_CACHE):
+        collections_to_process = []
+    elif collection_arg:
+        collections_to_process = [collection_arg]
+    else:
+        collections_to_process = list(COLLECTIONS.keys())
+
+    if not collections_to_process:
         print("Загружаю кеш...")
         topics = load_json(TORRENTS_CACHE) or []
         cleaned_topics = clean_catalog_topics(topics)
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
             save_json(TORRENTS_CACHE, topics)
+        changed = False
+        for t in topics:
+            if not t.get('_sanitized') and is_forbidden_topic(t):
+                sanitize_topic(t)
+                changed = True
+                print(f"  {t.get('movie_title','')}: скрыто (кеш)")
+        if changed:
+            save_json(TORRENTS_CACHE, topics)
     else:
-        print(f"1. Парсинг {coll_info['name']}...")
-        all_topics = []
-        base_url = coll_info['url']
-        # extract forum id for cache naming
-        m_fid = re.search(r'f=(\d+)', base_url)
-        forum_id = m_fid.group(1) if m_fid else collection
-        for page in range(pages_count):
-            start = page * PAGE_SIZE
-            url = base_url if start == 0 else f"{base_url}&start={start}"
-            listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
-            if not os.path.exists(listing_cache_path):
-                print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
-                try:
-                    r = SESSION.get(url, timeout=30)
-                    r.raise_for_status()
-                    raw = r.content
+        topics = load_json(TORRENTS_CACHE) or []
+        all_new_topics: list[dict] = []
+
+        for col_idx, collection in enumerate(collections_to_process):
+            coll_info = COLLECTIONS[collection]
+            print(f"\n{'='*60}")
+            print(f"Коллекция ({col_idx+1}/{len(collections_to_process)}): {coll_info['name']}")
+            print(f"{'='*60}")
+
+            print(f"1. Парсинг {coll_info['name']}...")
+            all_topics = []
+            base_url = coll_info['url']
+            m_fid = re.search(r'f=(\d+)', base_url)
+            forum_id = m_fid.group(1) if m_fid else collection
+            for page in range(pages_count):
+                start = page * PAGE_SIZE
+                url = base_url if start == 0 else f"{base_url}&start={start}"
+                listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
+                if not os.path.exists(listing_cache_path):
+                    print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
+                    try:
+                        r = SESSION.get(url, timeout=30)
+                        r.raise_for_status()
+                        raw = r.content
+                        html = raw.decode('cp1251', errors='replace')
+                        page_topics = parse_forum_page(html, collection=collection)
+                        if page_topics:
+                            with open(listing_cache_path, 'wb') as f:
+                                f.write(raw)
+                    except Exception as e:
+                        print(f"ошибка: {e}")
+                        continue
+                else:
+                    with open(listing_cache_path, 'rb') as f:
+                        raw = f.read()
                     html = raw.decode('cp1251', errors='replace')
                     page_topics = parse_forum_page(html, collection=collection)
-                    if page_topics:
-                        with open(listing_cache_path, 'wb') as f:
-                            f.write(raw)
-                except Exception as e:
-                    print(f"ошибка: {e}")
-                    continue
-            else:
-                with open(listing_cache_path, 'rb') as f:
-                    raw = f.read()
-                html = raw.decode('cp1251', errors='replace')
-                page_topics = parse_forum_page(html, collection=collection)
-                print(f"  Страница {page + 1} (start={start}) — из кеша", end=' ', flush=True)
-            print(f"{len(page_topics)} тем")
-            all_topics.extend(page_topics)
-            if topics_limit and len(all_topics) >= topics_limit:
-                all_topics = all_topics[:topics_limit]
-                print(f"  Достигнут лимит в {topics_limit} топиков")
-                break
-            time.sleep(0.5)
+                    print(f"  Страница {page + 1} (start={start}) — из кеша", end=' ', flush=True)
+                print(f"{len(page_topics)} тем")
+                all_topics.extend(page_topics)
+                if topics_limit and len(all_topics) >= topics_limit:
+                    all_topics = all_topics[:topics_limit]
+                    print(f"  Берём {topics_limit} тем (MAX_TOPICS)")
+                    break
+                time.sleep(0.5)
 
-        print(f"\nВсего найдено тем: {len(all_topics)}")
+            print(f"\nВсего найдено тем: {len(all_topics)}")
 
-        if limit and len(all_topics) > limit:
-            all_topics = all_topics[:limit]
-            print(f"  (лимит --limit={limit} применён к свежему набору)")
+            if limit and len(all_topics) > limit:
+                all_topics = all_topics[:limit]
+                print(f"  (лимит --limit={limit} применён к свежему набору)")
 
-        if not all_topics:
-            print("  Новых тем нет, сохраняем кеш как есть")
-            topics = load_json(TORRENTS_CACHE) or []
-            save_json(TORRENTS_CACHE, topics)
-            generate_html_only = True
-        else:
-            generate_html_only = False
+            if not all_topics:
+                print("  Новых тем нет для этой коллекции")
+                continue
 
-        print("2. Слияние с кешем...")
-        cached = load_json(TORRENTS_CACHE) or []
-        cache_by_id = {t['topic_id']: t for t in cached if t.get('topic_id')}
+            print("2. Слияние с кешем...")
+            cache_by_id = {t['topic_id']: t for t in topics if t.get('topic_id')}
 
-        # Refresh adds/updates fetched topics; existing valid topics in the same
-        # collection stay until housekeeping removes them by age.
-        fetched_ids = {nt['topic_id'] for nt in all_topics}
-        other = [t for t in cached if t.get('collection', 'nashe_kino') != collection]
-        existing_current = [
-            t for t in cached
-            if t.get('collection', 'nashe_kino') == collection
-            and t.get('topic_id') not in fetched_ids
-        ]
+            other = [t for t in topics if t.get('collection', 'nashe_kino') != collection]
+            # Keep ALL existing topics from this collection (no updates)
+            existing_current = [
+                t for t in topics
+                if t.get('collection', 'nashe_kino') == collection
+            ]
+            existing_ids = {t['topic_id'] for t in existing_current}
 
-        new_current = []
-        merged_current = []
-        for t in all_topics:
-            tid = t['topic_id']
-            if tid in cache_by_id:
-                old = cache_by_id[tid]
-                old['seeders'] = t['seeders']
-                old['leechers'] = t['leechers']
-                old['size_str'] = t['size_str']
-                old['size_bytes'] = t['size_bytes']
-                old['date_str'] = t['date_str']
-                old['title'] = t['title']
-                old['movie_title'] = t['movie_title']
-                if t.get('orig_title'):
-                    old['orig_title'] = t['orig_title']
-                old['collection'] = collection
-                merged_current.append(old)
-            else:
-                new_current.append(t)
-                merged_current.append(t)
-        merged_current.extend(existing_current)
+            # Add only genuinely new topics (not already in cache)
+            new_current: list[dict] = []
+            for t in all_topics:
+                if t['topic_id'] not in existing_ids:
+                    new_current.append(t)
 
-        merged = other + merged_current
-        new_topics = new_current
-        print(f"  В кеше: {len(cached)}, новых: {len(new_current)}, "
-              f"из других коллекций: {len(other)}, всего: {len(merged)}")
+            merged = other + existing_current + new_current
+            print(f"  В кеше: {len(cache_by_id)}, свежих (всего): {len(all_topics)}, "
+                  f"новых: {len(new_current)}, "
+                  f"из других коллекций: {len(other)}, всего: {len(merged)}")
 
-        if not generate_html_only:
-            need_fetch = [t for t in merged if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
+            need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
             if need_fetch:
-                print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} тем...")
+                print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} новых тем...")
                 fetch_magnets(need_fetch)
+                for t in need_fetch:
+                    if is_forbidden_topic(t):
+                        sanitize_topic(t)
+                        print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
 
-        topics = clean_catalog_topics(merged) if not generate_html_only else clean_catalog_topics(topics)
-        topic_ids = {t.get('topic_id') for t in topics}
-        new_topics = [t for t in new_topics if t.get('topic_id') in topic_ids]
+            topics = clean_catalog_topics(merged)
+            topic_ids = {t.get('topic_id') for t in topics}
+            all_new_topics.extend(t for t in new_current if t.get('topic_id') in topic_ids)
+            save_json(TORRENTS_CACHE, topics)
+
+        # Enrich all new topics across all collections in one batch
+        if all_new_topics:
+            print(f"\n{'='*60}")
+            print("Обогащение новых тем за все коллекции")
+            print(f"{'='*60}")
+
+            print("\n4. Поиск IMDB ID...")
+            search_imdb_ids(all_new_topics)
+
+            print("\n5. Поиск Кинопоиск рейтинга...")
+            search_kinopoisk_ids(all_new_topics)
+
+            needed_ids = set()
+            for t in all_new_topics:
+                if t.get('imdb_id'):
+                    needed_ids.add(t['imdb_id'])
+
+            if needed_ids:
+                print(f"\n6. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
+                ratings = load_ratings(needed_ids)
+                print(f"   Получено рейтингов: {sum(1 for k in needed_ids if k in ratings)}/{len(needed_ids)}")
+
+                print(f"\n7. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
+                basics = load_basics(needed_ids)
+                print(f"   Получено жанров: {sum(1 for k in needed_ids if k in basics)}/{len(needed_ids)}")
+            else:
+                ratings = {}
+                basics = {}
+
+            print(f"\n8. Обогащение данных...")
+            enrich(all_new_topics, ratings, basics)
+
+            print(f"\n9. Проверка запрещённых тем...")
+            for t in all_new_topics:
+                if t.get('_sanitized'):
+                    continue
+                if is_forbidden_topic(t):
+                    sanitize_topic(t)
+                    print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
+        else:
+            print("\nНовых тем нет, обогащение пропущено")
+
+        print("\n9. Проверка запрещённых тем (весь кеш)...")
+        sanitized = 0
+        for t in topics:
+            if not t.get('_sanitized') and is_forbidden_topic(t):
+                sanitize_topic(t)
+                sanitized += 1
+                print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
+        if sanitized:
+            print(f"  Всего скрыто: {sanitized}")
+        else:
+            print("  Чисто")
+
+        print("\n10. Кинопоиск постеры (для всех)...")
+        kp_count = 0
+        for t in topics:
+            if not has_real_poster(t) and t.get('kp_id'):
+                kp_local = download_kinopoisk_poster(t['kp_id'])
+                if kp_local:
+                    t['poster_url'] = kp_local
+                    kp_count += 1
+                    print(f"  {t.get('movie_title','')}: KP постер ✓")
+        if kp_count:
+            print(f"  Загружено: {kp_count}")
+        else:
+            print("  Нет нуждающихся")
+
+        topics.sort(key=lambda t: t.get('seeders', 0) or 0, reverse=True)
         save_json(TORRENTS_CACHE, topics)
 
-        if not generate_html_only:
-            if new_topics:
-                print("\n4. Поиск IMDB ID...")
-                search_imdb_ids(new_topics)
-
-                print("\n5. Поиск Кинопоиск рейтинга...")
-                search_kinopoisk_ids(new_topics)
-
-                needed_ids = set()
-                for t in new_topics:
-                    if t.get('imdb_id'):
-                        needed_ids.add(t['imdb_id'])
-
-                if needed_ids:
-                    print(f"\n6. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
-                    ratings = load_ratings(needed_ids)
-                    print(f"   Получено рейтингов: {sum(1 for k in needed_ids if k in ratings)}/{len(needed_ids)}")
-
-                    print(f"\n7. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
-                    basics = load_basics(needed_ids)
-                    print(f"   Получено жанров: {sum(1 for k in needed_ids if k in basics)}/{len(needed_ids)}")
-                else:
-                    ratings = {}
-                    basics = {}
-
-                print(f"\n8. Обогащение данных...")
-                enrich(new_topics, ratings, basics)
-            else:
-                print("\n4-8. Новых тем нет, тяжелое обогащение пропущено")
-
-            topics.sort(key=lambda t: t.get('seeders', 0) or 0, reverse=True)
-
-            save_json(TORRENTS_CACHE, topics)
-
-    print(f"\n9. Генерация HTML ({len(topics)} фильмов)...")
-    output = generate_html(topics)
+    hidden_ids = load_hidden_topic_ids()
+    print(f"\n{'='*60}")
+    print(f"Генерация HTML ({len(topics)} фильмов, скрыто: {len(hidden_ids)})...")
+    output = generate_html(topics, hidden_ids=hidden_ids)
     atomic_write_text(OUTPUT_FILE, output)
     print(f"Готово: {OUTPUT_FILE}")
     print(f"\nЗапусти: python stream_server.py")

@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import mimetypes
+import socket
 import threading
 import subprocess
 import shutil
@@ -38,9 +39,13 @@ app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path='')
 
 STREAM_IDLE_TIMEOUT = 30
 SESSION_SWEEP_INTERVAL = 10
+MAX_STREAM_SESSIONS = 10
 _sessions_lock = threading.Lock()
 _stream_sessions: dict[str, dict[str, float | str]] = {}
 _session_monitor_started = False
+
+_rate_limit_store: dict[str, float] = {}
+RATE_LIMIT_SECONDS = 1.0
 
 _enrich_status: dict[str, str] = {}
 _enrich_lock = threading.Lock()
@@ -434,7 +439,20 @@ def _ensure_periodic_enrich():
     t.start()
 
 
+def _rate_limit(key: str, seconds: float = RATE_LIMIT_SECONDS) -> bool:
+    now = time.monotonic()
+    last = _rate_limit_store.get(key)
+    if last and now - last < seconds:
+        return False
+    _rate_limit_store[key] = now
+    return True
+
+
 def _mark_stream_session(info_hash: str) -> str:
+    with _sessions_lock:
+        if len(_stream_sessions) >= MAX_STREAM_SESSIONS:
+            if info_hash not in {s['hash'] for s in _stream_sessions.values()}:
+                raise RuntimeError(f'Too many active streams ({MAX_STREAM_SESSIONS})')
     sid = request.args.get('sid') or request.headers.get('X-Player-Session')
     if not sid:
         sid = f'{request.remote_addr or "local"}:{info_hash}'
@@ -556,7 +574,10 @@ STREAM_READ_CHUNK = 1024 * 1024
 
 @app.route('/stream/<info_hash>')
 def stream(info_hash):
-    sid = _mark_stream_session(info_hash)
+    try:
+        sid = _mark_stream_session(info_hash)
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 503
     touch_session = lambda: _touch_stream_session(sid)
     handle = engine.get_handle(info_hash)
     if not handle:
@@ -757,11 +778,29 @@ def index():
     index_path = DATA_DIR / 'index-kino.html'
 
     if not index_path.exists():
-        return '<h1>HomeKino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
+        return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
+
+    stat = index_path.stat()
+    INJECT_VER = 'v3'
+    etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
+
+    if request.if_none_match.contains(etag_val):
+        return Response(status=304)
+
     html = index_path.read_text('utf-8')
-    refresh_btn = '<a class="rf" href="/refresh" title="Обновить данные с Pirate Bay" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🔄</a>'
+    refresh_btn = '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
-    return html
+    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
+    html = html.replace('</div>\n\n<table id="tbl">', f'</div>\n{browse_links}<table id="tbl">')
+    bl_style = '<style>.bl{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}.bl a{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}.bl a:hover{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}</style>'
+    html = html.replace('</head>', f'{bl_style}</head>', 1)
+
+    resp = Response(html, content_type='text/html')
+    resp.set_etag(etag_val)
+    resp.cache_control.public = True
+    resp.cache_control.max_age = 0
+    resp.cache_control.must_revalidate = True
+    return resp
 
 
 @app.route('/refresh')
@@ -793,6 +832,8 @@ def refresh():
 
 @app.route('/cleanup')
 def cleanup_trigger():
+    if not _rate_limit(f'cleanup:{request.remote_addr}', seconds=10):
+        return jsonify(error='rate limited'), 429
     removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
     topics = cleanup_old_topics()
     return jsonify(removed=removed, count=len(removed), topics=topics)
@@ -805,6 +846,8 @@ def torrents_data():
 
 @app.route('/enrich/all', methods=['POST'])
 def enrich_all():
+    if not _rate_limit(f'enrich:{request.remote_addr}', seconds=30):
+        return jsonify(error='rate limited'), 429
     threading.Thread(target=_enrich_missing, args=[True], daemon=True).start()
     return jsonify(status='started')
 
@@ -828,10 +871,843 @@ def enrich_status(topic_id):
     return jsonify(status=status)
 
 
+@app.route('/hide/<topic_id>', methods=['POST'])
+def hide_topic(topic_id):
+    if not _rate_limit(f'hide:{request.remote_addr}'):
+        return jsonify(error='rate limited'), 429
+    gp.add_hidden_topic(topic_id)
+    data_path = DATA_DIR / 'torrents_data.json'
+    if data_path.exists():
+        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        atomic_write_text(DATA_DIR / 'index-kino.html', html)
+    return jsonify(ok=True)
+
+
+@app.route('/unhide/<topic_id>', methods=['POST'])
+def unhide_topic(topic_id):
+    if not _rate_limit(f'unhide:{request.remote_addr}'):
+        return jsonify(error='rate limited'), 429
+    gp.remove_hidden_topic(topic_id)
+    data_path = DATA_DIR / 'torrents_data.json'
+    if data_path.exists():
+        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        atomic_write_text(DATA_DIR / 'index-kino.html', html)
+    return jsonify(ok=True)
+
+
 @app.after_request
 def add_cors(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
+    if request.path.startswith('/data/posters/'):
+        response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
     return response
+
+
+# ---------------------------------------------------------------------------
+# Browse modes
+# ---------------------------------------------------------------------------
+def _get_movies():
+    p = DATA_DIR / 'torrents_data.json'
+    if not p.exists():
+        return []
+    return json.loads(p.read_text('utf-8'))
+
+
+BROWSE_CSS = '''
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#141414;color:#fff;min-height:100vh}
+a{color:#e50914;text-decoration:none}
+h1{font-size:24px;font-weight:700;padding:20px 30px 10px}
+h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
+.back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}
+.back:hover{background:#e50914;border-color:#e50914}
+'''
+
+
+@app.route('/test')
+def browse_test():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    count = len(movies)
+    genres = sorted({g.strip() for m in movies for g in m.get('genre', '').split(',') if g.strip()})
+    years = sorted({m['movie_year'] for m in movies if m.get('movie_year')}, reverse=True)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>LocaL-Kino — Тест режимов</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#141414;color:#fff;padding:30px;min-height:100vh}}
+h1{{font-size:28px;margin-bottom:6px}}
+.sub{{color:#888;margin-bottom:30px;font-size:14px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}}
+.card{{background:#1f1f1f;border-radius:10px;padding:20px;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,.4)}}
+.card h3{{font-size:18px;margin-bottom:8px}}
+.card p{{font-size:13px;color:#aaa;margin-bottom:12px;line-height:1.4}}
+.card a{{display:inline-block;background:#e50914;color:#fff;padding:8px 18px;border-radius:4px;font-size:13px;text-decoration:none;margin-right:8px}}
+.card a:hover{{background:#f40612}}
+.tag{{display:inline-block;background:#333;color:#aaa;font-size:11px;padding:2px 8px;border-radius:3px;margin-right:4px;margin-top:6px}}
+</style></head><body>
+<h1>🧪 Режимы просмотра</h1>
+<p class="sub">{count} фильмов, {len(genres)} жанров, {len(years)} годов выпуска</p>
+<div class="grid">
+<div class="card"><h3>🎠 Carousel</h3><p>Netflix-стиль: горизонтальные ряды по жанрам. Скролл колёсиком мыши или стрелками.</p><a href="/browse/carousel">Открыть</a><span class="tag">постеры</span><span class="tag">жанры</span></div>
+<div class="card"><h3>🎲 Random</h3><p>Случайный фильм на весь экран: постер, описание, трейлер. Клавиши ← → для навигации.</p><a href="/browse/random">Открыть</a><span class="tag">одна карточка</span><span class="tag">клавиши</span></div>
+<div class="card"><h3>🔍 Filter</h3><p>Фильтры слева: жанр, год, рейтинг, коллекция, сиды. Результаты обновляются мгновенно.</p><a href="/browse/filter">Открыть</a><span class="tag">фильтрация</span><span class="tag">реальное время</span></div>
+<div class="card"><h3>📅 Timeline</h3><p>Фильмы на временной шкале по годам. Клик по году → фильмы этого года.</p><a href="/browse/timeline">Открыть</a><span class="tag">годы</span><span class="tag">коллекции</span></div>
+<div class="card"><h3>📺 Shuffle TV</h3><p>Автоматическая карусель: фильмы переключаются каждые 30 секунд. Как телеканал.</p><a href="/browse/shuffle">Открыть</a><span class="tag">авто</span><span class="tag">полный экран</span></div>
+<div class="card"><h3>🤺 Дуэль</h3><p>Два фильма — выбирай лучший. VS-режим, счётчик побед.</p><a href="/browse/duel">Открыть</a><span class="tag">выбор</span><span class="tag">vs</span></div>
+<div class="card"><h3>🔲 Матрица</h3><p>Случайные 16 постеров в сетке 4×4. Клик — плеер. Перемешать заново.</p><a href="/browse/matrix">Открыть</a><span class="tag">сетка</span><span class="tag">постеры</span></div>
+<div class="card"><h3>📊 Статистика</h3><p>Графики: жанры, годы, коллекции. Количество, рейтинги, распределение.</p><a href="/browse/stats">Открыть</a><span class="tag">чарты</span><span class="tag">данные</span></div>
+<div class="card"><h3>🔎 Поиск</h3><p>Поиск фильмов по названию (русскому или оригинальному). Результаты мгновенно по мере ввода.</p><a href="/browse/search">Открыть</a><span class="tag">поиск</span><span class="tag">название</span></div>
+<div class="card"><h3>🏆 Топ</h3><p>Топ-50 фильмов по рейтингу Кинопоиска и IMDB. Сортировка, бейджи, номера мест.</p><a href="/browse/top">Открыть</a><span class="tag">рейтинг</span><span class="tag">топ</span></div>
+<div class="card"><h3>📂 Коллекции</h3><p>Фильмы сгруппированные по коллекциям: Наше кино, Новинки, Кино СНГ и другие.</p><a href="/browse/collections">Открыть</a><span class="tag">группы</span><span class="tag">коллекции</span></div>
+</div>
+<p style="margin-top:30px;font-size:13px;color:#555"><a href="/" style="color:#e50914">← На главную</a></p>
+</body></html>'''
+
+
+def _poster_style(poster_url: str) -> str:
+    if not poster_url:
+        return 'background-image:url(/data/posters/placeholder.png)'
+    if not poster_url.startswith('data/'):
+        poster_url = 'data/' + poster_url
+    full_path = str(DATA_DIR / poster_url.removeprefix('data/'))
+    if not os.path.exists(full_path):
+        return 'background-image:url(/data/posters/placeholder.png)'
+    return f'background-image:url(/{poster_url})'
+
+
+@app.route('/browse/carousel')
+def browse_carousel():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    genre_map: dict[str, list] = {}
+    for m in movies:
+        for g in m.get('genre', '').split(','):
+            g = g.strip()
+            if not g:
+                continue
+            genre_map.setdefault(g, []).append(m)
+    rows_html = ''
+    sorted_genres = sorted(genre_map.items(), key=lambda x: -len(x[1]))
+    for genre, items in sorted_genres:
+        items.sort(key=lambda m: (0 if 'background-image' in _poster_style(m.get('poster_url', '')) else 1, -(m.get('seeders') or 0)))
+        cards = ''
+        for m in items:
+            poster_style = _poster_style(m.get('poster_url', ''))
+            yr = m.get('movie_year', '')
+            rt = m.get('kp_rating') or m.get('imdb_rating') or ''
+            cards += f'''<div class="cc">
+<div class="cp" style="{poster_style}"></div>
+<div class="ci"><strong>{m.get('orig_title') or m.get('movie_title','')}</strong>{" "+yr if yr else ""}{" · "+rt if rt else ""}</div>
+</div>'''
+        rows_html += f'<h2>{genre} ({len(items)})</h2><div class="cr">{cards}</div>'
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Carousel</title>
+<style>
+{BROWSE_CSS}
+.cr{{display:flex;gap:12px;overflow-x:auto;padding:10px 30px 20px;scroll-behavior:smooth;-webkit-overflow-scrolling:touch}}
+.cr::-webkit-scrollbar{{height:6px}}
+.cr::-webkit-scrollbar-thumb{{background:#555;border-radius:3px}}
+.cc{{flex:0 0 auto;width:180px;cursor:pointer;transition:transform .2s}}
+.cc:hover{{transform:scale(1.05)}}
+.cp{{width:180px;height:270px;background-size:cover;background-position:center;border-radius:6px}}
+.ci{{font-size:12px;color:#ccc;padding:6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>🎠 По жанрам</h1>
+{rows_html}
+</body></html>'''
+
+
+@app.route('/browse/random')
+def browse_random():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Random</title>
+<style>
+{BROWSE_CSS}
+body{{background:#000;display:flex;align-items:center;justify-content:center}}
+#rc{{position:relative;width:100%;height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}}
+#rc .bg{{position:absolute;inset:0;background-size:cover;background-position:center;filter:blur(20px) brightness(.3);transition:background-image .5s}}
+#rc .poster{{position:relative;z-index:1;width:300px;height:450px;background-size:cover;background-position:center;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.6);transition:background-image .5s}}
+#rc .info{{position:relative;z-index:1;margin-left:40px;max-width:500px}}
+#rc .info h2{{font-size:28px;padding:0;margin-bottom:8px}}
+#rc .info .meta{{color:#aaa;font-size:14px;margin-bottom:12px}}
+#rc .info .desc{{color:#ccc;font-size:14px;line-height:1.5;margin-bottom:20px}}
+.btns a{{display:inline-block;background:#e50914;color:#fff;padding:10px 24px;border-radius:4px;font-size:14px;text-decoration:none;margin-right:10px}}
+.btns a:hover{{background:#f40612}}
+.btns button{{background:#333;color:#fff;border:none;padding:10px 24px;border-radius:4px;font-size:14px;cursor:pointer}}
+.btns button:hover{{background:#555}}
+#nav{{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);display:flex;gap:12px;z-index:10}}
+#nav button{{background:rgba(255,255,255,.1);color:#fff;border:1px solid #555;padding:8px 20px;border-radius:4px;font-size:16px;cursor:pointer}}
+#nav button:hover{{background:rgba(255,255,255,.2)}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="rc"><div class="bg" id="bg"></div><div class="poster" id="poster"></div><div class="info"><h2 id="title"></h2><div class="meta" id="meta"></div><div class="desc" id="cast"></div><div class="btns" id="btns"></div></div></div>
+<div id="nav"><button onclick="prev()">←</button><button onclick="next()">→</button></div>
+ <script>
+const MOVIES = {movies_json};
+function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+let idx = Math.floor(Math.random()*MOVIES.length);
+function show(i){{
+const m=MOVIES[i];if(!m)return;
+const p=posterUrl(m);
+document.getElementById('bg').style.backgroundImage='url('+p+')';
+document.getElementById('poster').style.backgroundImage='url('+p+')';
+document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
+document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
+document.getElementById('cast').textContent=m.cast||'';
+document.getElementById('btns').innerHTML=(m.magnet?'<a href="player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank">▶ Трейлер</a>':'');
+}}
+function next(){{idx=(idx+1)%MOVIES.length;show(idx)}}
+function prev(){{idx=(idx-1+MOVIES.length)%MOVIES.length;show(idx)}}
+document.addEventListener('keydown',e=>{{if(e.key==='ArrowLeft')prev();if(e.key==='ArrowRight')next()}});
+show(idx);
+</script></body></html>'''
+
+
+@app.route('/browse/filter')
+def browse_filter():
+    from html import escape as h_esc
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    genre_counts: dict[str, int] = {}
+    for m in movies:
+        for g in m.get('genre', '').split(','):
+            g = g.strip().lower()
+            if g:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+    top_genres = sorted(genre_counts.keys(), key=lambda g: -genre_counts[g])[:20]
+    years = sorted({m['movie_year'] for m in movies if m.get('movie_year')}, reverse=True)
+    collections = sorted({m.get('collection', '') for m in movies if m.get('collection')})
+    formats = sorted({m.get('format', '').upper().strip() for m in movies if m.get('format') and m.get('format').strip()})
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    genre_opts = ''.join(f'<label><input type="checkbox" class="fg" value="{g}" checked> {g.capitalize()}</label>' for g in top_genres)
+    year_opts = ''.join(f'<option value="{y}">{y}</option>' for y in years)
+    coll_opts = ''.join(f'<option value="{h_esc(c)}">{h_esc(c)}</option>' for c in collections)
+    fmt_opts = ''.join(f'<option value="{f}">{f}</option>' for f in formats)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Filter</title>
+<style>
+{BROWSE_CSS}
+body{{display:flex;padding:0}}
+#sidebar{{width:260px;min-width:260px;background:#1a1a1a;padding:20px;height:100vh;overflow-y:auto;position:sticky;top:0}}
+#sidebar h3{{font-size:14px;margin:14px 0 8px;color:#aaa}}
+#sidebar label{{display:block;font-size:13px;margin:3px 0;cursor:pointer}}
+#sidebar input[type=checkbox]{{margin-right:6px}}
+#sidebar select,#sidebar input[type=range]{{width:100%;margin:4px 0 8px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px}}
+#sidebar input[type=range]{{padding:0}}
+#results{{flex:1;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;align-content:start}}
+.fr{{width:160px;cursor:pointer;transition:transform .2s}}
+.fr:hover{{transform:scale(1.05)}}
+.fr .fp{{width:160px;height:240px;background-size:cover;background-position:center;border-radius:6px}}
+.fr .fi{{font-size:12px;color:#ccc;padding:4px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+#count{{position:fixed;bottom:10px;right:20px;background:rgba(0,0,0,.7);padding:6px 14px;border-radius:4px;font-size:13px;z-index:100}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="sidebar"><h3>Жанры</h3>{genre_opts}<h3>Год от</h3><select id="yrFrom"><option value="">Все</option>{year_opts}</select><h3>Год до</h3><select id="yrTo"><option value="">Все</option>{year_opts}</select><h3>Рейтинг ≥</h3><input type="range" id="minRt" min="0" max="10" step="0.5" value="0"><span id="rtVal">0</span><h3>Коллекция</h3><select id="coll"><option value="">Все</option>{coll_opts}</select><h3>Формат</h3><select id="fmt"><option value="">Все</option>{fmt_opts}</select><h3>Сиды ≥</h3><input type="range" id="minSd" min="0" max="100" step="1" value="0"><span id="sdVal">0</span></div>
+<div id="results"></div><div id="count"></div>
+ <script>
+const MOVIES = {movies_json};
+function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function filter(){{
+const selGenres=new Set([...document.querySelectorAll('.fg:checked')].map(c=>c.value));
+const yrFrom=document.getElementById('yrFrom').value;
+const yrTo=document.getElementById('yrTo').value;
+const minRt=parseFloat(document.getElementById('minRt').value);
+const coll=document.getElementById('coll').value;
+const fmt=document.getElementById('fmt').value;
+const minSd=parseInt(document.getElementById('minSd').value);
+document.getElementById('rtVal').textContent=minRt;
+document.getElementById('sdVal').textContent=minSd;
+const out=MOVIES.filter(m=>{{
+const g=(m.genre||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+if(!g.some(x=>selGenres.has(x)))return false;
+if(yrFrom&&m.movie_year<yrFrom)return false;
+if(yrTo&&m.movie_year>yrTo)return false;
+const r=parseFloat(m.kp_rating||m.imdb_rating||'0');
+if(r<minRt)return false;
+if(coll&&m.collection!==coll)return false;
+if(fmt&&(m.format||'').toUpperCase()!==fmt)return false;
+if((m.seeders||0)<minSd)return false;
+return true;
+}});
+document.getElementById('count').textContent=out.length+' фильмов';
+document.getElementById('results').innerHTML=out.map(m=>{{
+const p=posterUrl(m)?'background-image:url('+posterUrl(m)+')':'background:#333';
+const hash=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase();
+const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
+return '<div class=fr data-href="player.html#'+(hash||'')+'"><div class=fp style="'+p+'"></div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
+}}).join('');
+}}
+document.querySelectorAll('.fg').forEach(c=>c.addEventListener('change',filter));
+document.getElementById('yrFrom').addEventListener('change',filter);
+document.getElementById('yrTo').addEventListener('change',filter);
+document.getElementById('minRt').addEventListener('input',filter);
+document.getElementById('coll').addEventListener('change',filter);
+document.getElementById('fmt').addEventListener('change',filter);
+document.getElementById('minSd').addEventListener('input',filter);
+document.getElementById('results').addEventListener('click',function(e){{var t=e.target.closest('.fr');if(t&&t.dataset.href)location=t.dataset.href}});
+filter();
+</script></body></html>'''
+
+
+@app.route('/browse/timeline')
+def browse_timeline():
+    import re
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    year_map: dict[str, list] = {}
+    for m in movies:
+        y = m.get('movie_year', '')
+        if y:
+            year_map.setdefault(y, []).append(m)
+    years = sorted(year_map.keys(), reverse=True)
+    rows_html = ''
+    for y in years:
+        items = year_map[y]
+        cards = ''
+        for m in items:
+            rt = m.get('kp_rating') or m.get('imdb_rating') or '—'
+            poster_style = _poster_style(m.get('poster_url', ''))
+            match = re.search(r'btih:([A-Fa-f0-9]{40})', m.get('magnet', ''))
+            player_url = f'player.html#{match.group(1).lower()}' if match else '#'
+            title = m.get('orig_title') or m.get('movie_title', '')
+            from html import escape as h_esc
+            cards += f'''<div class="tc" onclick="location=\'{h_esc(player_url)}\'">
+<div class="tp" style="{poster_style}"></div>
+<div class="ti"><strong>{h_esc(title)}</strong> <span class="tr">{rt}</span></div>
+</div>'''
+        rows_html += f'''<div class="ty" onclick="this.classList.toggle(\'open\')">
+<div class="yh"><span class="yl">{y}</span> <span class="yc">{len(items)}</span> <span class="ya">▼</span></div>
+<div class="yg">{cards}</div>
+</div>'''
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Timeline</title>
+<style>
+{BROWSE_CSS}
+body{{padding:20px 30px}}
+.ty{{margin-bottom:4px;overflow:hidden;border-radius:6px;background:#1a1a1a;transition:background .2s}}
+.ty:hover{{background:#222}}
+.yh{{padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:12px;user-select:none}}
+.yl{{font-size:22px;font-weight:700;min-width:50px}}
+.yc{{font-size:13px;color:#888}}
+.ya{{margin-left:auto;color:#555;transition:transform .3s}}
+.ty.open .ya{{transform:rotate(180deg)}}
+.yg{{display:none;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:0 16px 16px}}
+.ty.open .yg{{display:grid}}
+.tc{{cursor:pointer;transition:transform .2s}}
+.tc:hover{{transform:scale(1.05)}}
+.tp{{width:140px;height:210px;background-size:cover;background-position:center;border-radius:5px}}
+.ti{{font-size:11px;color:#ccc;padding:4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.tr{{color:#888}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>📅 По годам</h1>
+{rows_html}
+</body></html>'''
+
+
+@app.route('/browse/shuffle')
+def browse_shuffle():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    hidden_set = set(str(k) for k in hidden)
+    movies = [m for m in movies if str(m['topic_id']) not in hidden_set]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Киноплёнка</title>
+<style>
+body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui,sans-serif}}
+#bg{{position:fixed;inset:0;background-size:cover;background-position:center;filter:blur(40px) brightness(.2);transition:background-image 1s}}
+#main-w{{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:3;width:300px;height:440px;overflow:visible;border-radius:12px;box-shadow:0 10px 50px rgba(0,0,0,.8)}}
+#main-w .mp{{position:absolute;inset:0;background-size:cover;background-position:center;background-color:#222;border-radius:12px;transform-origin:center center;transition:transform .5s ease,opacity .5s ease}}
+#main-w .mp.next-idle{{visibility:hidden;opacity:0;transform:translateX(120%)}}
+#main-w .mp.out{{transform:translateX(-220px) scale(.34);opacity:.9}}
+#main-w .mp.out-right{{transform:translateX(220px) scale(.34);opacity:.9}}
+#main-w .mp.in{{transform:translateX(220px) scale(.34)}}
+#main-w .mp.in-left{{transform:translateX(-220px) scale(.34)}}
+#main-w .mp.in.go{{transform:translateX(0);opacity:1}}
+#main-w .mp.in-left.go{{transform:translateX(0);opacity:1}}
+#info{{position:fixed;top:calc(50% + 230px);left:50%;transform:translateX(-50%);z-index:4;text-align:center;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,.8);pointer-events:none}}
+#info h2{{font-size:20px;margin:0 0 2px;font-weight:600}}
+#info .meta{{font-size:12px;color:#aaa}}
+#strip-wrap{{position:fixed;top:50%;left:0;right:0;transform:translateY(-50%);z-index:2;height:190px;overflow:hidden;pointer-events:none}}
+.side-strip{{position:absolute;top:20px;height:150px;display:flex;align-items:center;gap:6px;transition:transform .5s cubic-bezier(.4,0,.2,1)}}
+.side-strip::before,.side-strip::after{{content:"";position:absolute;left:0;right:0;height:20px;z-index:3;background-color:#050505;background-image:repeating-linear-gradient(90deg,transparent 0 20px,rgba(230,230,210,.72) 20px 34px,transparent 34px 54px);box-shadow:0 0 10px rgba(0,0,0,.8)}}
+.side-strip::before{{top:-20px}}
+.side-strip::after{{bottom:-20px}}
+#strip-left{{right:calc(50% + 170px)}}
+#strip-right{{left:calc(50% + 170px)}}
+.side-strip .fr{{flex:none;width:100px;height:150px;background-size:cover;background-position:center;border-radius:4px;border:2px solid #333;box-sizing:border-box;background-color:#222;opacity:.64;transition:opacity .3s}}
+.film-slot{{position:absolute;top:20px;width:100px;height:150px;z-index:4;box-sizing:border-box;border:2px solid #333;border-radius:4px;background:rgba(0,0,0,.24);visibility:hidden;opacity:0;transition:opacity .12s linear}}
+.film-slot.show{{visibility:visible;opacity:1}}
+.film-slot::before,.film-slot::after{{content:"";position:absolute;left:-2px;right:-2px;height:20px;background-color:#050505;background-image:repeating-linear-gradient(90deg,transparent 0 20px,rgba(230,230,210,.72) 20px 34px,transparent 34px 54px);box-shadow:0 0 10px rgba(0,0,0,.8)}}
+.film-slot::before{{top:-22px}}
+.film-slot::after{{bottom:-22px}}
+#slot-left{{left:calc(50% - 270px)}}
+#slot-right{{left:calc(50% + 170px)}}
+.side-strip .fr.blank{{background:rgba(0,0,0,.18)}}
+#ctrl{{position:fixed;bottom:5%;left:50%;transform:translateX(-50%);z-index:10;display:flex;gap:8px;opacity:0;transition:opacity .3s}}
+#ctrl.show{{opacity:1}}
+#ctrl button{{background:rgba(255,255,255,.08);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}}
+#ctrl button:hover{{background:rgba(255,255,255,.2)}}
+#timer{{position:fixed;top:12px;left:16px;z-index:10;font-size:13px;color:#555;font-variant-numeric:tabular-nums}}
+.back{{position:fixed;top:12px;right:16px;z-index:20;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
+.back:hover{{color:#fff}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="timer"></div>
+<div id="bg"></div>
+<div id="main-w"><div class="mp" id="mpCur"></div><div class="mp next-idle" id="mpNext"></div></div>
+<div id="info"><h2 id="stitle"></h2><div class="meta" id="smeta"></div></div>
+<div id="strip-wrap"><div id="strip-left" class="side-strip"></div><div id="strip-right" class="side-strip"></div><div id="slot-left" class="film-slot"></div><div id="slot-right" class="film-slot"></div></div>
+<div id="ctrl" class="show"><button id="playBtn" onclick="togglePause()">⏸</button><button onclick="next()">→</button><button onclick="setSpeed(5)">5с</button><button onclick="setSpeed(10)">10с</button><button onclick="setSpeed(15)">15с</button><button onclick="setSpeed(30)">30с</button></div>
+ <script>
+const MOVIES = {movies_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+let idx=Math.floor(Math.random()*MOVIES.length),paused=false,speed=5,timer=0,animating=false;
+const FRAME=106; // width+gap (100+6)
+const HALF=12;
+const ANIM_MS=520;
+
+function movieAt(i){{return MOVIES[(i+MOVIES.length)%MOVIES.length]}}
+function setInfo(m){{
+document.getElementById('stitle').textContent=m.orig_title||m.movie_title||'';
+document.getElementById('smeta').textContent=[m.movie_year,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
+}}
+function setMainPoster(m){{
+const p=pu(m);
+document.getElementById('bg').style.backgroundImage='url('+p+')';
+document.getElementById('mpCur').style.backgroundImage='url('+p+')';
+setInfo(m);
+}}
+function setStrip(center, direction){{
+const total=MOVIES.length;
+const left=document.getElementById('strip-left');
+const right=document.getElementById('strip-right');
+const leftHtml=[];
+const rightHtml=[];
+for(let o=-HALF;o<=-1;o++){{
+if(direction==='backward'&&o===-1){{
+leftHtml.push('<div class="fr blank"></div>');
+continue;
+}}
+const fi=(center+o+total)%total;
+leftHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+}}
+for(let o=1;o<=HALF;o++){{
+if(direction==='forward'&&o===1){{
+rightHtml.push('<div class="fr blank"></div>');
+continue;
+}}
+const fi=(center+o+total)%total;
+rightHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+}}
+left.innerHTML=leftHtml.join('');
+right.innerHTML=rightHtml.join('');
+left.style.transition='none';
+right.style.transition='none';
+left.style.transform='translateX(0)';
+right.style.transform='translateX(0)';
+void left.offsetHeight;
+}}
+function render(i){{
+const m=MOVIES[i];if(!m)return;
+setMainPoster(m);
+setStrip(i,'idle');
+timer=0;
+}}
+
+function move(delta){{
+if(animating)return;
+if(!MOVIES.length)return;
+animating=true;
+const direction=delta>0?'forward':'backward';
+const ni=(idx+delta+MOVIES.length)%MOVIES.length;
+const nm=MOVIES[ni]; if(!nm){{animating=false;return;}}
+const newP=pu(nm);
+const mpCur=document.getElementById('mpCur');
+const mpNext=document.getElementById('mpNext');
+const left=document.getElementById('strip-left');
+const right=document.getElementById('strip-right');
+const slot=document.getElementById(direction==='forward'?'slot-left':'slot-right');
+setStrip(idx,direction);
+document.getElementById('slot-left').className='film-slot';
+document.getElementById('slot-right').className='film-slot';
+slot.className='film-slot show';
+document.getElementById('bg').style.backgroundImage='url('+newP+')';
+// Reset next poster off-screen in the same direction as the filmstrip movement
+mpNext.style.transition='none';
+mpNext.style.backgroundImage='url('+newP+')';
+mpNext.className=direction==='forward'?'mp in':'mp in-left';
+mpNext.style.visibility='visible';
+void mpNext.offsetHeight; // reflow
+// Slide the strip and the large frame as one timed movement
+left.style.transition='transform '+ANIM_MS+'ms cubic-bezier(.4,0,.2,1)';
+right.style.transition='transform '+ANIM_MS+'ms cubic-bezier(.4,0,.2,1)';
+left.style.transform='translateX('+(direction==='forward'?-FRAME:FRAME)+'px)';
+right.style.transform='translateX('+(direction==='forward'?-FRAME:FRAME)+'px)';
+mpCur.style.transition='transform '+ANIM_MS+'ms ease,opacity '+ANIM_MS+'ms ease';
+mpCur.className=direction==='forward'?'mp out':'mp out-right';
+mpNext.style.transition='transform '+ANIM_MS+'ms ease,opacity '+ANIM_MS+'ms ease';
+mpNext.className=(direction==='forward'?'mp in go':'mp in-left go');
+setTimeout(()=>{{
+idx=ni;
+// Set current poster to new image, reset positions
+mpCur.style.transition='none';
+mpCur.style.backgroundImage='url('+newP+')';
+mpCur.className='mp';
+mpNext.style.transition='none';
+mpNext.style.backgroundImage='';
+mpNext.className='mp next-idle';
+mpNext.style.visibility='';
+slot.className='film-slot';
+setInfo(nm);
+setStrip(idx,'idle');
+timer=0;
+animating=false;
+}},ANIM_MS+40);
+showCtrl();
+}}
+
+function next(){{move(1)}}
+function prev(){{
+move(-1);
+}}
+
+function togglePause(){{paused=!paused;document.getElementById('playBtn').textContent=paused?'▶':'⏸';showCtrl()}}
+function setSpeed(s){{speed=s;timer=0}}
+function showCtrl(){{document.getElementById('ctrl').classList.add('show');clearTimeout(window._hc);window._hc=setTimeout(()=>document.getElementById('ctrl').classList.remove('show'),2000)}}
+document.addEventListener('mousemove',showCtrl);
+document.addEventListener('keydown',e=>{{if(e.key==='ArrowRight')next();if(e.key==='ArrowLeft')prev();if(e.key===' '||e.key==='Space'){{e.preventDefault();togglePause()}}}});
+setInterval(()=>{{if(paused)return;timer++;const s=speed-timer;document.getElementById('timer').textContent=(s>0?s+'с':'сейчас')+' | '+(paused?'⏸':'▶')+' '+speed+'с';if(timer>=speed)next()}},1000);
+// Initial render
+if(MOVIES.length){{render(idx);}}
+else{{document.getElementById('stitle').textContent='Нет фильмов';}}
+</script></body></html>'''
+@app.route('/browse/duel')
+def browse_duel():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Дуэль</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;overflow:hidden;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}}
+h1{{font-size:22px;margin-bottom:20px;color:#888}}
+#arena{{display:flex;gap:40px;align-items:center}}
+.fighter{{width:240px;cursor:pointer;transition:transform .3s,box-shadow .3s;border-radius:12px;overflow:hidden;text-align:center}}
+.fighter:hover{{transform:scale(1.05);box-shadow:0 0 40px rgba(229,9,20,.4)}}
+.fighter .poster{{width:240px;height:360px;background-size:cover;background-position:center;border-radius:10px;background-color:#222}}
+.fighter .title{{font-size:14px;margin-top:8px;padding:0 4px}}
+.fighter .meta{{font-size:12px;color:#888;margin-top:2px}}
+.vs{{font-size:48px;color:#e50914;font-weight:900;text-shadow:0 0 20px rgba(229,9,20,.5)}}
+#score{{position:fixed;bottom:30px;color:#555;font-size:13px}}
+#skip{{position:fixed;top:20px;right:20px;z-index:10;background:rgba(255,255,255,.08);color:#aaa;border:1px solid #444;padding:8px 18px;border-radius:4px;font-size:13px;cursor:pointer}}
+#skip:hover{{background:rgba(255,255,255,.15)}}
+.back{{position:fixed;top:20px;left:20px;z-index:10;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
+.back:hover{{color:#fff}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<button id="skip" onclick="next()">Пропустить →</button>
+<h1>Какой фильм лучше?</h1>
+<div id="arena"><div class="fighter" id="fa" onclick="vote(0)"><div class="poster" id="pa"></div><div class="title" id="ta"></div><div class="meta" id="ma"></div></div><div class="vs">VS</div><div class="fighter" id="fb" onclick="vote(1)"><div class="poster" id="pb"></div><div class="title" id="tb"></div><div class="meta" id="mb"></div></div></div>
+<div id="score">👍 <span id="sc">0</span></div>
+<script>
+const MOVIES={movies_json};
+let i=Math.floor(Math.random()*MOVIES.length),score=0;
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function pick(n){{return MOVIES[(i+n)%MOVIES.length]}}
+function show(){{
+const a=pick(0),b=pick(1+Math.floor(Math.random()*(MOVIES.length-2)));
+const set=(el,poster,title,meta)=>{{
+el.style.backgroundImage='url('+pu(poster)+')';
+document.getElementById('t'+el.id[1]).textContent=poster.orig_title||poster.movie_title||'';
+document.getElementById('m'+el.id[1]).textContent=[poster.movie_year,poster.kp_rating?'KP '+poster.kp_rating:'',poster.imdb_rating?'IMDB '+poster.imdb_rating:''].filter(Boolean).join(' · ');
+}};
+set(document.getElementById('pa'),a);set(document.getElementById('pb'),b);
+i=(i+1)%MOVIES.length;
+}}
+function vote(n){{score++;document.getElementById('sc').textContent=score;next()}}
+function next(){{show()}}
+show();
+</script></body></html>'''
+
+@app.route('/browse/matrix')
+def browse_matrix():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Матрица</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#0a0a0a;color:#fff;font-family:system-ui,sans-serif;overflow-y:auto;height:100vh}}
+#grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:28px}}
+#grid .cell{{position:relative;background-size:cover;background-position:center;aspect-ratio:2/3;border-radius:6px;cursor:pointer;transition:transform .3s;overflow:hidden;background-color:#1a1a1a}}
+#grid .cell:hover{{transform:scale(1.02);z-index:2;box-shadow:0 0 12px rgba(229,9,20,.25)}}
+#grid .cell .label{{position:absolute;bottom:0;left:0;right:0;padding:6px 8px;background:linear-gradient(transparent,rgba(0,0,0,.8));font-size:12px;opacity:0;transition:opacity .2s}}
+#grid .cell:hover .label{{opacity:1}}
+#shuffle{{position:fixed;top:20px;right:100px;z-index:10;background:rgba(229,9,14,.8);color:#fff;border:0;padding:10px 24px;border-radius:6px;font-size:14px;cursor:pointer}}
+#shuffle:hover{{background:#e50914}}
+#pauseBtn{{position:fixed;top:20px;right:20px;z-index:10;background:rgba(80,80,80,.8);color:#fff;border:0;padding:10px 24px;border-radius:6px;font-size:14px;cursor:pointer}}
+#pauseBtn:hover{{background:rgba(120,120,120,.8)}}
+.back{{position:fixed;top:20px;left:20px;z-index:10;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
+.back:hover{{color:#fff}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<button id="shuffle" onclick="sc()" style="right:20px">🔀 Перемешать</button><button id="pauseBtn" onclick="togglePause()" style="right:100px">⏸ Пауза</button>
+<div id="grid"></div>
+<script>
+const MOVIES={movies_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function sc(){{
+const a=[...MOVIES];
+for(let i=a.length-1;i>0;i--){{const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
+a.length=8;
+const g=document.getElementById('grid');
+    g.innerHTML=a.map(m=>'<div class="cell" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')"><div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
+    g.onclick=function(e){{var c=e.target.closest(\'.cell\');if(c&&c.dataset.hash){{window.open(\'player.html#\'+c.dataset.hash,\'_blank\');}}}}
+}}
+sc();
+var _ti=setInterval(sc,10000);
+function togglePause(){{
+if(_ti){{clearInterval(_ti);_ti=null;document.getElementById('pauseBtn').textContent='▶ Пуск';}}
+else{{_ti=setInterval(sc,10000);document.getElementById('pauseBtn').textContent='⏸ Пауза';}}
+}}
+</script></body></html>'''
+
+@app.route('/browse/stats')
+def browse_stats():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    genre_counts: dict[str, int] = {}
+    for m in movies:
+        for g in m.get('genre', '').split(','):
+            g = g.strip().lower()
+            if g:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+    top_genres = sorted(genre_counts.items(), key=lambda x: -x[1])[:15]
+    total = len(movies)
+    top = {k: v for k, v in top_genres}
+    genre_json = json.dumps(top, ensure_ascii=False)
+    year_groups: dict[int, int] = {}
+    for m in movies:
+        y = m.get('movie_year')
+        if y:
+            year_groups[y] = year_groups.get(y, 0) + 1
+    years_sorted = sorted(year_groups.items())
+    years_json = json.dumps(dict(years_sorted), ensure_ascii=False)
+    rated = sum(1 for m in movies if m.get('kp_rating') or m.get('imdb_rating'))
+    avg_rating = 0
+    ratings_list = [float(m.get('kp_rating') or m.get('imdb_rating') or 0) for m in movies if m.get('kp_rating') or m.get('imdb_rating')]
+    if ratings_list:
+        avg_rating = round(sum(ratings_list) / len(ratings_list), 1)
+    coll_counts: dict[str, int] = {}
+    for m in movies:
+        c = m.get('collection', '')
+        if c:
+            coll_counts[c] = coll_counts.get(c, 0) + 1
+    coll_json = json.dumps(coll_counts, ensure_ascii=False)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Статистика</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:30px}}
+h1{{font-size:24px;margin-bottom:4px}}
+.sub{{color:#888;font-size:14px;margin-bottom:30px}}
+.row{{display:flex;gap:30px;flex-wrap:wrap}}
+.box{{background:#1f1f1f;border-radius:10px;padding:20px;flex:1;min-width:300px}}
+.box h2{{font-size:16px;color:#aaa;margin-bottom:12px}}
+.stat{{font-size:32px;font-weight:700}}
+.stat-label{{font-size:13px;color:#888}}
+canvas{{max-width:100%;height:auto!important}}
+.bar{{display:flex;align-items:center;margin:4px 0;gap:8px}}
+.bar-label{{font-size:12px;width:100px;text-align:right;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.bar-fill{{height:16px;border-radius:3px;min-width:2px;transition:width .5s}}
+.bar-val{{font-size:11px;color:#666}}
+.back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}}
+.back:hover{{background:#e50914;border-color:#e50914}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>📊 Статистика</h1>
+<p class="sub">{total} фильмов, {rated} с рейтингом, средний {avg_rating}</p>
+<div class="row">
+<div class="box"><h2>🎭 Жанры</h2><div id="genre-bars"></div></div>
+<div class="box"><h2>📅 Годы</h2><canvas id="yearChart" height="200"></canvas></div>
+<div class="box"><h2>📂 Коллекции</h2><div id="coll-bars"></div></div>
+</div>
+<script>
+const GENRES={genre_json};
+const YEARS={years_json};
+const COLLS={coll_json};
+const COLORS=['#e50914','#f5c518','#46d369','#0072eb','#e87c03','#b9090b','#1a73e8','#34a853','#ea4335','#fbbc04','#ff6d01','#c44601','#564d4d','#808080','#a0a0a0'];
+const maxG=Math.max(...Object.values(GENRES));
+document.getElementById('genre-bars').innerHTML=Object.entries(GENRES).map(([g,n],i)=>'<div class="bar"><span class="bar-label">'+g+'</span><div class="bar-fill" style="width:'+(n/maxG*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
+const maxC=Math.max(...Object.values(COLLS));
+document.getElementById('coll-bars').innerHTML=Object.entries(COLLS).map(([c,n],i)=>'<div class="bar"><span class="bar-label">'+c+'</span><div class="bar-fill" style="width:'+(n/maxC*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
+const canvas=document.getElementById('yearChart');
+const ctx=canvas.getContext('2d');
+const years=Object.keys(YEARS);
+const vals=Object.values(YEARS);
+canvas.width=canvas.parentElement.offsetWidth-40;canvas.height=200;
+const w=canvas.width,y=200,h=160,b=30;
+const max=Math.max(...vals);
+ctx.clearRect(0,0,w,y);
+years.forEach((yr,i)=>{{
+const barW=Math.max(4,w/years.length-2);
+const barH=(vals[i]/max)*h;
+const x=i*(barW+2)+b;
+ctx.fillStyle=COLORS[i%COLORS.length];
+ctx.fillRect(x,y-25-barH,barW,barH);
+ctx.fillStyle='#888';
+ctx.font='9px sans-serif';
+ctx.textAlign='center';
+ctx.fillText(yr,x+barW/2,y-27-barH);
+}});
+</script></body></html>'''
+
+@app.route('/browse/search')
+def browse_search():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Поиск</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
+input[type=text]{{width:100%;padding:14px 18px;font-size:18px;border:0;border-radius:8px;background:#2a2a2a;color:#fff;outline:0}}
+input[type=text]:focus{{box-shadow:0 0 0 2px #e50914}}
+input[type=text]::placeholder{{color:#666}}
+#results{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:20px}}
+.card{{position:relative;aspect-ratio:2/3;background-size:cover;background-position:center;border-radius:6px;cursor:pointer;overflow:hidden;background-color:#1a1a1a;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:scale(1.03);box-shadow:0 0 20px rgba(229,9,20,.3);z-index:2}}
+.card .info{{position:absolute;bottom:0;left:0;right:0;padding:8px;background:linear-gradient(transparent,rgba(0,0,0,.9));font-size:12px;opacity:0;transition:opacity .2s}}
+.card:hover .info{{opacity:1}}
+.no{{color:#666;text-align:center;margin-top:40px;font-size:16px}}
+.cnt{{color:#888;font-size:13px;margin-top:8px}}
+.back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
+.back:hover{{background:#e50914;border-color:#e50914}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<input type="text" id="q" placeholder="Название фильма..." autofocus>
+<p class="cnt" id="cnt"></p>
+<div id="results"></div>
+<script>
+const MOVIES={movies_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function render(q){{
+const ql=q.toLowerCase().trim();
+const filtered=ql?MOVIES.filter(m=>(m.movie_title||'').toLowerCase().includes(ql)||(m.orig_title||'').toLowerCase().includes(ql)):MOVIES;
+document.getElementById('cnt').textContent='Найдено: '+filtered.length;
+document.getElementById('results').innerHTML=filtered.length?filtered.map(m=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join(''):'<div class="no">Ничего не найдено</div>';
+}}
+document.getElementById('q').addEventListener('input',function(){{render(this.value);}});
+render('');
+</script></body></html>'''
+
+
+@app.route('/browse/top')
+def browse_top():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    def _rating(m):
+        kp = float(m.get('kp_rating') or 0)
+        imdb = float(m.get('imdb_rating') or 0)
+        return max(kp, imdb)
+    movies.sort(key=_rating, reverse=True)
+    top = movies[:50]
+    movies_json = json.dumps(top, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Топ-50</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
+h1{{font-size:24px}}
+.sub{{color:#888;font-size:14px;margin-bottom:20px}}
+#grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}}
+.card{{position:relative;aspect-ratio:2/3;background-size:cover;background-position:center;border-radius:6px;cursor:pointer;overflow:hidden;background-color:#1a1a1a;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:scale(1.03);box-shadow:0 0 20px rgba(229,9,20,.3);z-index:2}}
+.card .info{{position:absolute;bottom:0;left:0;right:0;padding:8px;background:linear-gradient(transparent,rgba(0,0,0,.9));font-size:12px;opacity:0;transition:opacity .2s}}
+.card:hover .info{{opacity:1}}
+.rank{{position:absolute;top:6px;left:6px;width:26px;height:26px;background:#e50914;color:#fff;font-size:13px;font-weight:700;border-radius:50%;display:flex;align-items:center;justify-content:center;z-index:3}}
+.badge{{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.7);color:#f5c518;font-size:12px;font-weight:600;padding:2px 6px;border-radius:4px;z-index:3}}
+.back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
+.back:hover{{background:#e50914;border-color:#e50914}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>🏆 Топ-50</h1>
+<p class="sub">По рейтингу Кинопоиска и IMDB</p>
+<div id="grid"></div>
+<script>
+const MOVIES={movies_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function rt(m){{return Math.max(parseFloat(m.kp_rating)||0,parseFloat(m.imdb_rating)||0)}}
+document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join('');
+</script></body></html>'''
+
+
+@app.route('/browse/collections')
+def browse_collections():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    groups: dict[str, list] = {}
+    for m in movies:
+        c = m.get('collection', 'unknown')
+        groups.setdefault(c, []).append(m)
+    coll_json = json.dumps(groups, ensure_ascii=False, default=str).replace('</script>', '<\\/script>')
+    labels = {'nashe_kino': 'Наше кино', 'kino_sng': 'Кино СНГ', 'novinki_2026': 'Новинки 2026', 'kino_sng_hd': 'Кино СНГ HD'}
+    labels_json = json.dumps(labels, ensure_ascii=False)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Коллекции</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
+h1{{font-size:24px;margin-bottom:4px}}
+.sub{{color:#888;font-size:14px;margin-bottom:20px}}
+.section{{margin-bottom:24px}}
+.section h2{{font-size:18px;margin-bottom:4px;cursor:pointer;display:flex;align-items:center;gap:8px;user-select:none}}
+.section h2:hover{{color:#e50914}}
+.section h2 .arrow{{transition:transform .2s;font-size:14px}}
+.section h2 .arrow.open{{transform:rotate(180deg)}}
+.section h2 .cnt{{color:#888;font-size:13px;font-weight:400}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:10px}}
+.card{{position:relative;aspect-ratio:2/3;background-size:cover;background-position:center;border-radius:6px;cursor:pointer;overflow:hidden;background-color:#1a1a1a;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:scale(1.03);box-shadow:0 0 15px rgba(229,9,20,.3);z-index:2}}
+.card .info{{position:absolute;bottom:0;left:0;right:0;padding:6px;background:linear-gradient(transparent,rgba(0,0,0,.9));font-size:11px;opacity:0;transition:opacity .2s}}
+.card:hover .info{{opacity:1}}
+.back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
+.back:hover{{background:#e50914;border-color:#e50914}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>📂 Коллекции</h1>
+<p class="sub">{len(movies)} фильмов, {len(groups)} коллекций</p>
+<div id="root"></div>
+<script>
+const GROUPS={coll_json};
+const LABELS={labels_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function label(k){{return LABELS[k]||k}}
+document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2 onclick="(function(el){{var g=el.nextElementSibling;g.style.display=g.style.display===\'none\'?\'\':\'none\';el.querySelector(\'.arrow\').classList.toggle(\'open\');}})(this)"><span class="arrow">&#9660;</span>'+label(key)+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(m=>{{const h=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return '<div class="card" style="background-image:url('+pu(m)+')" onclick="window.open(\'player.html#'+(h?h[1].toLowerCase():\'\')+'\',\'_blank\')"><div class="info">'+(m.movie_title||m.orig_title||'')+'<br>'+(m.movie_year||'')+'</div></div>';}}).join('')+'</div></div>').join('');
+</script></body></html>'''
 
 
 if __name__ == '__main__':
@@ -869,4 +1745,13 @@ if __name__ == '__main__':
     _ensure_enrich_worker()
     _ensure_periodic_enrich()
     _ensure_daily_refresh_loop()
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(('::', port))
+    sock.listen(128)
+    from werkzeug.serving import make_server
+    server = make_server('::', port, app, threaded=True, fd=sock.fileno())
+    sock.close()
+    print(f' * Running on http://127.0.0.1:{port}')
+    server.serve_forever()

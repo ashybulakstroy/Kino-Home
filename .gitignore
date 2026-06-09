@@ -11,7 +11,7 @@ data/*
 !data/.gitkeep
 !data/posters/
 data/posters/*
-!data/posters/placeholder.jpg
+!data/posters/placeholder.png
 
 temp/
 /posters/
