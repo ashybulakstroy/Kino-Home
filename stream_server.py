@@ -830,8 +830,28 @@ def transcode(info_hash):
 def stop_session():
     data = request.get_json(silent=True) or {}
     sid = data.get('sid') or request.form.get('sid')
+    hash = data.get('hash') or request.form.get('hash')
     _stop_stream_session(str(sid) if sid else None)
+    if hash:
+        engine.pause(str(hash))
+    if not sid and not hash:
+        with _sessions_lock:
+            for sid, item in list(_stream_sessions.items()):
+                h = str(item.get('hash') or '')
+                if h:
+                    engine.pause(h)
+            _stream_sessions.clear()
     return jsonify(ok=True)
+
+
+@app.route('/stop_all', methods=['POST'])
+def stop_all():
+    _reject_public_admin()
+    engine.stop_all()
+    with _sessions_lock:
+        _stream_sessions.clear()
+    print('Все торренты остановлены')
+    return jsonify(ok=True, message='Все торренты остановлены')
 
 
 @app.route('/player.html')
