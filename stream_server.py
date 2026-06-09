@@ -1183,7 +1183,7 @@ document.getElementById('poster').style.backgroundImage='url('+p+')';
 document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
 document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
 document.getElementById('cast').textContent=m.cast||'';
-document.getElementById('btns').innerHTML=(m.magnet?'<a href="player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank"'+(m.youtube_url.indexOf('/results?')!==-1?' style="background:#e67e22"':'')+'>▶ Трейлер</a>':'');
+document.getElementById('btns').innerHTML=(m.magnet?'<a href="/player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank"'+(m.youtube_url.indexOf('/results?')!==-1?' style="background:#e67e22"':'')+'>▶ Трейлер</a>':'');
 }}
 function next(){{idx=(idx+1)%MOVIES.length;show(idx)}}
 function prev(){{idx=(idx-1+MOVIES.length)%MOVIES.length;show(idx)}}
@@ -1264,7 +1264,7 @@ document.getElementById('results').innerHTML=out.map(m=>{{
 const p=posterUrl(m)?'background-image:url('+posterUrl(m)+')':'background:#333';
 const hash=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase();
 const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
-return '<div class=fr data-href="player.html#'+(hash||'')+'"><div class=fp style="'+p+'"></div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
+return '<div class=fr data-href="/player.html#'+(hash||'')+'"><div class=fp style="'+p+'"></div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
 }}).join('');
 }}
 document.querySelectorAll('.fg').forEach(c=>c.addEventListener('change',filter));
@@ -1299,7 +1299,7 @@ def browse_timeline():
             rt = m.get('kp_rating') or m.get('imdb_rating') or '—'
             poster_style = _poster_style(m.get('poster_url', ''))
             match = re.search(r'btih:([A-Fa-f0-9]{40})', m.get('magnet', ''))
-            player_url = f'player.html#{match.group(1).lower()}' if match else '#'
+            player_url = f'/player.html#{match.group(1).lower()}' if match else '#'
             title = m.get('orig_title') or m.get('movie_title', '')
             from html import escape as h_esc
             cards += f'''<div class="tc" onclick="location=\'{h_esc(player_url)}\'">
@@ -1599,7 +1599,7 @@ for(let i=a.length-1;i>0;i--){{const j=Math.floor(Math.random()*(i+1));[a[i],a[j
 a.length=8;
 const g=document.getElementById('grid');
     g.innerHTML=a.map(m=>'<div class="cell" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')"><div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
-    g.onclick=function(e){{var c=e.target.closest(\'.cell\');if(c&&c.dataset.hash){{window.open(\'player.html#\'+c.dataset.hash,\'_blank\');}}}}
+    g.onclick=function(e){{var c=e.target.closest(\'.cell\');if(c&&c.dataset.hash){{window.open(\'/player.html#\'+c.dataset.hash,\'_blank\');}}}}
 }}
 sc();
 var _ti=setInterval(sc,10000);
