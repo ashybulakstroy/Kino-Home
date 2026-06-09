@@ -1982,6 +1982,18 @@ def main():
                 print(f"  {t.get('movie_title','')}: скрыто (кеш)")
         if changed:
             save_json(TORRENTS_CACHE, topics)
+
+        hidden_ids = load_hidden_topic_ids()
+        hidden_changed = False
+        for t in topics:
+            tid = str(t.get('topic_id', ''))
+            if t.get('_sanitized') and tid not in hidden_ids:
+                hidden_ids.add(tid)
+                hidden_changed = True
+        if hidden_changed:
+            save_hidden_topic_ids(hidden_ids)
+            print(f"  Скрытые обновлены: {len(hidden_ids)}")
+
     else:
         topics = load_json(TORRENTS_CACHE) or []
         all_new_topics: list[dict] = []
@@ -2130,6 +2142,21 @@ def main():
             print(f"  Всего скрыто: {sanitized}")
         else:
             print("  Чисто")
+
+        print("  Синхронизация hidden_topics с _sanitized...")
+        hidden_ids = load_hidden_topic_ids()
+        changed = False
+        for t in topics:
+            tid = str(t.get('topic_id', ''))
+            if t.get('_sanitized') and tid not in hidden_ids:
+                hidden_ids.add(tid)
+                changed = True
+                print(f"  {t.get('movie_title','')}: добавлен в скрытые")
+        if changed:
+            save_hidden_topic_ids(hidden_ids)
+            print("  Скрытые обновлены")
+        else:
+            print("  ОК")
 
         print("\n10. Кинопоиск постеры (для всех)...")
         kp_count = 0

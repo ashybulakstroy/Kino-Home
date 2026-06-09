@@ -1004,16 +1004,19 @@ def add_cors_and_gzip(response):
     if request.path.startswith('/data/posters/'):
         response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
     if (response.status_code == 200
-        and isinstance(response.data, bytes)
-        and len(response.data) > 512
         and response.content_type
         and response.content_type.startswith('text/')
         and 'gzip' in request.accept_encodings):
-        compressed = gzip.compress(response.data)
-        if len(compressed) < len(response.data) * 0.9:
-            response.data = compressed
-            response.headers['Content-Encoding'] = 'gzip'
-            response.headers['Content-Length'] = str(len(response.data))
+        try:
+            data = response.get_data()
+        except Exception:
+            return response
+        if isinstance(data, bytes) and len(data) > 512:
+            compressed = gzip.compress(data)
+            if len(compressed) < len(data) * 0.9:
+                response.set_data(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Length'] = str(len(compressed))
     return response
 
 
@@ -1024,7 +1027,9 @@ def _get_movies():
     p = DATA_DIR / 'torrents_data.json'
     if not p.exists():
         return []
-    return json.loads(p.read_text('utf-8'))
+    data = json.loads(p.read_text('utf-8'))
+    hidden = gp.load_hidden_topic_ids()
+    return [m for m in data if not m.get('_sanitized') and str(m.get('topic_id', '')) not in hidden]
 
 
 BROWSE_CSS = '''
