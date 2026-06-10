@@ -1,0 +1,1396 @@
+import os
+import re
+import sys
+import time
+import json
+import mimetypes
+import socket
+import threading
+import subprocess
+import shutil
+from datetime import date, datetime, timedelta
+from flask import Flask, request, Response, jsonify, send_file, abort, redirect
+
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS
+
+import generate_page as gp
+from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
+
+
+class _LazyEngine:
+    _engine = None
+    _lock = threading.Lock()
+
+    def _ensure(self):
+        if self._engine is None:
+            with self._lock:
+                if self._engine is None:
+                    from engine import TorrentEngine
+                    self._engine = TorrentEngine(temp_dir=str(TEMP_DIR))
+        return self._engine
+
+    def __getattr__(self, name):
+        return getattr(self._ensure(), name)
+
+
+engine = _LazyEngine()
+
+app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path='')
+
+STREAM_IDLE_TIMEOUT = 30
+SESSION_SWEEP_INTERVAL = 10
+MAX_STREAM_SESSIONS = 10
+_sessions_lock = threading.Lock()
+_stream_sessions: dict[str, dict[str, float | str]] = {}
+_session_monitor_started = False
+
+_rate_limit_store: dict[str, float] = {}
+RATE_LIMIT_SECONDS = 1.0
+
+_enrich_status: dict[str, str] = {}
+_enrich_lock = threading.Lock()
+_daily_refresh_lock = threading.Lock()
+_daily_refresh_started = False
+DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
+DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
+REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
+REFRESH_FILES = [
+    'torrents_data.json',
+    'imdb_basics_cache.json',
+    'imdb_ratings_cache.json',
+    'imdb_search_cache.json',
+    'kp_search_cache.json',
+    'youtube_cache.json',
+    'index-kino.html',
+]
+REFRESH_DIRS = ['posters', 'topic_cache']
+
+
+def _today_stamp() -> str:
+    return date.today().isoformat()
+
+
+def _daily_refresh_due() -> bool:
+    try:
+        return DAILY_REFRESH_STAMP.read_text('utf-8').strip() != _today_stamp()
+    except FileNotFoundError:
+        return True
+
+
+def _write_daily_refresh_stamp():
+    atomic_write_text(DAILY_REFRESH_STAMP, _today_stamp())
+
+
+def _copy_existing_refresh_data(staging_dir):
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    for name in REFRESH_FILES:
+        src = DATA_DIR / name
+        if src.exists():
+            shutil.copy2(src, staging_dir / name)
+    for name in REFRESH_DIRS:
+        src = DATA_DIR / name
+        if src.exists():
+            shutil.copytree(src, staging_dir / name, dirs_exist_ok=True)
+
+
+def _publish_staging_refresh(staging_dir):
+    for name in REFRESH_DIRS:
+        src = staging_dir / name
+        dst = DATA_DIR / name
+        if src.exists():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+    for name in REFRESH_FILES:
+        src = staging_dir / name
+        dst = DATA_DIR / name
+        if src.exists():
+            with file_lock(dst):
+                os.replace(src, dst)
+
+
+def _run_refresh_process(collection=None):
+    env = os.environ.copy()
+    env['LOCAL_KINO_DATA_DIR'] = str(REFRESH_STAGING_DIR)
+    args = [sys.executable, 'generate_page.py', '--refresh']
+    if collection:
+        args.append(f'--collection={collection}')
+    return subprocess.Popen(
+        args,
+        cwd=str(BASE_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+
+
+def _run_all_collections_refresh():
+    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+    for collection in gp.COLLECTIONS:
+        print(f'Автообновление: коллекция {collection}')
+        proc = _run_refresh_process(collection)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end='')
+        code = proc.wait()
+        if code != 0:
+            return code
+    return 0
+
+
+def _iter_all_collections_refresh_output():
+    _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+    for collection in gp.COLLECTIONS:
+        yield f'Автообновление: коллекция {collection}\n'
+        proc = _run_refresh_process(collection)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            yield line
+        code = proc.wait()
+        if code != 0:
+            return code
+    return 0
+
+
+def _run_daily_refresh_if_due(reason: str = 'timer'):
+    if not _daily_refresh_due():
+        print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+        return
+    if not _daily_refresh_lock.acquire(blocking=False):
+        print('Автообновление: refresh уже выполняется')
+        return
+    try:
+        if not _daily_refresh_due():
+            print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+            return
+        print(f'Автообновление: запускаю refresh ({reason})')
+        code = _run_all_collections_refresh()
+        if code == 0:
+            _publish_staging_refresh(REFRESH_STAGING_DIR)
+            _write_daily_refresh_stamp()
+            print(f'Автообновление: готово, метка {_today_stamp()}')
+        else:
+            print(f'Автообновление: ошибка refresh, код {code}; метка не обновлена')
+    except Exception as e:
+        print(f'Автообновление: ошибка {e}; метка не обновлена')
+    finally:
+        _daily_refresh_lock.release()
+
+
+def _daily_refresh_loop():
+    while True:
+        time.sleep(DAILY_REFRESH_CHECK_SECONDS)
+        _run_daily_refresh_if_due('timer')
+
+
+def _ensure_daily_refresh_loop():
+    global _daily_refresh_started
+    if _daily_refresh_started:
+        return
+    _daily_refresh_started = True
+    threading.Thread(target=_daily_refresh_loop, daemon=True).start()
+
+
+def _parse_topic_date(value: str):
+    if not value:
+        return None
+    value = str(value).strip()
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _poster_file_from_url(poster_url: str):
+    if not poster_url:
+        return None
+    poster_url = str(poster_url).replace('\\', '/')
+    marker = 'posters/'
+    if marker not in poster_url:
+        return None
+    filename = poster_url.rsplit(marker, 1)[-1].split('?', 1)[0].split('#', 1)[0]
+    if not filename or '/' in filename or '..' in filename:
+        return None
+    return DATA_DIR / 'posters' / filename
+
+
+def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
+    if max_age_days <= 0:
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
+    data_path = DATA_DIR / 'torrents_data.json'
+    if not data_path.exists():
+        return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
+
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    now_text = datetime.now().strftime('%Y-%m-%d %H:%M')
+    removed = []
+    dated_topics = 0
+    skipped_topics = 0
+    with file_lock(data_path):
+        try:
+            topics = json.loads(data_path.read_text('utf-8'))
+        except Exception:
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': 0}
+
+        collection_counts = {}
+        for topic in topics:
+            collection = topic.get('collection', 'nashe_kino')
+            collection_counts[collection] = collection_counts.get(collection, 0) + 1
+        keep = []
+        for topic in topics:
+            collection = topic.get('collection', 'nashe_kino')
+            topic_date = _parse_topic_date(topic.get('added_at', ''))
+            if not topic_date:
+                topic['added_at'] = now_text
+                dated_topics += 1
+                keep.append(topic)
+            elif topic_date < cutoff:
+                collection_info = gp.COLLECTIONS.get(collection, {})
+                age_cleanup = bool(collection_info.get('age_cleanup', False))
+                if age_cleanup and collection_counts.get(collection, 0) > gp.MAX_TOPICS:
+                    removed.append(topic)
+                    collection_counts[collection] -= 1
+                else:
+                    skipped_topics += 1
+                    keep.append(topic)
+            else:
+                keep.append(topic)
+
+        if not removed and not dated_topics:
+            return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': skipped_topics}
+
+        atomic_write_json_unlocked(data_path, keep)
+        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(keep))
+
+    if removed:
+        try:
+            archive_path = DATA_DIR / 'topics_archive.json'
+            archive = []
+            if archive_path.exists():
+                archive = json.loads(archive_path.read_text('utf-8'))
+                if not isinstance(archive, list):
+                    archive = []
+            archived_ids = {str(t.get('topic_id')) for t in archive if isinstance(t, dict)}
+            archived_at = datetime.now().strftime('%Y-%m-%d %H:%M')
+            for topic in removed:
+                topic_id = str(topic.get('topic_id') or '')
+                if topic_id in archived_ids:
+                    continue
+                archived_topic = dict(topic)
+                archived_topic['archived_at'] = archived_at
+                archived_topic['archive_reason'] = f'age>{max_age_days}'
+                archive.append(archived_topic)
+            atomic_write_json_unlocked(archive_path, archive)
+        except Exception:
+            pass
+
+    used_posters = {
+        str(t.get('poster_url') or '').replace('\\', '/')
+        for t in keep
+        if t.get('poster_url')
+    }
+    removed_cache = 0
+    removed_posters = 0
+    for topic in removed:
+        topic_id = str(topic.get('topic_id') or '').strip()
+        if topic_id:
+            cache_path = DATA_DIR / 'topic_cache' / f'{topic_id}.html'
+            try:
+                if cache_path.exists():
+                    cache_path.unlink()
+                    removed_cache += 1
+            except OSError:
+                pass
+
+        poster_url = str(topic.get('poster_url') or '').replace('\\', '/')
+        if poster_url and poster_url not in used_posters:
+            poster_path = _poster_file_from_url(poster_url)
+            try:
+                if poster_path and poster_path.exists():
+                    poster_path.unlink()
+                    removed_posters += 1
+            except OSError:
+                pass
+
+    return {
+        'removed_topics': len(removed),
+        'removed_cache': removed_cache,
+        'removed_posters': removed_posters,
+        'dated_topics': dated_topics,
+        'skipped_topics': skipped_topics,
+        'max_age_days': max_age_days,
+    }
+ENRICH_QUEUE: list[str] = []
+
+
+def _enrich_worker():
+    while True:
+        time.sleep(1)
+        topic_id = None
+        with _enrich_lock:
+            if ENRICH_QUEUE:
+                topic_id = ENRICH_QUEUE.pop(0)
+                _enrich_status[topic_id] = 'in_progress'
+        if not topic_id:
+            continue
+        try:
+            data_path = DATA_DIR / 'torrents_data.json'
+            if not data_path.exists():
+                with _enrich_lock:
+                    _enrich_status[topic_id] = 'error: no data'
+                continue
+            with file_lock(data_path):
+                topics = json.loads(data_path.read_text('utf-8'))
+                topic = next((t for t in topics if t.get('topic_id') == topic_id), None)
+                if not topic:
+                    with _enrich_lock:
+                        _enrich_status[topic_id] = 'error: not found'
+                    continue
+                gp.enrich_topic(topic, force_poster_retry=True)
+                atomic_write_json_unlocked(data_path, topics)
+                gen_path = DATA_DIR / 'index-kino.html'
+                html = gp.generate_html(topics)
+                atomic_write_text(gen_path, html)
+            with _enrich_lock:
+                _enrich_status[topic_id] = 'done'
+        except Exception as e:
+            with _enrich_lock:
+                _enrich_status[topic_id] = f'error: {e}'
+
+
+def _ensure_enrich_worker():
+    t = threading.Thread(target=_enrich_worker, daemon=True)
+    t.start()
+
+
+def _enrich_missing(force: bool = False):
+    data_path = DATA_DIR / 'torrents_data.json'
+    if not data_path.exists():
+        return
+    try:
+        with file_lock(data_path):
+            topics = json.loads(data_path.read_text('utf-8'))
+            changed = False
+            cleaned_topics = gp.clean_catalog_topics(topics)
+            if len(cleaned_topics) != len(topics):
+                topics = cleaned_topics
+                changed = True
+            MAX_RETRIES = 3
+            for topic in topics:
+                poster_due = (
+                    not gp.has_real_poster(topic)
+                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
+                )
+                rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
+                need = (not topic.get('magnet') or topic.get('_magnet_failed')
+                        or poster_due
+                        or rating_due
+                        or not topic.get('youtube_url')
+                        or not topic.get('format'))
+                if not need:
+                    if topic.get('_enrich_retries'):
+                        topic.pop('_enrich_retries', None)
+                        changed = True
+                    continue
+                retries = topic.get('_enrich_retries', 0)
+                if not force and retries >= MAX_RETRIES and not poster_due:
+                    continue
+                title = topic.get('movie_title') or topic.get('title', '?')
+                print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
+                topic['_enrich_retries'] = retries + 1
+                gp.enrich_topic(topic, force_poster_retry=force)
+                changed = True
+                poster_still_due = (
+                    not gp.has_real_poster(topic)
+                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
+                )
+                rating_still_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
+                still_missing = (not topic.get('magnet') or topic.get('_magnet_failed')
+                                 or poster_still_due
+                                 or rating_still_due
+                                 or not topic.get('youtube_url')
+                                 or not topic.get('format'))
+                if not still_missing:
+                    topic.pop('_enrich_retries', None)
+                    print(f'    -> OK')
+                else:
+                    print(f'    -> ещё не все данные')
+            if changed:
+                atomic_write_json_unlocked(data_path, topics)
+                gen_path = DATA_DIR / 'index-kino.html'
+                atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
+                print(f'  [enrich] сохранено ({sum(1 for t in topics if not t.get("_enrich_retries"))}/{len(topics)} готово)')
+    except Exception:
+        return
+
+
+def _periodic_enrich():
+    print(f'Автообогащение запущено, интервал {ENRICH_INTERVAL_MINUTES} мин')
+    while True:
+        _enrich_missing()
+        time.sleep(ENRICH_INTERVAL_MINUTES * 60)
+
+
+def _ensure_periodic_enrich():
+    t = threading.Thread(target=_periodic_enrich, daemon=True)
+    t.start()
+
+
+def _rate_limit(key: str, seconds: float = RATE_LIMIT_SECONDS) -> bool:
+    now = time.monotonic()
+    last = _rate_limit_store.get(key)
+    if last and now - last < seconds:
+        return False
+    _rate_limit_store[key] = now
+    return True
+
+
+def _mark_stream_session(info_hash: str) -> str:
+    with _sessions_lock:
+        if len(_stream_sessions) >= MAX_STREAM_SESSIONS:
+            if info_hash not in {s['hash'] for s in _stream_sessions.values()}:
+                raise RuntimeError(f'Too many active streams ({MAX_STREAM_SESSIONS})')
+    sid = request.args.get('sid') or request.headers.get('X-Player-Session')
+    if not sid:
+        sid = f'{request.remote_addr or "local"}:{info_hash}'
+    now = time.monotonic()
+    with _sessions_lock:
+        _stream_sessions[sid] = {'hash': info_hash, 'last_seen': now}
+    engine.resume(info_hash)
+    return sid
+
+
+def _touch_stream_session(sid: str):
+    now = time.monotonic()
+    with _sessions_lock:
+        item = _stream_sessions.get(sid)
+        if item:
+            item['last_seen'] = now
+
+
+def _stop_stream_session(sid: str | None):
+    if not sid:
+        return
+    stopped_hash = None
+    with _sessions_lock:
+        item = _stream_sessions.pop(sid, None)
+        if item:
+            stopped_hash = str(item.get('hash') or '')
+            still_active = any(v.get('hash') == stopped_hash for v in _stream_sessions.values())
+        else:
+            still_active = True
+    if stopped_hash and not still_active:
+        engine.pause(stopped_hash)
+
+
+def _sweep_stream_sessions():
+    while True:
+        time.sleep(SESSION_SWEEP_INTERVAL)
+        now = time.monotonic()
+        pause_hashes: set[str] = set()
+        with _sessions_lock:
+            expired = [
+                sid for sid, item in _stream_sessions.items()
+                if now - float(item.get('last_seen') or 0) > STREAM_IDLE_TIMEOUT
+            ]
+            for sid in expired:
+                item = _stream_sessions.pop(sid, None)
+                if item and item.get('hash'):
+                    pause_hashes.add(str(item['hash']))
+            active_hashes = {str(item['hash']) for item in _stream_sessions.values() if item.get('hash')}
+        for info_hash in pause_hashes - active_hashes:
+            engine.pause(info_hash)
+
+
+def _ensure_session_monitor():
+    global _session_monitor_started
+    if _session_monitor_started:
+        return
+    _session_monitor_started = True
+    threading.Thread(target=_sweep_stream_sessions, daemon=True).start()
+
+
+@app.before_request
+def _start_session_monitor():
+    _ensure_session_monitor()
+
+
+@app.route('/watch', methods=['POST'])
+def watch():
+    data = request.get_json(silent=True)
+    if not data or 'magnet' not in data:
+        return jsonify(error='magnet required'), 400
+
+    magnet = data['magnet']
+    try:
+        info_hash = engine.add_magnet(magnet)
+    except TimeoutError as e:
+        return jsonify(error=str(e)), 504
+
+    return jsonify(info_hash=info_hash)
+
+
+@app.route('/start', methods=['POST'])
+def start_torrent():
+    magnet = request.form.get('magnet')
+    if not magnet:
+        return 'magnet required', 400
+    try:
+        info_hash = engine.add_magnet_async(magnet)
+    except ValueError as e:
+        return str(e), 400
+    return redirect(f'/player.html#{info_hash}')
+
+
+@app.route('/watch_sync', methods=['POST'])
+def watch_sync():
+    data = request.get_json(silent=True)
+    if not data or 'magnet' not in data:
+        return jsonify(error='magnet required'), 400
+    magnet = data['magnet']
+    try:
+        info_hash = engine.add_magnet(magnet, timeout=7)
+    except TimeoutError:
+        info_hash = engine.add_magnet_async(magnet)
+        return jsonify(info_hash=info_hash, async_mode=True)
+    return jsonify(info_hash=info_hash, async_mode=False)
+
+
+@app.route('/status/<info_hash>')
+def status(info_hash):
+    s = engine.get_status(info_hash)
+    if s is None:
+        return jsonify(error='not found'), 404
+    return jsonify(s)
+
+
+INITIAL_CHUNK = 8 * 1024 * 1024  # 8 MB - covers full moov for most files
+MAX_RANGE_CHUNK = 16 * 1024 * 1024
+STREAM_READ_CHUNK = 1024 * 1024
+
+
+@app.route('/stream/<info_hash>')
+def stream(info_hash):
+    try:
+        sid = _mark_stream_session(info_hash)
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 503
+    touch_session = lambda: _touch_stream_session(sid)
+    handle = engine.get_handle(info_hash)
+    if not handle:
+        handle = engine.wait_for_handle(info_hash, timeout=30)
+    local_file = engine.wait_for_local_file(info_hash, timeout=0.1)
+    if not handle:
+        if not local_file:
+            abort(404, description='Torrent not found')
+
+    deadline = time.monotonic() + 60
+    if handle:
+        while not handle.status().has_metadata:
+            touch_session()
+            if time.monotonic() > deadline:
+                abort(503, description='Metadata timeout')
+            time.sleep(0.3)
+
+    filepath = engine.get_file_path(info_hash)
+    while not filepath:
+        touch_session()
+        if time.monotonic() > deadline:
+            abort(404, description='File path not found')
+        time.sleep(0.3)
+        filepath = engine.get_file_path(info_hash)
+
+    video_info = engine.get_video_file_info(info_hash)
+    if not video_info:
+        abort(404, description='Video file not found')
+
+    while not os.path.exists(filepath):
+        touch_session()
+        if time.monotonic() > deadline:
+            abort(404, description='File not found on disk')
+        time.sleep(0.3)
+
+    file_size = video_info['size']
+
+    ext = os.path.splitext(filepath)[1].lower()
+    streamable = {'.mkv', '.mp4'}
+    if ext not in streamable and handle:
+        status = handle.status()
+        if status.progress < 1.0:
+            abort(503, description='Формат ' + ext.upper().lstrip('.') + ' требует полной загрузки. Прогресс: ' + str(round(status.progress * 100)) + '%')
+
+    range_header = request.headers.get('Range')
+    start, end = 0, file_size - 1
+
+    if range_header:
+        m = re.match(r'bytes=(\d*)-(\d*)', range_header)
+        if m:
+            start_str = m.group(1)
+            req_end_str = m.group(2)
+            if not start_str and req_end_str:
+                suffix_len = int(req_end_str)
+                if suffix_len <= 0:
+                    abort(416)
+                start = max(file_size - suffix_len, 0)
+                end = file_size - 1
+            else:
+                start = int(start_str) if start_str else 0
+                if start >= file_size:
+                    abort(416)
+                if req_end_str:
+                    end = min(int(req_end_str), file_size - 1)
+                else:
+                    end = min(start + INITIAL_CHUNK - 1, file_size - 1)
+        else:
+            abort(416)
+        if start > end:
+            abort(416)
+    else:
+        end = min(start + INITIAL_CHUNK - 1, file_size - 1)
+
+    if end - start + 1 > MAX_RANGE_CHUNK:
+        end = min(start + MAX_RANGE_CHUNK - 1, file_size - 1)
+
+    if handle and not video_info.get('local_only'):
+        info = handle.torrent_file()
+        try:
+            start_piece = info.map_file(video_info['index'], start, 1).piece
+            end_piece = info.map_file(video_info['index'], end, 1).piece
+        except RuntimeError:
+            abort(416)
+
+        engine.prioritize_piece_range(info_hash, start_piece, end_piece)
+
+        try:
+            _wait_for_pieces(handle, start_piece, end_piece, touch=touch_session)
+        except TimeoutError:
+            abort(503, description='Download in progress, retry later')
+
+    content_length = end - start + 1
+    content_type = mimetypes.guess_type(filepath)[0] or 'video/mp4'
+
+    def generate_file():
+        remaining = content_length
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            while remaining > 0:
+                _touch_stream_session(sid)
+                chunk = f.read(min(STREAM_READ_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    resp = Response(generate_file(), status=206, content_type=content_type, direct_passthrough=True)
+    resp.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+    resp.headers['Accept-Ranges'] = 'bytes'
+    resp.headers['Content-Length'] = str(content_length)
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+def _wait_for_pieces(handle, start_piece, end_piece, timeout=120, interval=0.5, touch=None):
+    deadline = time.monotonic() + timeout
+    num_pieces = handle.torrent_file().num_pieces()
+    while time.monotonic() < deadline:
+        if touch:
+            touch()
+        s = handle.status()
+        if s.state in (0, 1, 6):
+            time.sleep(interval)
+            continue
+        all_have = True
+        for i in range(start_piece, min(end_piece + 1, num_pieces)):
+            if not handle.have_piece(i):
+                all_have = False
+                break
+        if all_have:
+            handle.flush_cache()
+            return
+        time.sleep(interval)
+    raise TimeoutError(f'Pieces {start_piece}-{end_piece} not available after {timeout}s')
+
+
+@app.route('/transcode/<info_hash>')
+def transcode(info_hash):
+    sid = _mark_stream_session(info_hash)
+    filepath = engine.get_file_path(info_hash)
+    if not filepath:
+        filepath = engine.wait_for_local_file(info_hash, timeout=10)
+    if not filepath or not os.path.exists(filepath):
+        abort(404, description='File not found')
+
+    cmd = [
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-i', filepath,
+        '-map', '0:v:0',
+        '-map', '0:a:0',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        'pipe:1',
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def generate():
+        try:
+            while True:
+                _touch_stream_session(sid)
+                chunk = proc.stdout.read(STREAM_READ_CHUNK)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+    resp = Response(generate(), content_type='video/mp4', direct_passthrough=True)
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/stop_session', methods=['POST'])
+def stop_session():
+    data = request.get_json(silent=True) or {}
+    sid = data.get('sid') or request.form.get('sid')
+    _stop_stream_session(str(sid) if sid else None)
+    return jsonify(ok=True)
+
+
+@app.route('/player.html')
+def player():
+    return send_file(str(BASE_DIR / 'player.html'))
+
+
+@app.route('/')
+def index():
+    index_path = DATA_DIR / 'index-kino.html'
+
+    if not index_path.exists():
+        return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
+
+    stat = index_path.stat()
+    INJECT_VER = 'v3'
+    etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
+
+    if request.if_none_match.contains(etag_val):
+        return Response(status=304)
+
+    html = index_path.read_text('utf-8')
+    refresh_btn = '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🔄</a>'
+    html = html.replace('</span>', f'{refresh_btn}</span>', 1)
+    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a></div>\n'''
+    html = html.replace('</div>\n\n<table id="tbl">', f'</div>\n{browse_links}<table id="tbl">')
+    bl_style = '<style>.bl{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}.bl a{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}.bl a:hover{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}</style>'
+    html = html.replace('</head>', f'{bl_style}</head>', 1)
+
+    resp = Response(html, content_type='text/html')
+    resp.set_etag(etag_val)
+    resp.cache_control.public = True
+    resp.cache_control.max_age = 0
+    resp.cache_control.must_revalidate = True
+    return resp
+
+
+@app.route('/refresh')
+def refresh():
+    def generate():
+        if not _daily_refresh_lock.acquire(blocking=False):
+            yield '<html><body><h2>Обновление уже выполняется</h2><p><a href="/">Назад</a></p></body></html>'
+            return
+        yield '<html><body><h2>Обновляю данные...</h2><pre>'
+        try:
+            refresh_output = _iter_all_collections_refresh_output()
+            code = 0
+            while True:
+                try:
+                    yield next(refresh_output)
+                except StopIteration as done:
+                    code = done.value or 0
+                    break
+            if code == 0:
+                _publish_staging_refresh(REFRESH_STAGING_DIR)
+                _write_daily_refresh_stamp()
+                yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
+            else:
+                yield f'</pre><p>Ошибка refresh, код {code}. Метка не обновлена.</p><p><a href="/">Назад</a></p></body></html>'
+        finally:
+            _daily_refresh_lock.release()
+    return Response(generate(), content_type='text/html')
+
+
+@app.route('/cleanup')
+def cleanup_trigger():
+    if not _rate_limit(f'cleanup:{request.remote_addr}', seconds=10):
+        return jsonify(error='rate limited'), 429
+    removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
+    topics = cleanup_old_topics()
+    return jsonify(removed=removed, count=len(removed), topics=topics)
+
+
+@app.route('/torrents_data.json')
+def torrents_data():
+    return send_file(str(DATA_DIR / 'torrents_data.json'))
+
+
+@app.route('/enrich/all', methods=['POST'])
+def enrich_all():
+    if not _rate_limit(f'enrich:{request.remote_addr}', seconds=30):
+        return jsonify(error='rate limited'), 429
+    threading.Thread(target=_enrich_missing, args=[True], daemon=True).start()
+    return jsonify(status='started')
+
+
+@app.route('/enrich/<topic_id>', methods=['POST'])
+def enrich_topic(topic_id):
+    with _enrich_lock:
+        if _enrich_status.get(topic_id) == 'in_progress':
+            return jsonify(status='in_progress')
+        if topic_id in ENRICH_QUEUE:
+            return jsonify(status='queued')
+        ENRICH_QUEUE.append(topic_id)
+        _enrich_status[topic_id] = 'queued'
+    return jsonify(status='queued')
+
+
+@app.route('/enrich/status/<topic_id>')
+def enrich_status(topic_id):
+    with _enrich_lock:
+        status = _enrich_status.get(topic_id, 'unknown')
+    return jsonify(status=status)
+
+
+@app.route('/hide/<topic_id>', methods=['POST'])
+def hide_topic(topic_id):
+    if not _rate_limit(f'hide:{request.remote_addr}'):
+        return jsonify(error='rate limited'), 429
+    gp.add_hidden_topic(topic_id)
+    data_path = DATA_DIR / 'torrents_data.json'
+    if data_path.exists():
+        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        atomic_write_text(DATA_DIR / 'index-kino.html', html)
+    return jsonify(ok=True)
+
+
+@app.route('/unhide/<topic_id>', methods=['POST'])
+def unhide_topic(topic_id):
+    if not _rate_limit(f'unhide:{request.remote_addr}'):
+        return jsonify(error='rate limited'), 429
+    gp.remove_hidden_topic(topic_id)
+    data_path = DATA_DIR / 'torrents_data.json'
+    if data_path.exists():
+        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        atomic_write_text(DATA_DIR / 'index-kino.html', html)
+    return jsonify(ok=True)
+
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Browse modes
+# ---------------------------------------------------------------------------
+def _get_movies():
+    p = DATA_DIR / 'torrents_data.json'
+    if not p.exists():
+        return []
+    return json.loads(p.read_text('utf-8'))
+
+
+BROWSE_CSS = '''
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#141414;color:#fff;min-height:100vh}
+a{color:#e50914;text-decoration:none}
+h1{font-size:24px;font-weight:700;padding:20px 30px 10px}
+h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
+.back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}
+.back:hover{background:#e50914;border-color:#e50914}
+'''
+
+
+@app.route('/test')
+def browse_test():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    count = len(movies)
+    genres = sorted({g.strip() for m in movies for g in m.get('genre', '').split(',') if g.strip()})
+    years = sorted({m['movie_year'] for m in movies if m.get('movie_year')}, reverse=True)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>LocaL-Kino — Тест режимов</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#141414;color:#fff;padding:30px;min-height:100vh}}
+h1{{font-size:28px;margin-bottom:6px}}
+.sub{{color:#888;margin-bottom:30px;font-size:14px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}}
+.card{{background:#1f1f1f;border-radius:10px;padding:20px;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,.4)}}
+.card h3{{font-size:18px;margin-bottom:8px}}
+.card p{{font-size:13px;color:#aaa;margin-bottom:12px;line-height:1.4}}
+.card a{{display:inline-block;background:#e50914;color:#fff;padding:8px 18px;border-radius:4px;font-size:13px;text-decoration:none;margin-right:8px}}
+.card a:hover{{background:#f40612}}
+.tag{{display:inline-block;background:#333;color:#aaa;font-size:11px;padding:2px 8px;border-radius:3px;margin-right:4px;margin-top:6px}}
+</style></head><body>
+<h1>🧪 Режимы просмотра</h1>
+<p class="sub">{count} фильмов, {len(genres)} жанров, {len(years)} годов выпуска</p>
+<div class="grid">
+<div class="card"><h3>🎠 Carousel</h3><p>Netflix-стиль: горизонтальные ряды по жанрам. Скролл колёсиком мыши или стрелками.</p><a href="/browse/carousel">Открыть</a><span class="tag">постеры</span><span class="tag">жанры</span></div>
+<div class="card"><h3>🎲 Random</h3><p>Случайный фильм на весь экран: постер, описание, трейлер. Клавиши ← → для навигации.</p><a href="/browse/random">Открыть</a><span class="tag">одна карточка</span><span class="tag">клавиши</span></div>
+<div class="card"><h3>🔍 Filter</h3><p>Фильтры слева: жанр, год, рейтинг, коллекция, сиды. Результаты обновляются мгновенно.</p><a href="/browse/filter">Открыть</a><span class="tag">фильтрация</span><span class="tag">реальное время</span></div>
+<div class="card"><h3>📅 Timeline</h3><p>Фильмы на временной шкале по годам. Клик по году → фильмы этого года.</p><a href="/browse/timeline">Открыть</a><span class="tag">годы</span><span class="tag">коллекции</span></div>
+<div class="card"><h3>📺 Shuffle TV</h3><p>Автоматическая карусель: фильмы переключаются каждые 30 секунд. Как телеканал.</p><a href="/browse/shuffle">Открыть</a><span class="tag">авто</span><span class="tag">полный экран</span></div>
+</div>
+<p style="margin-top:30px;font-size:13px;color:#555"><a href="/" style="color:#e50914">← На главную</a></p>
+</body></html>'''
+
+
+def _poster_style(poster_url: str) -> str:
+    if not poster_url:
+        return 'background:#333'
+    if not poster_url.startswith('data/'):
+        poster_url = 'data/' + poster_url
+    full_path = str(DATA_DIR / poster_url.removeprefix('data/'))
+    if not os.path.exists(full_path):
+        return 'background:#333'
+    return f'background-image:url(/{poster_url})'
+
+
+@app.route('/browse/carousel')
+def browse_carousel():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    genre_map: dict[str, list] = {}
+    for m in movies:
+        for g in m.get('genre', '').split(','):
+            g = g.strip()
+            if not g:
+                continue
+            genre_map.setdefault(g, []).append(m)
+    rows_html = ''
+    sorted_genres = sorted(genre_map.items(), key=lambda x: -len(x[1]))
+    for genre, items in sorted_genres:
+        items.sort(key=lambda m: (0 if 'background-image' in _poster_style(m.get('poster_url', '')) else 1, -(m.get('seeders') or 0)))
+        cards = ''
+        for m in items:
+            poster_style = _poster_style(m.get('poster_url', ''))
+            yr = m.get('movie_year', '')
+            rt = m.get('kp_rating') or m.get('imdb_rating') or ''
+            cards += f'''<div class="cc">
+<div class="cp" style="{poster_style}"></div>
+<div class="ci"><strong>{m.get('orig_title') or m.get('movie_title','')}</strong>{" "+yr if yr else ""}{" · "+rt if rt else ""}</div>
+</div>'''
+        rows_html += f'<h2>{genre} ({len(items)})</h2><div class="cr">{cards}</div>'
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Carousel</title>
+<style>
+{BROWSE_CSS}
+.cr{{display:flex;gap:12px;overflow-x:auto;padding:10px 30px 20px;scroll-behavior:smooth;-webkit-overflow-scrolling:touch}}
+.cr::-webkit-scrollbar{{height:6px}}
+.cr::-webkit-scrollbar-thumb{{background:#555;border-radius:3px}}
+.cc{{flex:0 0 auto;width:180px;cursor:pointer;transition:transform .2s}}
+.cc:hover{{transform:scale(1.05)}}
+.cp{{width:180px;height:270px;background-size:cover;background-position:center;border-radius:6px}}
+.ci{{font-size:12px;color:#ccc;padding:6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>🎠 По жанрам</h1>
+{rows_html}
+</body></html>'''
+
+
+@app.route('/browse/random')
+def browse_random():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Random</title>
+<style>
+{BROWSE_CSS}
+body{{background:#000;display:flex;align-items:center;justify-content:center}}
+#rc{{position:relative;width:100%;height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}}
+#rc .bg{{position:absolute;inset:0;background-size:cover;background-position:center;filter:blur(20px) brightness(.3);transition:background-image .5s}}
+#rc .poster{{position:relative;z-index:1;width:300px;height:450px;background-size:cover;background-position:center;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.6);transition:background-image .5s}}
+#rc .info{{position:relative;z-index:1;margin-left:40px;max-width:500px}}
+#rc .info h2{{font-size:28px;padding:0;margin-bottom:8px}}
+#rc .info .meta{{color:#aaa;font-size:14px;margin-bottom:12px}}
+#rc .info .desc{{color:#ccc;font-size:14px;line-height:1.5;margin-bottom:20px}}
+.btns a{{display:inline-block;background:#e50914;color:#fff;padding:10px 24px;border-radius:4px;font-size:14px;text-decoration:none;margin-right:10px}}
+.btns a:hover{{background:#f40612}}
+.btns button{{background:#333;color:#fff;border:none;padding:10px 24px;border-radius:4px;font-size:14px;cursor:pointer}}
+.btns button:hover{{background:#555}}
+#nav{{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);display:flex;gap:12px;z-index:10}}
+#nav button{{background:rgba(255,255,255,.1);color:#fff;border:1px solid #555;padding:8px 20px;border-radius:4px;font-size:16px;cursor:pointer}}
+#nav button:hover{{background:rgba(255,255,255,.2)}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="rc"><div class="bg" id="bg"></div><div class="poster" id="poster"></div><div class="info"><h2 id="title"></h2><div class="meta" id="meta"></div><div class="desc" id="cast"></div><div class="btns" id="btns"></div></div></div>
+<div id="nav"><button onclick="prev()">←</button><button onclick="next()">→</button></div>
+ <script>
+const MOVIES = {movies_json};
+function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:''}}
+let idx = Math.floor(Math.random()*MOVIES.length);
+function show(i){{
+const m=MOVIES[i];if(!m)return;
+const p=posterUrl(m);
+document.getElementById('bg').style.backgroundImage='url('+p+')';
+document.getElementById('poster').style.backgroundImage='url('+p+')';
+document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
+document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
+document.getElementById('cast').textContent=m.cast||'';
+document.getElementById('btns').innerHTML=(m.magnet?'<a href="player.html#'+m.magnet.match(/btih:([A-Fa-f0-9]+)/)[1].toLowerCase()+'">▶ Смотреть</a>':'')+(m.youtube_url?'<a href="'+m.youtube_url+'" target="_blank">▶ Трейлер</a>':'');
+}}
+function next(){{idx=(idx+1)%MOVIES.length;show(idx)}}
+function prev(){{idx=(idx-1+MOVIES.length)%MOVIES.length;show(idx)}}
+document.addEventListener('keydown',e=>{{if(e.key==='ArrowLeft')prev();if(e.key==='ArrowRight')next()}});
+show(idx);
+</script></body></html>'''
+
+
+@app.route('/browse/filter')
+def browse_filter():
+    from html import escape as h_esc
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    genre_counts: dict[str, int] = {}
+    for m in movies:
+        for g in m.get('genre', '').split(','):
+            g = g.strip().lower()
+            if g:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+    top_genres = sorted(genre_counts.keys(), key=lambda g: -genre_counts[g])[:20]
+    years = sorted({m['movie_year'] for m in movies if m.get('movie_year')}, reverse=True)
+    collections = sorted({m.get('collection', '') for m in movies if m.get('collection')})
+    formats = sorted({m.get('format', '').upper().strip() for m in movies if m.get('format') and m.get('format').strip()})
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    genre_opts = ''.join(f'<label><input type="checkbox" class="fg" value="{g}" checked> {g.capitalize()}</label>' for g in top_genres)
+    year_opts = ''.join(f'<option value="{y}">{y}</option>' for y in years)
+    coll_opts = ''.join(f'<option value="{h_esc(c)}">{h_esc(c)}</option>' for c in collections)
+    fmt_opts = ''.join(f'<option value="{f}">{f}</option>' for f in formats)
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Filter</title>
+<style>
+{BROWSE_CSS}
+body{{display:flex;padding:0}}
+#sidebar{{width:260px;min-width:260px;background:#1a1a1a;padding:20px;height:100vh;overflow-y:auto;position:sticky;top:0}}
+#sidebar h3{{font-size:14px;margin:14px 0 8px;color:#aaa}}
+#sidebar label{{display:block;font-size:13px;margin:3px 0;cursor:pointer}}
+#sidebar input[type=checkbox]{{margin-right:6px}}
+#sidebar select,#sidebar input[type=range]{{width:100%;margin:4px 0 8px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px}}
+#sidebar input[type=range]{{padding:0}}
+#results{{flex:1;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;align-content:start}}
+.fr{{width:160px;cursor:pointer;transition:transform .2s}}
+.fr:hover{{transform:scale(1.05)}}
+.fr .fp{{width:160px;height:240px;background-size:cover;background-position:center;border-radius:6px}}
+.fr .fi{{font-size:12px;color:#ccc;padding:4px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+#count{{position:fixed;bottom:10px;right:20px;background:rgba(0,0,0,.7);padding:6px 14px;border-radius:4px;font-size:13px;z-index:100}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="sidebar"><h3>Жанры</h3>{genre_opts}<h3>Год от</h3><select id="yrFrom"><option value="">Все</option>{year_opts}</select><h3>Год до</h3><select id="yrTo"><option value="">Все</option>{year_opts}</select><h3>Рейтинг ≥</h3><input type="range" id="minRt" min="0" max="10" step="0.5" value="0"><span id="rtVal">0</span><h3>Коллекция</h3><select id="coll"><option value="">Все</option>{coll_opts}</select><h3>Формат</h3><select id="fmt"><option value="">Все</option>{fmt_opts}</select><h3>Сиды ≥</h3><input type="range" id="minSd" min="0" max="100" step="1" value="0"><span id="sdVal">0</span></div>
+<div id="results"></div><div id="count"></div>
+ <script>
+const MOVIES = {movies_json};
+function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:''}}
+function filter(){{
+const selGenres=new Set([...document.querySelectorAll('.fg:checked')].map(c=>c.value));
+const yrFrom=document.getElementById('yrFrom').value;
+const yrTo=document.getElementById('yrTo').value;
+const minRt=parseFloat(document.getElementById('minRt').value);
+const coll=document.getElementById('coll').value;
+const fmt=document.getElementById('fmt').value;
+const minSd=parseInt(document.getElementById('minSd').value);
+document.getElementById('rtVal').textContent=minRt;
+document.getElementById('sdVal').textContent=minSd;
+const out=MOVIES.filter(m=>{{
+const g=(m.genre||'').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+if(!g.some(x=>selGenres.has(x)))return false;
+if(yrFrom&&m.movie_year<yrFrom)return false;
+if(yrTo&&m.movie_year>yrTo)return false;
+const r=parseFloat(m.kp_rating||m.imdb_rating||'0');
+if(r<minRt)return false;
+if(coll&&m.collection!==coll)return false;
+if(fmt&&(m.format||'').toUpperCase()!==fmt)return false;
+if((m.seeders||0)<minSd)return false;
+return true;
+}});
+document.getElementById('count').textContent=out.length+' фильмов';
+document.getElementById('results').innerHTML=out.map(m=>{{
+const p=posterUrl(m)?'background-image:url('+posterUrl(m)+')':'background:#333';
+const hash=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase();
+const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
+return '<div class=fr data-href="player.html#'+(hash||'')+'"><div class=fp style="'+p+'"></div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
+}}).join('');
+}}
+document.querySelectorAll('.fg').forEach(c=>c.addEventListener('change',filter));
+document.getElementById('yrFrom').addEventListener('change',filter);
+document.getElementById('yrTo').addEventListener('change',filter);
+document.getElementById('minRt').addEventListener('input',filter);
+document.getElementById('coll').addEventListener('change',filter);
+document.getElementById('fmt').addEventListener('change',filter);
+document.getElementById('minSd').addEventListener('input',filter);
+document.getElementById('results').addEventListener('click',function(e){{var t=e.target.closest('.fr');if(t&&t.dataset.href)location=t.dataset.href}});
+filter();
+</script></body></html>'''
+
+
+@app.route('/browse/timeline')
+def browse_timeline():
+    import re
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    movies = [m for m in movies if m['topic_id'] not in hidden]
+    year_map: dict[str, list] = {}
+    for m in movies:
+        y = m.get('movie_year', '')
+        if y:
+            year_map.setdefault(y, []).append(m)
+    years = sorted(year_map.keys(), reverse=True)
+    rows_html = ''
+    for y in years:
+        items = year_map[y]
+        cards = ''
+        for m in items:
+            rt = m.get('kp_rating') or m.get('imdb_rating') or '—'
+            poster_style = _poster_style(m.get('poster_url', ''))
+            match = re.search(r'btih:([A-Fa-f0-9]{40})', m.get('magnet', ''))
+            player_url = f'player.html#{match.group(1).lower()}' if match else '#'
+            title = m.get('orig_title') or m.get('movie_title', '')
+            from html import escape as h_esc
+            cards += f'''<div class="tc" onclick="location=\'{h_esc(player_url)}\'">
+<div class="tp" style="{poster_style}"></div>
+<div class="ti"><strong>{h_esc(title)}</strong> <span class="tr">{rt}</span></div>
+</div>'''
+        rows_html += f'''<div class="ty" onclick="this.classList.toggle(\'open\')">
+<div class="yh"><span class="yl">{y}</span> <span class="yc">{len(items)}</span> <span class="ya">▼</span></div>
+<div class="yg">{cards}</div>
+</div>'''
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Timeline</title>
+<style>
+{BROWSE_CSS}
+body{{padding:20px 30px}}
+.ty{{margin-bottom:4px;overflow:hidden;border-radius:6px;background:#1a1a1a;transition:background .2s}}
+.ty:hover{{background:#222}}
+.yh{{padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:12px;user-select:none}}
+.yl{{font-size:22px;font-weight:700;min-width:50px}}
+.yc{{font-size:13px;color:#888}}
+.ya{{margin-left:auto;color:#555;transition:transform .3s}}
+.ty.open .ya{{transform:rotate(180deg)}}
+.yg{{display:none;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:0 16px 16px}}
+.ty.open .yg{{display:grid}}
+.tc{{cursor:pointer;transition:transform .2s}}
+.tc:hover{{transform:scale(1.05)}}
+.tp{{width:140px;height:210px;background-size:cover;background-position:center;border-radius:5px}}
+.ti{{font-size:11px;color:#ccc;padding:4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.tr{{color:#888}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>📅 По годам</h1>
+{rows_html}
+</body></html>'''
+
+
+@app.route('/browse/shuffle')
+def browse_shuffle():
+    movies = _get_movies()
+    hidden = gp.load_hidden_topic_ids()
+    hidden_set = set(str(k) for k in hidden)
+    movies = [m for m in movies if str(m['topic_id']) not in hidden_set]
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Киноплёнка</title>
+<style>
+body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui,sans-serif}}
+#bg{{position:fixed;inset:0;background-size:cover;background-position:center;filter:blur(40px) brightness(.2);transition:background-image 1s}}
+#main-w{{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:3;width:300px;height:440px;overflow:hidden;border-radius:12px;box-shadow:0 10px 50px rgba(0,0,0,.8)}}
+#main-w .mp{{position:absolute;inset:0;background-size:cover;background-position:center;background-color:#222;transition:transform .5s ease,opacity .5s ease}}
+#main-w .mp.out{{transform:translateX(-120%);opacity:0}}
+#main-w .mp.in{{transform:translateX(120%)}}
+#main-w .mp.in.go{{transform:translateX(0);opacity:1}}
+#info{{position:fixed;top:calc(50% + 230px);left:50%;transform:translateX(-50%);z-index:4;text-align:center;color:#fff;text-shadow:0 2px 8px rgba(0,0,0,.8);pointer-events:none}}
+#info h2{{font-size:20px;margin:0 0 2px;font-weight:600}}
+#info .meta{{font-size:12px;color:#aaa}}
+#strip-wrap{{position:fixed;top:50%;left:0;right:0;transform:translateY(-50%);z-index:2;height:150px;overflow:hidden;pointer-events:none}}
+#strip{{display:flex;align-items:center;transition:transform .5s cubic-bezier(.4,0,.2,1);height:150px}}
+#strip .fr{{flex:none;width:100px;height:150px;background-size:cover;background-position:center;border-radius:4px;border:2px solid #333;box-sizing:border-box;background-color:#222;opacity:.6;transition:opacity .3s}}
+#strip .fr:nth-child(13){{border-color:#8ab4f8;opacity:1;box-shadow:0 0 16px rgba(138,180,248,.4)}}
+#ctrl{{position:fixed;bottom:5%;left:50%;transform:translateX(-50%);z-index:10;display:flex;gap:8px;opacity:0;transition:opacity .3s}}
+#ctrl.show{{opacity:1}}
+#ctrl button{{background:rgba(255,255,255,.08);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}}
+#ctrl button:hover{{background:rgba(255,255,255,.2)}}
+#timer{{position:fixed;top:12px;left:16px;z-index:10;font-size:13px;color:#555;font-variant-numeric:tabular-nums}}
+.back{{position:fixed;top:12px;right:16px;z-index:20;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
+.back:hover{{color:#fff}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<div id="timer"></div>
+<div id="bg"></div>
+<div id="main-w"><div class="mp" id="mpCur"></div><div class="mp" id="mpNext"></div></div>
+<div id="info"><h2 id="stitle"></h2><div class="meta" id="smeta"></div></div>
+<div id="strip-wrap"><div id="strip"></div></div>
+<div id="ctrl" class="show"><button id="playBtn" onclick="togglePause()">⏸</button><button onclick="next()">→</button><button onclick="setSpeed(5)">5с</button><button onclick="setSpeed(10)">10с</button><button onclick="setSpeed(15)">15с</button><button onclick="setSpeed(30)">30с</button></div>
+ <script>
+const MOVIES = {movies_json};
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+let idx=Math.floor(Math.random()*MOVIES.length),paused=false,speed=5,timer=0,animating=false;
+const FRAME=106; // width+gap (100+6)
+
+function render(i){{
+const m=MOVIES[i];if(!m)return;
+const p=pu(m);
+document.getElementById('bg').style.backgroundImage='url('+p+')';
+document.getElementById('stitle').textContent=m.orig_title||m.movie_title||'';
+document.getElementById('smeta').textContent=[m.movie_year,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
+const strip=document.getElementById('strip');
+const total=MOVIES.length;
+const half=12;
+const html=[];
+for(let o=-half;o<=half;o++){{
+const fi=(i+o+total)%total;
+html.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+}}
+strip.innerHTML=html.join('');
+strip.style.transform='translateX(-'+(half*FRAME)+'px)';
+timer=0;
+}}
+
+function next(){{
+if(animating)return;
+animating=true;
+const ni=(idx+1)%MOVIES.length;
+const nm=MOVIES[ni]; if(!nm){{animating=false;return;}}
+const oldP=pu(MOVIES[idx]);
+const newP=pu(nm);
+const mpCur=document.getElementById('mpCur');
+const mpNext=document.getElementById('mpNext');
+// Reset next poster off-screen right
+mpNext.style.transition='none';
+mpNext.style.backgroundImage='url('+newP+')';
+mpNext.className='mp in';
+void mpNext.offsetHeight; // reflow
+// Slide old poster out left, slide new poster in from right
+mpCur.style.transition='transform .5s ease,opacity .5s ease';
+mpCur.className='mp out';
+mpNext.style.transition='transform .5s ease,opacity .5s ease';
+mpNext.className='mp in go';
+setTimeout(()=>{{
+idx=ni;
+// Set current poster to new image, reset positions
+mpCur.style.transition='none';
+mpCur.style.backgroundImage='url('+newP+')';
+mpCur.className='mp';
+mpNext.className='mp'; // hidden
+document.getElementById('bg').style.backgroundImage='url('+newP+')';
+document.getElementById('stitle').textContent=nm.orig_title||nm.movie_title||'';
+document.getElementById('smeta').textContent=[nm.movie_year,nm.kp_rating?'KP '+nm.kp_rating:'',nm.imdb_rating?'IMDB '+nm.imdb_rating:''].filter(Boolean).join(' · ');
+// Update strip (slides left via CSS transition)
+const strip=document.getElementById('strip');
+const total=MOVIES.length;
+const half=12;
+const html=[];
+for(let o=-half;o<=half;o++){{
+const fi=(idx+o+total)%total;
+html.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+}}
+strip.innerHTML=html.join('');
+strip.style.transform='translateX(-'+(half*FRAME)+'px)';
+timer=0;
+animating=false;
+}},550);
+showCtrl();
+}}
+
+function prev(){{
+if(animating)return;
+idx=(idx-1+MOVIES.length)%MOVIES.length;
+// For prev, just instant (or could animate right-to-left)
+const m=MOVIES[idx];
+const p=pu(m);
+const mpCur=document.getElementById('mpCur');
+mpCur.style.transition='none';
+mpCur.style.backgroundImage='url('+p+')';
+mpCur.className='mp';
+render(idx);
+showCtrl();
+}}
+
+function togglePause(){{paused=!paused;document.getElementById('playBtn').textContent=paused?'▶':'⏸';showCtrl()}}
+function setSpeed(s){{speed=s;timer=0}}
+function showCtrl(){{document.getElementById('ctrl').classList.add('show');clearTimeout(window._hc);window._hc=setTimeout(()=>document.getElementById('ctrl').classList.remove('show'),2000)}}
+document.addEventListener('mousemove',showCtrl);
+document.addEventListener('keydown',e=>{{if(e.key==='ArrowRight')next();if(e.key==='ArrowLeft')prev();if(e.key===' '||e.key==='Space'){{e.preventDefault();togglePause()}}}});
+setInterval(()=>{{if(paused)return;timer++;const s=speed-timer;document.getElementById('timer').textContent=(s>0?s+'с':'сейчас')+' | '+(paused?'⏸':'▶')+' '+speed+'с';if(timer>=speed)next()}},1000);
+// Initial render
+const m0=MOVIES[idx]; if(m0){{
+const p0=pu(m0);
+document.getElementById('mpCur').style.backgroundImage='url('+p0+')';
+document.getElementById('bg').style.backgroundImage='url('+p0+')';
+document.getElementById('stitle').textContent=m0.orig_title||m0.movie_title||'';
+document.getElementById('smeta').textContent=[m0.movie_year,m0.kp_rating?'KP '+m0.kp_rating:'',m0.imdb_rating?'IMDB '+m0.imdb_rating:''].filter(Boolean).join(' · ');
+}}
+render(idx);
+'''
+if __name__ == '__main__':
+    import webbrowser
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else SERVER_PORT
+    print(f'LocaL-Kino server: http://localhost:{port}')
+    print(f'Test with: http://localhost:{port}/player.html')
+
+    def _deferred_cleanup():
+        print('Запускаю очистку temp...')
+        removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
+        if removed:
+            print(f'  Удалено папок: {len(removed)}')
+            for p in removed:
+                print(f'    - {p}')
+        else:
+            print('  Всё в порядке, ничего не удалено.')
+        topic_cleanup = cleanup_old_topics()
+        if topic_cleanup.get('removed_topics') or topic_cleanup.get('dated_topics') or topic_cleanup.get('skipped_topics'):
+            print('Очистка старых тем:')
+            print(f'  Тем: {topic_cleanup["removed_topics"]}')
+            print(f'  Тем с новой датой: {topic_cleanup["dated_topics"]}')
+            print(f'  Старых оставлено политикой коллекций: {topic_cleanup["skipped_topics"]}')
+            print(f'  Кешей: {topic_cleanup["removed_cache"]}')
+            print(f'  Постеров: {topic_cleanup["removed_posters"]}')
+        else:
+            print(f'Старых тем старше {TOPIC_MAX_AGE_DAYS} дней нет.')
+        _run_daily_refresh_if_due('startup')
+
+    threading.Thread(target=_deferred_cleanup, daemon=True).start()
+
+    print()
+    webbrowser.open(f'http://localhost:{port}')
+    _ensure_session_monitor()
+    _ensure_enrich_worker()
+    _ensure_periodic_enrich()
+    _ensure_daily_refresh_loop()
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(('::', port))
+    sock.listen(128)
+    from werkzeug.serving import make_server
+    server = make_server('::', port, app, threaded=True, fd=sock.fileno())
+    sock.close()
+    print(f' * Running on http://127.0.0.1:{port}')
+    server.serve_forever()
