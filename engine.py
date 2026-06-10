@@ -45,7 +45,14 @@ PIECE_PRIORITY_NONE = 0
 PIECE_PRIORITY_HIGH = 7
 PIECE_PRIORITY_LOW = 1
 HIGH_PRIORITY_COUNT = 2
-READY_THRESHOLD = 0.01
+READY_START_PIECES = 4
+READY_MIN_PROGRESS = 0.03
+READY_SPEED_FACTOR = 1.3
+READY_MIN_BUFFER_SECONDS = 90
+READY_MIN_BUFFER_BYTES = 64 * 1024 * 1024
+READY_MAX_BUFFER_BYTES = 256 * 1024 * 1024
+READY_SPEED_FALLBACK_BYTES = 2 * 1024 * 1024
+MIN_PLAUSIBLE_BITRATE = 128 * 1024
 
 
 class TorrentEngine:
@@ -67,6 +74,7 @@ class TorrentEngine:
         self.handles: dict[str, lt.torrent_handle] = {}
         self.local_files: dict[str, str] = {}
         self._readahead_cache: dict[str, tuple[int, int]] = {}
+        self._bitrate_cache: dict[str, float] = {}
 
     def add_magnet(self, magnet_url: str, timeout: float = 30) -> str:
         match = re.search(r'btih:([A-Fa-f0-9]{40})', magnet_url)
@@ -224,6 +232,10 @@ class TorrentEngine:
         streamable = video_format in ('mkv', 'mp4')
         num_pieces = handle.torrent_file().num_pieces()
         video = self._get_video_file(handle)
+        buffered_bytes = 0
+        min_buffer_bytes = 0
+        speed_ok = False
+        estimated_bitrate = 0
         if video:
             vindex, vsize, _ = video
             tm = handle.torrent_file()
@@ -232,12 +244,27 @@ class TorrentEngine:
             check_count = min(HIGH_PRIORITY_COUNT, vend - vstart + 1)
             first_done = all(handle.have_piece(i) for i in range(vstart, vstart + check_count))
             last_done = all(handle.have_piece(i) for i in range(vend - check_count + 1, vend + 1))
+            buffered_bytes = self._contiguous_done_bytes(handle, vstart, vend, vsize)
+            estimated_bitrate = self._estimate_bitrate(handle, total, video_path)
+            start_buffer_bytes = self._piece_buffer_bytes(tm, READY_START_PIECES, vsize)
+            min_buffer_bytes = self._ready_buffer_bytes(estimated_bitrate, total, start_buffer_bytes)
+            speed_ok = self._ready_speed_ok(s.download_rate, estimated_bitrate, progress)
         else:
             check_count = min(HIGH_PRIORITY_COUNT, num_pieces)
             first_done = all(handle.have_piece(i) for i in range(check_count))
             last_done = all(handle.have_piece(i) for i in range(num_pieces - check_count, num_pieces))
-        enough_overall = progress >= READY_THRESHOLD
-        ready = (progress >= 1.0) if not streamable else (first_done and (last_done or enough_overall))
+            buffered_bytes = self._contiguous_done_bytes(handle, 0, max(0, num_pieces - 1), total)
+            start_buffer_bytes = self._piece_buffer_bytes(handle.torrent_file(), READY_START_PIECES, total)
+            min_buffer_bytes = self._ready_buffer_bytes(0, total, start_buffer_bytes)
+            speed_ok = self._ready_speed_ok(s.download_rate, 0, progress)
+        enough_overall = progress >= READY_MIN_PROGRESS
+        startup_buffer_ready = buffered_bytes >= start_buffer_bytes
+        enough_buffer = buffered_bytes >= min_buffer_bytes
+        ready = (
+            progress >= 1.0
+            if not streamable
+            else (first_done and startup_buffer_ready and (speed_ok or enough_buffer) and (last_done or enough_overall))
+        )
         state = 'downloading' if s.download_rate > 0 else str(s.state)
 
         return {
@@ -254,6 +281,10 @@ class TorrentEngine:
             'file_size': file_size,
             'name': handle.torrent_file().name(),
             'format': video_format,
+            'buffered_bytes': buffered_bytes,
+            'start_buffer_bytes': start_buffer_bytes,
+            'min_buffer_bytes': min_buffer_bytes,
+            'estimated_bitrate': int(estimated_bitrate),
         }
 
     def get_handle(self, info_hash: str) -> lt.torrent_handle | None:
@@ -304,6 +335,68 @@ class TorrentEngine:
         except RuntimeError:
             pass
 
+    def _contiguous_done_bytes(self, handle: lt.torrent_handle, start_piece: int, end_piece: int, size: int) -> int:
+        try:
+            tm = handle.torrent_file()
+            piece_len = tm.piece_length()
+            done_pieces = 0
+            for piece in range(start_piece, end_piece + 1):
+                if not handle.have_piece(piece):
+                    break
+                done_pieces += 1
+            if done_pieces <= 0:
+                return 0
+            return min(done_pieces * piece_len, size)
+        except RuntimeError:
+            return 0
+
+    def _estimate_bitrate(self, handle: lt.torrent_handle, total_size: int, video_path: str | None) -> float:
+        try:
+            info_hash = str(handle.torrent_file().info_hash())
+        except RuntimeError:
+            return 0
+        cached = self._bitrate_cache.get(info_hash)
+        if cached is not None:
+            return cached
+        bitrate = 0.0
+        if video_path and os.path.exists(video_path):
+            try:
+                r = subprocess.run(
+                    ['ffprobe', '-v', 'error',
+                     '-show_entries', 'format=duration',
+                     '-of', 'json',
+                     video_path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    data = json.loads(r.stdout)
+                    duration = float(data.get('format', {}).get('duration', 0))
+                    if duration > 0:
+                        bitrate = total_size / duration
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, OSError):
+                pass
+        if 0 < bitrate < MIN_PLAUSIBLE_BITRATE:
+            bitrate = 0.0
+        if bitrate > 0:
+            self._bitrate_cache[info_hash] = bitrate
+        return bitrate
+
+    @staticmethod
+    def _ready_buffer_bytes(estimated_bitrate: float, total_size: int, start_buffer_bytes: int) -> int:
+        if estimated_bitrate > 0:
+            wanted = int(estimated_bitrate * READY_MIN_BUFFER_SECONDS)
+        else:
+            wanted = max(READY_MIN_BUFFER_BYTES, int(total_size * READY_MIN_PROGRESS))
+        return min(max(wanted, READY_MIN_BUFFER_BYTES, start_buffer_bytes), READY_MAX_BUFFER_BYTES)
+
+    @staticmethod
+    def _ready_speed_ok(download_rate: int, estimated_bitrate: float, progress: float) -> bool:
+        if progress >= 0.15:
+            return True
+        if estimated_bitrate > 0:
+            return download_rate >= estimated_bitrate * READY_SPEED_FACTOR
+        return download_rate >= READY_SPEED_FALLBACK_BYTES
+
     def prioritize_piece_range(self, info_hash: str, start_piece: int, end_piece: int):
         handle = self.handles.get(info_hash)
         if not handle:
@@ -346,14 +439,18 @@ class TorrentEngine:
                 tm = handle.torrent_file()
                 vstart = tm.map_file(vindex, 0, 1).piece
                 vend = tm.map_file(vindex, max(0, vsize - 1), 1).piece
-                for i in range(vstart, min(vstart + HIGH_PRIORITY_COUNT, vend + 1)):
+                startup_pieces = self._startup_buffer_pieces(tm, vsize)
+                startup_end = min(vstart + startup_pieces - 1, vend)
+                for i in range(vstart, startup_end + 1):
                     priorities[i] = PIECE_PRIORITY_HIGH
                 for i in range(max(vstart, vend - HIGH_PRIORITY_COUNT + 1), vend + 1):
                     priorities[i] = PIECE_PRIORITY_HIGH
+                self._set_piece_deadlines(handle, vstart, startup_end)
 
             for i in range(block_start, horizon + 1):
                 priorities[i] = PIECE_PRIORITY_HIGH
             handle.prioritize_pieces(priorities)
+            self._set_piece_deadlines(handle, block_start, horizon)
         except RuntimeError:
             return
 
@@ -544,12 +641,33 @@ class TorrentEngine:
 
         for i in range(start_piece, end_piece + 1):
             priorities[i] = PIECE_PRIORITY_LOW
-        for i in range(start_piece, min(start_piece + HIGH_PRIORITY_COUNT, end_piece + 1)):
+        startup_pieces = self._startup_buffer_pieces(info, file_size)
+        startup_end = min(start_piece + startup_pieces - 1, end_piece)
+        for i in range(start_piece, startup_end + 1):
             priorities[i] = PIECE_PRIORITY_HIGH
         for i in range(max(start_piece, end_piece - HIGH_PRIORITY_COUNT + 1), end_piece + 1):
             priorities[i] = PIECE_PRIORITY_HIGH
 
         handle.prioritize_pieces(priorities)
+        self._set_piece_deadlines(handle, start_piece, startup_end)
+
+    @staticmethod
+    def _startup_buffer_pieces(info: lt.torrent_info, file_size: int) -> int:
+        piece_len = max(info.piece_length(), 1)
+        wanted = min(max(READY_MIN_BUFFER_BYTES, int(file_size * READY_MIN_PROGRESS)), READY_MAX_BUFFER_BYTES)
+        return max(READY_START_PIECES, int((wanted + piece_len - 1) / piece_len))
+
+    @staticmethod
+    def _piece_buffer_bytes(info: lt.torrent_info, piece_count: int, file_size: int) -> int:
+        return min(max(piece_count, 1) * max(info.piece_length(), 1), file_size)
+
+    @staticmethod
+    def _set_piece_deadlines(handle: lt.torrent_handle, start_piece: int, end_piece: int):
+        try:
+            for offset, piece in enumerate(range(start_piece, end_piece + 1)):
+                handle.set_piece_deadline(piece, offset * 150)
+        except RuntimeError:
+            pass
 
     def _register_existing_file(self, info_hash: str, magnet_url: str):
         path = self._find_existing_video_file(magnet_url)
