@@ -537,7 +537,7 @@ def _stop_stream_session(sid: str | None):
         else:
             still_active = True
     if stopped_hash and not still_active:
-        engine.pause(stopped_hash)
+        engine.stop_download(stopped_hash)
 
 
 def _sweep_stream_sessions():
@@ -556,7 +556,7 @@ def _sweep_stream_sessions():
                     pause_hashes.add(str(item['hash']))
             active_hashes = {str(item['hash']) for item in _stream_sessions.values() if item.get('hash')}
         for info_hash in pause_hashes - active_hashes:
-            engine.pause(info_hash)
+            engine.stop_download(info_hash)
 
 
 def _ensure_session_monitor():
@@ -833,18 +833,24 @@ def stop_session():
     hash = data.get('hash') or request.form.get('hash')
     _stop_stream_session(str(sid) if sid else None)
     if hash:
-        engine.pause(str(hash))
-        with _sessions_lock:
-            expired = [sid for sid, item in _stream_sessions.items() if item.get('hash') == str(hash)]
-            for esid in expired:
-                _stream_sessions.pop(esid, None)
+        if not sid:
+            with _sessions_lock:
+                expired = [sid for sid, item in _stream_sessions.items() if item.get('hash') == str(hash)]
+                for esid in expired:
+                    _stream_sessions.pop(esid, None)
+                still_active = any(item.get('hash') == str(hash) for item in _stream_sessions.values())
+        else:
+            with _sessions_lock:
+                still_active = any(item.get('hash') == str(hash) for item in _stream_sessions.values())
+        if not still_active:
+            engine.stop_download(str(hash))
     if not sid and not hash:
         with _sessions_lock:
-            for sid, item in list(_stream_sessions.items()):
-                h = str(item.get('hash') or '')
-                if h:
-                    engine.pause(h)
+            hashes = [str(item.get('hash') or '') for item in _stream_sessions.values()]
             _stream_sessions.clear()
+        for h in hashes:
+            if h:
+                engine.stop_download(h)
     return jsonify(ok=True)
 
 

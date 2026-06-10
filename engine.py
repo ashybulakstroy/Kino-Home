@@ -508,6 +508,15 @@ class TorrentEngine:
         except RuntimeError:
             return
 
+    def stop_download(self, info_hash: str):
+        handle = self.handles.pop(info_hash, None)
+        if not handle:
+            return
+        try:
+            self.ses.remove_torrent(handle)
+        except RuntimeError:
+            return
+
     def remove(self, info_hash: str):
         handle = self.handles.pop(info_hash, None)
         if handle:
