@@ -45,6 +45,9 @@ _sessions_lock = threading.Lock()
 _stream_sessions: dict[str, dict[str, float | str]] = {}
 _session_monitor_started = False
 
+_transcode_lock = threading.Lock()
+_transcode_progress: dict[str, float] = {}  # info_hash -> progress 0..1
+
 _rate_limit_store: dict[str, float] = {}
 RATE_LIMIT_SECONDS = 1.0
 
@@ -497,12 +500,95 @@ def _catalog_allows_hash(info_hash: str) -> bool:
     return bool(info_hash and info_hash.lower() in _catalog_info_hashes())
 
 
+def _best_external_stream_replacement(payload: dict) -> dict | None:
+    from tools import find_streamable_rutracker as finder
+
+    raw_title = str(payload.get('raw_title') or payload.get('topic_title') or payload.get('title') or '').strip()
+    title = str(payload.get('title') or '').strip()
+    year = str(payload.get('year') or '').strip()
+    try:
+        wanted_size = int(payload.get('size_bytes') or 0)
+    except (TypeError, ValueError):
+        wanted_size = 0
+    if not raw_title and not title:
+        return None
+
+    wanted_title, orig_title, wanted_year = finder.parse_input_title(raw_title or title, year)
+    search_title = orig_title or wanted_title or title
+    if not search_title:
+        return None
+
+    session = finder.requests.Session()
+    session.headers.update(finder.HEADERS)
+    catalog_by_topic = {}
+    try:
+        catalog = json.loads((DATA_DIR / 'torrents_data.json').read_text('utf-8'))
+        catalog_by_topic = {str(t.get('topic_id') or ''): t for t in catalog if isinstance(t, dict)}
+    except (OSError, json.JSONDecodeError):
+        catalog_by_topic = {}
+
+    def _score_hits(hits):
+        scored = []
+        for hit in hits[:12]:
+            finder.enrich_hit(hit, fetch_topic=True)
+            if not hit.magnet or (hit.format or '').lower() not in finder.STREAMABLE_FORMATS:
+                continue
+            topic_size = int((catalog_by_topic.get(hit.topic_id) or {}).get('size_bytes') or 0)
+            size_delta = 1.0
+            if wanted_size and topic_size:
+                ratio = topic_size / max(wanted_size, 1)
+                if ratio < 0.4 or ratio > 2.2:
+                    continue
+                size_delta = abs(topic_size - wanted_size) / max(wanted_size, topic_size, 1)
+            scored_hit = finder.score_hit(hit, wanted_title, wanted_year)
+            if wanted_size and topic_size:
+                scored_hit.score += max(0, int(20 * (1 - size_delta)))
+                if 0.75 <= topic_size / max(wanted_size, 1) <= 1.35:
+                    scored_hit.reasons = (scored_hit.reasons or []) + ['size close']
+            scored.append((scored_hit, size_delta))
+        scored.sort(key=lambda item: (item[0].score, -item[1], item[0].seeders), reverse=True)
+        return scored
+
+    local_hits = finder.local_candidates(wanted_title, wanted_year, include_non_streamable=True)
+    scored = _score_hits(local_hits)
+    if not scored or scored[0][0].score < 95:
+        seen = {hit.topic_id for hit in local_hits}
+        web_hits = []
+        for hit in finder.search_web(session, finder.make_queries(search_title, wanted_year), per_query=3):
+            if hit.topic_id not in seen:
+                web_hits.append(hit)
+                seen.add(hit.topic_id)
+        scored = _score_hits(local_hits + web_hits)
+
+    if not scored or scored[0][0].score < 75:
+        return None
+
+    best, _size_delta = scored[0]
+    html = gp.get_topic_html(best.topic_id, best.url, timeout=15)
+    data = gp.parse_topic_for_magnet(html) if html else {}
+    magnet = data.get('magnet') or ''
+    fmt = (data.get('format') or best.format or '').lower()
+    if not magnet or fmt not in finder.STREAMABLE_FORMATS:
+        return None
+
+    return {
+        'topic_id': best.topic_id,
+        'topic_url': best.url,
+        'title': best.topic_title or best.search_title,
+        'magnet': magnet,
+        'format': fmt.upper(),
+        'size_bytes': int((catalog_by_topic.get(best.topic_id) or {}).get('size_bytes') or 0),
+        'score': best.score,
+        'source': best.source,
+    }
+
+
 def _reject_public_admin():
     if PUBLIC_MODE:
         abort(403, description='Disabled in public mode')
 
 
-def _mark_stream_session(info_hash: str) -> str:
+def _mark_stream_session(info_hash: str, transcode_pid: int | None = None) -> str:
     with _sessions_lock:
         if len(_stream_sessions) >= MAX_STREAM_SESSIONS:
             if info_hash not in {s['hash'] for s in _stream_sessions.values()}:
@@ -513,6 +599,8 @@ def _mark_stream_session(info_hash: str) -> str:
     now = time.monotonic()
     with _sessions_lock:
         _stream_sessions[sid] = {'hash': info_hash, 'last_seen': now}
+        if transcode_pid is not None:
+            _stream_sessions[sid]['transcode_pid'] = transcode_pid
     engine.resume(info_hash)
     return sid
 
@@ -540,6 +628,13 @@ def _stop_stream_session(sid: str | None):
         engine.stop_download(stopped_hash)
 
 
+def _kill_process(pid: int):
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+
+
 def _sweep_stream_sessions():
     while True:
         time.sleep(SESSION_SWEEP_INTERVAL)
@@ -552,8 +647,12 @@ def _sweep_stream_sessions():
             ]
             for sid in expired:
                 item = _stream_sessions.pop(sid, None)
-                if item and item.get('hash'):
-                    pause_hashes.add(str(item['hash']))
+                if item:
+                    pid = item.get('transcode_pid')
+                    if pid:
+                        _kill_process(pid)
+                    if item.get('hash'):
+                        pause_hashes.add(str(item['hash']))
             active_hashes = {str(item['hash']) for item in _stream_sessions.values() if item.get('hash')}
         for info_hash in pause_hashes - active_hashes:
             engine.stop_download(info_hash)
@@ -611,12 +710,51 @@ def watch_sync():
     magnet = data['magnet']
     if PUBLIC_MODE and not _catalog_allows_magnet(magnet):
         return jsonify(error='magnet not allowed'), 403
+    if data.get('async_only'):
+        try:
+            info_hash = engine.add_magnet_async(magnet)
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        return jsonify(info_hash=info_hash, async_mode=True)
     try:
         info_hash = engine.add_magnet(magnet, timeout=7)
     except TimeoutError:
         info_hash = engine.add_magnet_async(magnet)
         return jsonify(info_hash=info_hash, async_mode=True)
     return jsonify(info_hash=info_hash, async_mode=False)
+
+
+@app.route('/stream_replacement', methods=['POST'])
+def stream_replacement():
+    _reject_public_admin()
+    data = request.get_json(silent=True) or {}
+    container = str(data.get('container') or '').lower()
+    if container != 'avi':
+        return jsonify(found=False)
+    topic_id = str(data.get('topic_id') or '')
+    if topic_id:
+        try:
+            cat = json.loads((DATA_DIR / 'torrents_data.json').read_text('utf-8'))
+            for t in cat:
+                if isinstance(t, dict) and str(t.get('topic_id') or '') == topic_id:
+                    m = t.get('magnet') or ''
+                    match = re.search(r'btih:([A-Fa-f0-9]{40})', m)
+                    if match:
+                        s = engine.get_status(match.group(1).lower())
+                        if s and s.get('progress', 0) >= 1.0:
+                            return jsonify(found=False)
+                    break
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    try:
+        replacement = _best_external_stream_replacement(data)
+    except Exception as exc:
+        print(f'Ошибка поиска stream replacement: {exc}')
+        return jsonify(found=False, error='search_failed')
+    if not replacement:
+        return jsonify(found=False)
+    return jsonify(found=True, replacement=replacement)
 
 
 @app.route('/status/<info_hash>')
@@ -778,52 +916,270 @@ def _wait_for_pieces(handle, start_piece, end_piece, timeout=120, interval=0.5, 
     raise TimeoutError(f'Pieces {start_piece}-{end_piece} not available after {timeout}s')
 
 
+def _is_valid_mp4(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', path],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode != 0:
+            return False
+        info = json.loads(r.stdout)
+        streams = info.get('streams', [])
+        has_v = any(s.get('codec_type') == 'video' for s in streams)
+        has_a = any(s.get('codec_type') == 'audio' for s in streams)
+        dur = float(info.get('format', {}).get('duration', 0) or 0)
+        return has_v and has_a and dur > 0
+    except Exception:
+        return False
+
+
+def _serve_range(filepath, content_type, sid):
+    file_size = os.path.getsize(filepath)
+    range_h = request.headers.get('Range')
+    start, end = 0, file_size - 1
+    if range_h:
+        m = re.match(r'bytes=(\d*)-(\d*)', range_h)
+        if not m:
+            abort(416)
+        s_str = m.group(1)
+        e_str = m.group(2)
+        if not s_str and e_str:
+            suffix = int(e_str)
+            if suffix <= 0:
+                abort(416)
+            start = max(file_size - suffix, 0)
+            end = file_size - 1
+        else:
+            start = int(s_str) if s_str else 0
+            if start >= file_size:
+                abort(416)
+            end = min(int(e_str), file_size - 1) if e_str else min(start + INITIAL_CHUNK - 1, file_size - 1)
+        if start > end:
+            abort(416)
+    else:
+        end = min(start + INITIAL_CHUNK - 1, file_size - 1)
+    if end - start + 1 > MAX_RANGE_CHUNK:
+        end = min(start + MAX_RANGE_CHUNK - 1, file_size - 1)
+    cl = end - start + 1
+
+    def gen():
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            rem = cl
+            while rem > 0:
+                _touch_stream_session(sid)
+                chunk = f.read(min(STREAM_READ_CHUNK, rem))
+                if not chunk:
+                    break
+                yield chunk
+                rem -= len(chunk)
+
+    resp = Response(gen(), status=206 if range_h else 200, content_type=content_type, direct_passthrough=True)
+    resp.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+    resp.headers['Content-Length'] = str(cl)
+    resp.headers['Accept-Ranges'] = 'bytes'
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+def _read_ffmpeg_error(stderr_path, stderr_file=None):
+    try:
+        if stderr_file and not stderr_file.closed:
+            stderr_file.flush()
+        with open(stderr_path, 'rb') as f:
+            data = f.read()
+        return data.decode('utf-8', errors='replace').strip()
+    except Exception:
+        return 'ffmpeg error'
+
+
 @app.route('/transcode/<info_hash>')
 def transcode(info_hash):
     if PUBLIC_MODE and not _catalog_allows_hash(info_hash):
         abort(403, description='Not allowed')
-    sid = _mark_stream_session(info_hash)
     filepath = engine.get_file_path(info_hash)
     if not filepath:
         filepath = engine.wait_for_local_file(info_hash, timeout=10)
     if not filepath or not os.path.exists(filepath):
         abort(404, description='File not found')
 
+    base, _ = os.path.splitext(filepath)
+    out_path = base + '.mp4'
+    tmp_path = base + '.tmp.mp4'
+
+    if _is_valid_mp4(out_path):
+        sid = _mark_stream_session(info_hash)
+        return _serve_range(out_path, 'video/mp4', sid)
+
+    if os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    vcodec_opts = None
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', filepath],
+            capture_output=True, text=True, timeout=10
+        )
+        info = json.loads(probe.stdout)
+        for s in info.get('streams', []):
+            if s.get('codec_type') == 'video':
+                if s.get('codec_name') in ('h264', 'hevc', 'h265'):
+                    vcodec_opts = ['-c:v', 'copy']
+                break
+    except Exception:
+        pass
+    if vcodec_opts is None:
+        vcodec_opts = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
     cmd = [
-        'ffmpeg',
-        '-hide_banner',
-        '-loglevel', 'error',
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-nostats',
+        '-flush_packets', '1',
         '-i', filepath,
-        '-map', '0:v:0',
-        '-map', '0:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-b:a', '192k',
+        '-map', '0:v:0', '-map', '0:a:0',
+        *vcodec_opts,
+        '-g', '24',
+        '-c:a', 'aac', '-b:a', '192k',
         '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        'pipe:1',
+        '-movflags', 'frag_keyframe+default_base_moof',
+        tmp_path,
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    orig_size = os.path.getsize(filepath)
+    _transcode_progress[info_hash] = 0.0
+
+    stderr_path = tmp_path + '.fferr'
+    try:
+        stderr_file = open(stderr_path, 'wb')
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_file)
+    except FileNotFoundError:
+        _transcode_progress[info_hash] = -1.0
+        abort(500, description='ffmpeg не найден. Установите ffmpeg.')
+    try:
+        sid = _mark_stream_session(info_hash, transcode_pid=proc.pid)
+    except RuntimeError as e:
+        stderr_file.close()
+        proc.terminate()
+        _transcode_progress[info_hash] = -1.0
+        abort(503, description=str(e))
+
+    deadline = time.monotonic() + 30
+    while (not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 8192):
+        if proc.poll() is not None and proc.returncode != 0:
+            _transcode_progress[info_hash] = -1.0
+            err_msg = _read_ffmpeg_error(stderr_path, stderr_file)
+            abort(500, description=err_msg[:500])
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.1)
 
     def generate():
+        last = 0
+        done = False
+        buf = bytearray()
+        first_yield = True
         try:
-            while True:
+            while not done:
                 _touch_stream_session(sid)
-                chunk = proc.stdout.read(STREAM_READ_CHUNK)
-                if not chunk:
+                try:
+                    cur = os.path.getsize(tmp_path)
+                except OSError:
                     break
-                yield chunk
+                if cur > last:
+                    with open(tmp_path, 'rb') as f:
+                        f.seek(last)
+                        chunk = f.read(cur - last)
+                    last = cur
+                    if first_yield:
+                        buf.extend(chunk)
+                        if len(buf) >= 8388608:  # 8MB initial buffer
+                            yield bytes(buf)
+                            buf.clear()
+                            first_yield = False
+                    else:
+                        if buf:
+                            buf.extend(chunk)
+                            yield bytes(buf)
+                            buf.clear()
+                        else:
+                            yield chunk
+                with _transcode_lock:
+                    _transcode_progress[info_hash] = min(last / orig_size, 0.99) if orig_size else 0.0
+                if proc.poll() is not None:
+                    done = True
+                    try:
+                        cur = os.path.getsize(tmp_path)
+                        if cur > last:
+                            with open(tmp_path, 'rb') as f:
+                                f.seek(last)
+                                extra = f.read()
+                                if extra:
+                                    yield extra
+                    except OSError:
+                        pass
+                    if proc.returncode == 0:
+                        with _transcode_lock:
+                            _transcode_progress[info_hash] = 1.0
+                        try:
+                            os.replace(tmp_path, out_path)
+                        except OSError:
+                            pass
+                    elif os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                else:
+                    if cur == last:
+                        time.sleep(0.1)
         finally:
+            if buf:
+                yield bytes(buf)
             if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+            with _transcode_lock:
+                if proc.returncode != 0:
+                    _transcode_progress[info_hash] = -1.0
+                elif proc.returncode == 0:
+                    _transcode_progress.pop(info_hash, None)
+                else:
+                    _transcode_progress.pop(info_hash, None)
+            with _sessions_lock:
+                s = _stream_sessions.get(sid)
+                if s:
+                    s.pop('transcode_pid', None)
+            try:
+                if not stderr_file.closed:
+                    stderr_file.close()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(stderr_path):
+                    os.remove(stderr_path)
+            except OSError:
+                pass
 
     resp = Response(generate(), content_type='video/mp4', direct_passthrough=True)
     resp.headers['Cache-Control'] = 'no-cache'
     return resp
+
+
+@app.route('/transcode_progress/<info_hash>')
+def transcode_progress(info_hash):
+    with _transcode_lock:
+        p = _transcode_progress.get(info_hash)
+    if p is None:
+        return jsonify(progress=1.0, error=False)
+    if p < 0:
+        return jsonify(progress=0.0, error=True)
+    return jsonify(progress=round(p, 4), error=False)
 
 
 @app.route('/stop_session', methods=['POST'])
@@ -1070,6 +1426,7 @@ h1{font-size:24px;font-weight:700;padding:20px 30px 10px}
 h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
 .back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}
 .back:hover{background:#e50914;border-color:#e50914}
+.avi-badge{position:absolute;bottom:4px;right:4px;width:clamp(14px,10%,28px);aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#000;color:#fff;border:2px solid #fff;border-radius:4px;font-size:clamp(8px,.7vw,14px);pointer-events:none;z-index:5;line-height:1}
 '''
 
 
@@ -1149,8 +1506,9 @@ def browse_carousel():
             poster_style = _poster_style(m.get('poster_url', ''))
             yr = m.get('movie_year', '')
             rt = m.get('kp_rating') or m.get('imdb_rating') or ''
+            avi_badge = '<span class="avi-badge">⏳</span>' if m.get('format','').upper() == 'AVI' else ''
             cards += f'''<div class="cc">
-<div class="cp" style="{poster_style}"></div>
+<div class="cp" style="{poster_style}">{avi_badge}</div>
 <div class="ci"><strong>{m.get('orig_title') or m.get('movie_title','')}</strong>{" "+yr if yr else ""}{" · "+rt if rt else ""}</div>
 </div>'''
         rows_html += f'<h2>{genre} ({len(items)})</h2><div class="cr">{cards}</div>'
@@ -1163,7 +1521,7 @@ def browse_carousel():
 .cr::-webkit-scrollbar-thumb{{background:#555;border-radius:3px}}
 .cc{{flex:0 0 auto;width:180px;cursor:pointer;transition:transform .2s}}
 .cc:hover{{transform:scale(1.05)}}
-.cp{{width:180px;height:270px;background-size:cover;background-position:center;border-radius:6px}}
+.cp{{width:180px;height:270px;background-size:cover;background-position:center;border-radius:6px;position:relative}}
 .ci{{font-size:12px;color:#ccc;padding:6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 </style></head><body>
 <a href="/test" class="back">← Тест</a>
@@ -1209,7 +1567,9 @@ function show(i){{
 const m=MOVIES[i];if(!m)return;
 const p=posterUrl(m);
 document.getElementById('bg').style.backgroundImage='url('+p+')';
-document.getElementById('poster').style.backgroundImage='url('+p+')';
+const pe=document.getElementById('poster');pe.style.backgroundImage='url('+p+')';
+let b=pe.querySelector('.avi-badge');
+if((m.format||'').toUpperCase()==='AVI'){{if(!b){{b=document.createElement('span');b.className='avi-badge';b.textContent='⏳';pe.appendChild(b)}}}}else if(b){{b.remove()}}
 document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
 document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
 document.getElementById('cast').textContent=m.cast||'';
@@ -1257,7 +1617,7 @@ body{{display:flex;padding:0}}
 #results{{flex:1;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;align-content:start}}
 .fr{{width:160px;cursor:pointer;transition:transform .2s}}
 .fr:hover{{transform:scale(1.05)}}
-.fr .fp{{width:160px;height:240px;background-size:cover;background-position:center;border-radius:6px}}
+.fr .fp{{width:160px;height:240px;background-size:cover;background-position:center;border-radius:6px;position:relative}}
 .fr .fi{{font-size:12px;color:#ccc;padding:4px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 #count{{position:fixed;bottom:10px;right:20px;background:rgba(0,0,0,.7);padding:6px 14px;border-radius:4px;font-size:13px;z-index:100}}
 </style></head><body>
@@ -1293,8 +1653,9 @@ document.getElementById('count').textContent=out.length+' фильмов';
 document.getElementById('results').innerHTML=out.map(m=>{{
 const p=posterUrl(m)?'background-image:url('+posterUrl(m)+')':'background:#333';
 const hash=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase();
-const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
-return '<div class=fr data-href="/player.html#'+(hash||'')+'"><div class=fp style="'+p+'"></div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
+                const aviBadge=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';
+                const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
+                return '<div class=fr data-href="/player.html#'+(hash||'')+'"><div class=fp style="'+p+'">'+aviBadge+'</div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
 }}).join('');
 }}
 document.querySelectorAll('.fg').forEach(c=>c.addEventListener('change',filter));
@@ -1332,8 +1693,9 @@ def browse_timeline():
             player_url = f'/player.html#{match.group(1).lower()}' if match else '#'
             title = m.get('orig_title') or m.get('movie_title', '')
             from html import escape as h_esc
+            avi_badge = '<span class="avi-badge">⏳</span>' if m.get('format','').upper() == 'AVI' else ''
             cards += f'''<div class="tc" onclick="location=\'{h_esc(player_url)}\'">
-<div class="tp" style="{poster_style}"></div>
+<div class="tp" style="{poster_style}">{avi_badge}</div>
 <div class="ti"><strong>{h_esc(title)}</strong> <span class="tr">{rt}</span></div>
 </div>'''
         rows_html += f'''<div class="ty" onclick="this.classList.toggle(\'open\')">
@@ -1356,7 +1718,7 @@ body{{padding:20px 30px}}
 .ty.open .yg{{display:grid}}
 .tc{{cursor:pointer;transition:transform .2s}}
 .tc:hover{{transform:scale(1.05)}}
-.tp{{width:140px;height:210px;background-size:cover;background-position:center;border-radius:5px}}
+.tp{{width:140px;height:210px;background-size:cover;background-position:center;border-radius:5px;position:relative}}
 .ti{{font-size:11px;color:#ccc;padding:4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .tr{{color:#888}}
 </style></head><body>
@@ -1397,7 +1759,7 @@ body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui
 .side-strip::after{{bottom:-20px}}
 #strip-left{{right:calc(50% + 170px)}}
 #strip-right{{left:calc(50% + 170px)}}
-.side-strip .fr{{flex:none;width:100px;height:150px;background-size:cover;background-position:center;border-radius:4px;border:2px solid #333;box-sizing:border-box;background-color:#222;opacity:.64;transition:opacity .3s}}
+.side-strip .fr{{flex:none;width:100px;height:150px;background-size:cover;background-position:center;border-radius:4px;border:2px solid #333;box-sizing:border-box;background-color:#222;opacity:.64;transition:opacity .3s;position:relative}}
 .film-slot{{position:absolute;top:20px;width:100px;height:150px;z-index:4;box-sizing:border-box;border:2px solid #333;border-radius:4px;background:rgba(0,0,0,.24);visibility:hidden;opacity:0;transition:opacity .12s linear}}
 .film-slot.show{{visibility:visible;opacity:1}}
 .film-slot::before,.film-slot::after{{content:"";position:absolute;left:-2px;right:-2px;height:20px;background-color:#050505;background-image:repeating-linear-gradient(90deg,transparent 0 20px,rgba(230,230,210,.72) 20px 34px,transparent 34px 54px);box-shadow:0 0 10px rgba(0,0,0,.8)}}
@@ -1451,16 +1813,16 @@ if(direction==='backward'&&o===-1){{
 leftHtml.push('<div class="fr blank"></div>');
 continue;
 }}
-const fi=(center+o+total)%total;
-leftHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+                const fi=(center+o+total)%total;
+                leftHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+((MOVIES[fi].format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'</div>');
 }}
 for(let o=1;o<=HALF;o++){{
 if(direction==='forward'&&o===1){{
 rightHtml.push('<div class="fr blank"></div>');
 continue;
 }}
-const fi=(center+o+total)%total;
-rightHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')"></div>');
+                const fi=(center+o+total)%total;
+                rightHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+((MOVIES[fi].format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'</div>');
 }}
 left.innerHTML=leftHtml.join('');
 right.innerHTML=rightHtml.join('');
@@ -1559,7 +1921,7 @@ h1{{font-size:22px;margin-bottom:20px;color:#888}}
 #arena{{display:flex;gap:40px;align-items:center}}
 .fighter{{width:240px;cursor:pointer;transition:transform .3s,box-shadow .3s;border-radius:12px;overflow:hidden;text-align:center}}
 .fighter:hover{{transform:scale(1.05);box-shadow:0 0 40px rgba(229,9,20,.4)}}
-.fighter .poster{{width:240px;height:360px;background-size:cover;background-position:center;border-radius:10px;background-color:#222}}
+.fighter .poster{{width:240px;height:360px;background-size:cover;background-position:center;border-radius:10px;background-color:#222;position:relative}}
 .fighter .title{{font-size:14px;margin-top:8px;padding:0 4px}}
 .fighter .meta{{font-size:12px;color:#888;margin-top:2px}}
 .vs{{font-size:48px;color:#e50914;font-weight:900;text-shadow:0 0 20px rgba(229,9,20,.5)}}
@@ -1583,6 +1945,8 @@ function show(){{
 const a=pick(0),b=pick(1+Math.floor(Math.random()*(MOVIES.length-2)));
 const set=(el,poster,title,meta)=>{{
 el.style.backgroundImage='url('+pu(poster)+')';
+let b=el.querySelector('.avi-badge');
+if((poster.format||'').toUpperCase()==='AVI'){{if(!b){{b=document.createElement('span');b.className='avi-badge';b.textContent='⏳';el.appendChild(b)}}}}else if(b){{b.remove()}}
 document.getElementById('t'+el.id[1]).textContent=poster.orig_title||poster.movie_title||'';
 document.getElementById('m'+el.id[1]).textContent=[poster.movie_year,poster.kp_rating?'KP '+poster.kp_rating:'',poster.imdb_rating?'IMDB '+poster.imdb_rating:''].filter(Boolean).join(' · ');
 }};
@@ -1628,7 +1992,7 @@ const a=[...MOVIES];
 for(let i=a.length-1;i>0;i--){{const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
 a.length=8;
 const g=document.getElementById('grid');
-    g.innerHTML=a.map(m=>'<div class="cell" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')"><div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
+    g.innerHTML=a.map(m=>'<div class="cell" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')">'+((m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'<div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
     g.onclick=function(e){{var c=e.target.closest(\'.cell\');if(c&&c.dataset.hash){{window.open(\'/player.html#\'+c.dataset.hash,\'_blank\');}}}}
 }}
 sc();
@@ -1764,7 +2128,7 @@ function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
 function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-function card(m){{const h=hash(m);return '<div class="card" data-hash="'+h+'" style="background-image:url('+pu(m)+')"><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+function card(m){{const h=hash(m);const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+h+'" style="background-image:url('+pu(m)+')">'+ab+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 function render(q){{
 const ql=q.toLowerCase().trim();
 const filtered=ql?MOVIES.filter(m=>(m.movie_title||'').toLowerCase().includes(ql)||(m.orig_title||'').toLowerCase().includes(ql)):MOVIES;
@@ -1817,7 +2181,7 @@ function rt(m){{return Math.max(parseFloat(m.kp_rating)||0,parseFloat(m.imdb_rat
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
 function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>'<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')"><span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>').join('');
+document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+ab+'<span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}).join('');
 document.getElementById('grid').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 </script></body></html>'''
 
@@ -1867,7 +2231,7 @@ function label(k){{return LABELS[k]||k}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
 function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-function card(m){{return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')"><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+function card(m){{const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+ab+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2><span class="arrow'+(gi===0?' open':'')+'">&#9660;</span>'+esc(label(key))+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(card).join('')+'</div></div>').join('');
 document.getElementById('root').addEventListener('click',e=>{{const h=e.target.closest('h2');if(h){{const g=h.nextElementSibling;g.style.display=g.style.display==='none'?'':'none';h.querySelector('.arrow').classList.toggle('open');return}}const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 </script></body></html>'''

@@ -1180,9 +1180,10 @@ def parse_topic_for_magnet(html):
     known = {'avi', 'mkv', 'matroska', 'mp4', 'mpeg-4', 'mpeg', 'webm'}
     known_map = {'AVI': 'AVI', 'Matroska': 'MKV', 'MKV': 'MKV', 'MP4': 'MP4', 'MPEG-4': 'MP4', 'WEBM': 'WEBM'}
     text = re.sub(r'<[^>]+>', '', html)
-    m = re.search(r'Формат(?:\s+видео)?\s*:\s*(\S+)', text)
+    fmt_token = r'(AVI|MKV|Matroska|MP4|MPEG-4|MPEG|WEBM)'
+    m = re.search(r'Формат(?:\s+видео)?\s*[:：]\s*' + fmt_token, text, re.I)
     if not m:
-        m = re.search(r'Format(?:\s+video)?\s*:\s*(\S+)', text)
+        m = re.search(r'Format(?:\s+video)?\s*[:：]\s*' + fmt_token, text, re.I)
     if m:
         candidate = m.group(1).strip().rstrip(':').rstrip(',')
         if candidate.lower() in known:
@@ -1192,7 +1193,7 @@ def parse_topic_for_magnet(html):
         part = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
         part = re.sub(r'<[^>]+>', '', part)
         for line in part.split('\n'):
-            ck = re.search(r'(?:Формат|Format)(?:\s+(?:видео|video))?\s*:\s*(\S+)', line)
+            ck = re.search(r'(?:Формат|Format)(?:\s+(?:видео|video))?\s*[:：]\s*' + fmt_token, line, re.I)
             if ck:
                 cand = ck.group(1).rstrip(':').rstrip(',')
                 if cand.lower() in known:
@@ -1516,6 +1517,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
             rating_url = '#'
         votes = t['kp_votes'] or t['imdb_votes'] or ''
         votes_str = f" ({votes})" if votes else ''
+        votes_html = f'<span class="rv">{escape(votes_str)}</span>' if votes_str else ''
         votes_title = f' title="{votes} голосов"' if votes else ''
         trailer_q = urllib.parse.quote(f"{t['movie_title']} {t['movie_year']} official trailer")
         trailer_url = t.get('youtube_url') or f"https://www.youtube.com/results?search_query={trailer_q}"
@@ -1556,7 +1558,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         missing = real_poster_missing or not t.get('kp_rating') or not t.get('youtube_url')
         enrich_btn = f'<button class="eb" data-tid="{escape(t["topic_id"])}" onclick="enrich(this)">◈</button>' if missing else ''
 
-        watch_attrs = f'data-magnet="{escape(magnet)}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-topic-title="{topic_title}" data-collection="{collection}"'
+        watch_attrs = f'data-magnet="{escape(magnet)}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-size-bytes="{int(t.get("size_bytes") or 0)}" data-seeders="{seeders}" data-topic-title="{topic_title}" data-collection="{collection}"'
 
         rated_attr = '1' if t.get('kp_rating') or t.get('imdb_rating') else '0'
 
@@ -1566,11 +1568,11 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 <span class="tg" onclick="td(this)">+</span>
 <span class="un">{escape(t['author'])}</span>
 <a href="{trailer_url}" onclick="window.open(this.href,'tr','width=960,height=540,menubar=no,toolbar=no,location=no');return false" class="{trailer_cls}">▶ Трейлер</a>
-<a href="{rating_url}" target="_blank"{votes_title}><span class="rb {rating_cls}">{rating_label} {escape(str(rating))}{escape(votes_str)}</span></a>
+<a href="{rating_url}" target="_blank"{votes_title}><span class="rb {rating_cls}">{rating_label} {escape(str(rating))}{votes_html}</span></a>
 {enrich_btn}
 <span class="rmv" onclick="hm(this)">✕</span>
 </div>
-<div class="dtc" style="display:none"><div class="dc">{poster_html}<div class="dx">{genre_html}{fmt_row}<div class="rbi"><span class="rb {rating_cls}">{rating_label} {escape(str(rating))}{escape(votes_str)}</span></div>{cast_html}</div></div></div>
+<div class="dtc" style="display:none"><div class="dc">{poster_html}<div class="dx">{genre_html}{fmt_row}<div class="rbi"><span class="rb {rating_cls}">{rating_label} {escape(str(rating))}{votes_html}</span></div>{cast_html}</div></div></div>
 </td>
 <td>{esize}</td>
 <td>{escape(t['date_str'])}</td>
@@ -1651,6 +1653,7 @@ td{{padding:12px 16px;font-size:14px;vertical-align:middle}}
 .rh{{background:#f5c518;color:#000}}
 .rm{{background:#b0881a;color:#fff}}
 .rl{{background:#e0e0e0;color:#666}}
+.rv{{color:#b8b8b8;font-weight:400}}
 .un{{font-size:12px;color:#888}}
 .rmv{{display:inline-block;width:18px;height:18px;line-height:16px;text-align:center;font-size:11px;font-weight:700;color:#fff;background:#da3633;border-radius:3px;cursor:pointer;user-select:none;flex-shrink:0;margin-left:6px}}
 .rmv:hover{{background:#b62324}}
@@ -1766,10 +1769,12 @@ function bgf(){{var gs={{}};[].forEach.call(document.querySelectorAll('#tbl tbod
 var playerPoll=null;
 var currentHash='';
 var currentSession='';
+var currentWatchStartedAt=0;
 function fmtBytes(b){{if(!b)return'0 B';var u=['B','KB','MB','GB','TB'],i=0,v=b;while(v>=1024&&i<u.length-1){{v/=1024;i++}}return v.toFixed(1)+' '+u[i]}}
 function hashFromMagnet(m){{var x=(m||'').match(/btih:([A-Fa-f0-9]{{40}})/i);return x?x[1].toLowerCase():''}}
 function isStreamContainer(c){{c=(c||'').toLowerCase();return c==='mkv'||c==='mp4'}}
 function findStreamReplacement(el){{var src={{magnet:el.getAttribute('data-magnet')||'',title:el.getAttribute('data-title')||'',year:el.getAttribute('data-year')||'',container:(el.getAttribute('data-container')||'').toLowerCase(),collection:el.getAttribute('data-collection')||'',hash:hashFromMagnet(el.getAttribute('data-magnet')||'')}};if(src.container!=='avi'||!src.title)return null;var best=null,bestScore=-1;[].forEach.call(document.querySelectorAll('button.wb[data-magnet]'),function(b){{var m=b.getAttribute('data-magnet')||'',h=hashFromMagnet(m),c=(b.getAttribute('data-container')||'').toLowerCase(),title=b.getAttribute('data-title')||'',year=b.getAttribute('data-year')||'';if(!m||!h||h===src.hash||!isStreamContainer(c)||title!==src.title)return;if(src.year&&year!==src.year)return;var score=parseInt(b.getAttribute('data-seeders')||'0',10)||0;if(c==='mp4')score+=5;if(b.getAttribute('data-collection')===src.collection)score+=3;if(score>bestScore){{bestScore=score;best=b}}}});if(!best)return null;return {{magnet:best.getAttribute('data-magnet')||'',container:(best.getAttribute('data-container')||'').toUpperCase(),title:best.getAttribute('data-topic-title')||best.getAttribute('data-title')||'',seeders:parseInt(best.getAttribute('data-seeders')||'0',10)||0}}}}
+async function findExternalStreamReplacement(el){{var payload={{title:el.getAttribute('data-title')||'',raw_title:el.getAttribute('data-topic-title')||'',year:el.getAttribute('data-year')||'',container:(el.getAttribute('data-container')||'').toLowerCase(),size_bytes:parseInt(el.getAttribute('data-size-bytes')||'0',10)||0,topic_id:(el.closest('[data-tid]')||{{}}).getAttribute?el.closest('[data-tid]').getAttribute('data-tid'):''}};try{{var ctl=window.AbortController?new AbortController():null,timer=ctl?setTimeout(function(){{ctl.abort()}},22000):null;var r=await fetch('/stream_replacement',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),signal:ctl?ctl.signal:undefined}});if(timer)clearTimeout(timer);if(!r.ok)return null;var d=await r.json().catch(function(){{return {{}}}});return d.found&&d.replacement&&d.replacement.magnet?d.replacement:null}}catch(_e){{return null}}}}
 function newSession(h){{return h+'-'+Date.now()+'-'+Math.random().toString(36).slice(2)}}
 function streamUrl(kind,h){{var sid=encodeURIComponent(currentSession||'');return '/'+kind+'/'+h+(sid?'?sid='+sid:'')}}
 function stopCurrentSession(){{if(!currentSession&&!currentHash)return;var sid=currentSession,h=currentHash;currentSession='';currentHash='';var payload=JSON.stringify({{sid:sid,hash:h}});try{{if(navigator.sendBeacon){{var blob=new Blob([payload],{{type:'application/json'}});navigator.sendBeacon('/stop_session',blob);return}}}}catch(_e){{}}fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:payload,keepalive:true}}).catch(function(){{}})}}
@@ -1777,9 +1782,12 @@ function unmutePlayer(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}var
 function playPlayer(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}var p=document.getElementById('inline-player'),s=document.getElementById('player-status');p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(err){{s.textContent='Не удалось запустить: '+(err&&err.name?err.name:'ошибка')}})}}
 function useAacAudio(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}if(!currentHash)return;var p=document.getElementById('inline-player'),s=document.getElementById('player-status'),b=document.getElementById('aac-button');if(p.dataset.mode==='aac')return;p.dataset.mode='aac';p.pause();p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.src=streamUrl('transcode',currentHash);if(b)b.textContent='AAC включён';s.textContent='Запускаю совместимый AAC-звук...';p.play().catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска AAC-звука'}})}}
 function closePlayer(){{if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}var p=document.getElementById('inline-player');p.pause();p.removeAttribute('src');p.load();stopCurrentSession();document.getElementById('player-overlay').classList.add('hidden')}}
-function startStream(p, h) {{p.dataset.mode='stream';p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.src=streamUrl('stream',h);var pp=p.play();if(pp&&pp.catch)pp.catch(function(){{document.getElementById('player-status').textContent='Нажмите ▶ в плеере для запуска'}})}}
-function pollPlayer(h){{var s=document.getElementById('player-status'),p=document.getElementById('inline-player');if(playerPoll)clearInterval(playerPoll);playerPoll=setInterval(async function(){{try{{var r=await fetch('/status/'+h);if(!r.ok){{s.textContent='Ожидание добавления...';return}}var d=await r.json();if(d.state==='pending'){{s.textContent='Получаю метаданные...';return}}if(d.state==='checking_files'){{s.textContent='Проверяю уже скачанные данные... '+fmtBytes(d.total)+' · peers '+(d.num_peers||0);return}}var pct=Math.round((d.progress||0)*1000)/10;s.textContent=(d.ready?'Видео готово, запускаю...':'Буферизация...')+' '+pct+'% · '+fmtBytes(d.downloaded)+' / '+fmtBytes(d.total)+' · '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);if(d.ready){{clearInterval(playerPoll);playerPoll=null;startStream(p,h)}}}}catch(_e){{s.textContent='Нет связи с сервером'}}}},1500)}}
-async function watch(el){{var m=el.getAttribute('data-magnet'),replacement=findStreamReplacement(el),replacementText='';if(replacement){{m=replacement.magnet;replacementText='Найден быстрый способ онлайн-просмотра, запускаю...'}}var h=hashFromMagnet(m);if(!m)return;if(!h){{window.open(m);return}}stopCurrentSession();currentHash=h;currentSession=newSession(h);var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';s.textContent=replacementText||'Запускаю поток...';e.textContent='';pollPlayer(h);try{{var r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{magnet:m}})}});var d=await r.json().catch(function(){{return {{}}}});if(!r.ok||!d.info_hash){{e.textContent=d.error||'Не удалось добавить kino';return}}if(d.info_hash.toLowerCase()!==h){{h=d.info_hash;currentHash=h;currentSession=newSession(h);pollPlayer(h)}}s.textContent=replacementText||(d.async_mode?'Получаю метаданные...':'Буферизация...')}}catch(_err){{e.textContent='Ошибка соединения с сервером'}}}}
+function startStream(p, h) {{p.dataset.mode='stream';p.muted=true;p.src=streamUrl('stream',h);p.play().then(function(){{}}).catch(function(){{document.getElementById('player-status').textContent='Нажмите ▶ в плеере для запуска'}})}}
+function startTranscode(p, h) {{var s=document.getElementById('player-status');s.textContent='Перекодирование AVI в MP4...';p.dataset.mode='aac';p.muted=true;p.src=streamUrl('transcode',h);p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска'}})}}
+function stalledText(d){{var elapsed=currentWatchStartedAt?Math.floor((Date.now()-currentWatchStartedAt)/1000):0;if(elapsed>=120&&!(d.downloaded||0))return'Торрент не грузится: за 2 минуты нет входящей загрузки. peers '+(d.num_peers||0);return ''}}
+function pollPlayer(h){{var s=document.getElementById('player-status'),p=document.getElementById('inline-player');if(playerPoll)clearInterval(playerPoll);playerPoll=setInterval(async function(){{try{{var r=await fetch('/status/'+h);if(!r.ok){{s.textContent='Ожидание добавления...';return}}var d=await r.json();var stalled=stalledText(d);if(stalled){{s.textContent=stalled;return}}if(d.state==='pending'){{s.textContent='Получаю метаданные... '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);return}}if(d.state==='checking_files'){{s.textContent='Проверяю уже скачанные данные... '+fmtBytes(d.total)+' · peers '+(d.num_peers||0);return}}var pct=Math.round((d.progress||0)*1000)/10;s.textContent=(d.ready?'Видео готово, запускаю...':'Буферизация...')+' '+pct+'% · '+fmtBytes(d.downloaded)+' / '+fmtBytes(d.total)+' · '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);if(d.ready){{clearInterval(playerPoll);playerPoll=null;if(d.format==='avi'){{startTranscode(p,h)}}else{{startStream(p,h)}}}}}}catch(_e){{s.textContent='Нет связи с сервером'}}}},1500)}}
+async function startWatchMagnet(m,statusText,asyncOnly){{var h=hashFromMagnet(m),s=document.getElementById('player-status'),e=document.getElementById('player-error');if(!m)return '';if(!h){{window.open(m);return ''}}currentHash=h;currentSession=newSession(h);currentWatchStartedAt=Date.now();s.textContent=statusText||'Запускаю поток...';pollPlayer(h);try{{var payload={{magnet:m}};if(asyncOnly)payload.async_only=true;var r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});var d=await r.json().catch(function(){{return {{}}}});if(!r.ok||!d.info_hash){{e.textContent=d.error||'Не удалось добавить kino';return ''}}if(d.info_hash.toLowerCase()!==h){{h=d.info_hash;currentHash=h;currentSession=newSession(h);pollPlayer(h)}}s.textContent=d.async_mode?'Получаю метаданные...':'Буферизация...';return h}}catch(_err){{e.textContent='Ошибка соединения с сервером';return ''}}}}
+async function watch(el){{var m=el.getAttribute('data-magnet'),container=(el.getAttribute('data-container')||'').toLowerCase(),replacement=findStreamReplacement(el);stopCurrentSession();var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';e.textContent='';if(replacement){{await startWatchMagnet(replacement.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false);return}}if(container==='avi'){{var originalHash=hashFromMagnet(m);var originalSid='';var started=await startWatchMagnet(m,'Запускаю подготовку файла, параллельно ищу быстрый способ онлайн-просмотра...',true);originalSid=currentSession;try{{var _sr=await fetch('/status/'+started);if(_sr.ok){{var _sd=await _sr.json();if(_sd.progress>=1.0){{s.textContent='Файл уже загружен, запускаю поток...';if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}startTranscode(p,started);return}}}}}}catch(_e){{}}findExternalStreamReplacement(el).then(async function(rep){{if(!rep){{if(currentHash===originalHash||currentHash===started)s.textContent='Быстрый онлайн-вариант не найден, продолжаю подготовку файла...';return}}if(currentHash!==originalHash&&currentHash!==started)return;var oldHash=currentHash,oldSid=currentSession||originalSid;s.textContent='Найден быстрый способ онлайн-просмотра, переключаю...';try{{await fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{sid:oldSid,hash:oldHash}})}})}}catch(_e){{}}currentHash='';currentSession='';await startWatchMagnet(rep.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false)}});return}}await startWatchMagnet(m,'Запускаю поток...',false)}}
 function ac(){{af()}}
 function af(){{var d=document.getElementById('ds').value,g=document.getElementById('gs').value,c=document.getElementById('cs').value,h=JSON.parse(localStorage.getItem('ph')||'[]');localStorage.setItem('dv',d);var n=Date.now()/1000,cut=d>0?n-d*86400:0;
 [].forEach.call(document.querySelectorAll('#tbl tbody tr,.tile-card'),function(r){{var show=true,dt=parseFloat(r.getAttribute('data-date')||'0'),rg=(r.getAttribute('data-genre')||'').toLowerCase(),t=r.getAttribute('data-title')||'';if(c&&r.getAttribute('data-collection')!==c)show=false;if(show&&cut&&dt<cut)show=false;if(show&&g&&rg.indexOf(g)===-1)show=false;if(show&&(sx.test(rg)||sx.test(t)))show=false;if(show&&h.indexOf(t)!==-1)show=false;r.style.display=show?'':'none'}});

@@ -135,15 +135,23 @@ class TorrentEngine:
 
         def _wait_metadata():
             deadline = time.monotonic() + 30
-            while not handle.status().has_metadata:
-                if time.monotonic() > deadline:
-                    self.handles.pop(info_hash, None)
-                    self.ses.remove_torrent(handle)
+            try:
+                while not handle.status().has_metadata:
+                    if self.handles.get(info_hash) is not handle:
+                        return
+                    if time.monotonic() > deadline:
+                        self.handles.pop(info_hash, None)
+                        self.ses.remove_torrent(handle)
+                        return
+                    time.sleep(0.1)
+                if self.handles.get(info_hash) is not handle:
                     return
-                time.sleep(0.1)
-            info = handle.torrent_file()
-            self._prioritize_streaming_file(handle)
-            self._start_handle(handle)
+                self._prioritize_streaming_file(handle)
+                self._start_handle(handle)
+            except RuntimeError:
+                if self.handles.get(info_hash) is handle:
+                    self.handles.pop(info_hash, None)
+                return
 
         t = threading.Thread(target=_wait_metadata, daemon=True)
         t.start()
@@ -189,15 +197,17 @@ class TorrentEngine:
                 'progress': 0,
                 'downloaded': 0,
                 'total': 1,
-                'download_rate': 0,
-                'upload_rate': 0,
-                'num_peers': 0,
-                'num_seeds': 0,
+                'download_rate': s.download_rate,
+                'upload_rate': s.upload_rate,
+                'num_peers': s.num_peers,
+                'num_seeds': s.num_seeds,
                 'state': 'pending',
                 'ready': False,
                 'video_path': None,
                 'file_size': 0,
                 'name': 'Получение метаданных...',
+                'format': None,
+                'transcode': False,
             }
 
         total = s.total_wanted
@@ -227,6 +237,7 @@ class TorrentEngine:
                     'file_size': 0,
                     'name': handle.torrent_file().name(),
                     'format': video_format,
+                    'transcode': video_format not in ('mp4', 'mkv') if video_format else False,
                 }
 
         streamable = video_format in ('mkv', 'mp4')
@@ -281,6 +292,7 @@ class TorrentEngine:
             'file_size': file_size,
             'name': handle.torrent_file().name(),
             'format': video_format,
+            'transcode': video_format not in ('mp4', 'mkv') if video_format else False,
             'buffered_bytes': buffered_bytes,
             'start_buffer_bytes': start_buffer_bytes,
             'min_buffer_bytes': min_buffer_bytes,
