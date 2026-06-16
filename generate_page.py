@@ -1999,7 +1999,7 @@ body.mobile{{padding:10px}}body.mobile h1{{font-size:22px}}body.mobile .sub{{fon
 <div class="sub">
 <span id="stats-line">• Всего: <strong id="stat-total">{len(topics)}</strong> kino
 • С рейтингом: <strong id="stat-rated">{with_r}</strong></span>
-<a href="/sync_order" class="tv" title="Синхронизировать порядок" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">📋</a>
+<a href="/sync_order" class="tv" title="Синхронизировать порядок" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer;font-family:monospace">[sync]</a>
 <a href="/recheck_trailers" class="tv" title="Проверить трейлеры" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🎬</a>
 <span class="tv" onclick="tv()" id="tvb">Вид: плитка</span>
 <span class="tv" onclick="md()" id="mdb">📱</span>
