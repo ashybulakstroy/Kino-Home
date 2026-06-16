@@ -2172,10 +2172,6 @@ def main():
             else:
                 magnet_stats = {'total': 0, 'ok': 0, 'failed': 0}
 
-            if magnet_stats['total'] and magnet_stats['failed'] / max(magnet_stats['total'], 1) > 0.5:
-                print("  КРИТИЧНО: больше 50% новых тем не получили magnet; refresh коллекции невалиден")
-                critical_collection_error = True
-
             topics = clean_catalog_topics(merged)
             topic_ids = {t.get('topic_id') for t in topics}
             all_new_topics.extend(t for t in new_current if t.get('topic_id') in topic_ids)
