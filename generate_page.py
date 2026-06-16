@@ -27,6 +27,7 @@ FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
 MAX_TOPICS = 30
 PAGE_SIZE = 50
+MAX_RETRY = 10
 
 DATA_DIR = os.environ.get("LOCAL_KINO_DATA_DIR", "data")
 RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
@@ -154,14 +155,22 @@ def get_topic_html(topic_id, topic_url, timeout=10):
         with open(cache_path, 'rb') as f:
             raw = f.read()
     else:
-        try:
-            r = SESSION.get(topic_url, timeout=timeout)
-            r.raise_for_status()
-            raw = r.content
-            with open(cache_path, 'wb') as f:
-                f.write(raw)
-        except Exception:
-            return None
+        last_e = None
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                r = SESSION.get(topic_url, timeout=timeout)
+                r.raise_for_status()
+                raw = r.content
+                with open(cache_path, 'wb') as f:
+                    f.write(raw)
+                break
+            except Exception as e:
+                last_e = e
+                if attempt < MAX_RETRY:
+                    print(f"  [retry {attempt}/{MAX_RETRY}] {e}")
+                    time.sleep(2)
+                    continue
+                return None
 
     # determine encoding: prefer charset from meta, fallback utf8→cp1251
     enc = 'cp1251'
@@ -2080,19 +2089,27 @@ def main():
                 listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
                 page_topics = []
                 print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
-                try:
-                    r = SESSION.get(url, timeout=30)
-                    r.raise_for_status()
-                    raw = r.content
-                    html = raw.decode('cp1251', errors='replace')
-                    page_topics = parse_forum_page(html, collection=collection)
-                    if page_topics:
-                        if page == 0:
-                            page1_ok = True
-                        os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
-                        with open(listing_cache_path, 'wb') as f:
-                            f.write(raw)
-                except Exception as e:
+                last_error = None
+                for attempt in range(1, MAX_RETRY + 1):
+                    try:
+                        r = SESSION.get(url, timeout=30)
+                        r.raise_for_status()
+                        raw = r.content
+                        html = raw.decode('cp1251', errors='replace')
+                        page_topics = parse_forum_page(html, collection=collection)
+                        if page_topics:
+                            if page == 0:
+                                page1_ok = True
+                            os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                            with open(listing_cache_path, 'wb') as f:
+                                f.write(raw)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        if attempt < MAX_RETRY:
+                            print(f"\n  попытка {attempt}/{MAX_RETRY}: {e}; жду 2с", flush=True)
+                            time.sleep(2)
+                else:
                     listing_errors += 1
                     if listing_cache_is_valid(listing_cache_path):
                         with open(listing_cache_path, 'rb') as f:
@@ -2102,9 +2119,9 @@ def main():
                         if page == 0 and page_topics:
                             page1_ok = True
                             page1_used_cache = True
-                        print(f"ошибка: {e}; используем кеш", end=' ', flush=True)
+                        print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
                     else:
-                        print(f"ошибка: {e}; свежего кеша нет")
+                        print(f"ошибка: {last_error}; свежего кеша нет")
                         continue
                 print(f"{len(page_topics)} тем")
                 all_topics.extend(page_topics)

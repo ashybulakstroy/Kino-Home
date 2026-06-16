@@ -13,6 +13,7 @@ def file_lock(path):
         if os.name == "nt":
             import msvcrt
 
+            lock_file.seek(0)
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
             try:
                 yield
