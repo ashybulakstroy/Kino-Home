@@ -18,10 +18,10 @@ from config import LISTING_CACHE_MAX_AGE_DAYS
 from project_io import atomic_write_json, atomic_write_text
 
 COLLECTIONS = {
-    'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22', 'age_cleanup': True},
-    'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False},
-    'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252', 'age_cleanup': True},
-    'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False},
+    'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22',     'age_cleanup': True,  'skip_topics': 2},
+    'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False, 'skip_topics': 0},
+    'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252',   'age_cleanup': True,  'skip_topics': 0},
+    'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False, 'skip_topics': 0},
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
@@ -630,7 +630,7 @@ TRAILER_NEGATIVE = (
     'review', 'reaction', 'explained', 'ending', 'soundtrack', 'clip', 'scene',
     'обзор', 'реакция', 'разбор', 'саундтрек', 'песня', 'клип', 'сцена',
     'прохождение', 'gameplay', 'game trailer',
-    'серия', 'сезон', 'выпуск', 'episode',
+    'сери', 'серия', 'сезон', 'выпуск', 'эпизод', 'episode',
 )
 
 
@@ -698,6 +698,23 @@ def _duration_seconds(value):
     return total
 
 
+def _transliterate(text):
+    """Convert Cyrillic characters to Latin approximants."""
+    table = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd',
+        'е': 'e', 'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i',
+        'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+        'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't',
+        'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
+        'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '',
+        'э': 'e', 'ю': 'yu', 'я': 'ya',
+    }
+    result = []
+    for ch in (text or '').lower():
+        result.append(table.get(ch, ch))
+    return ''.join(result)
+
+
 def _score_youtube_candidate(candidate, title, year):
     cand_title = (candidate.get('title') or '').lower()
     cand_channel = (candidate.get('channel') or '').lower()
@@ -707,11 +724,31 @@ def _score_youtube_candidate(candidate, title, year):
     if not wanted_tokens or all(token.isdigit() for token in wanted_tokens):
         return 0
 
-    overlap = len(wanted_tokens & cand_tokens) / max(len(wanted_tokens), 1)
+    # transliteration — match Cyrillic titles against Latin YouTube titles
+    wanted_translit = _transliterate(wanted)
+    wanted_translit_tokens = _title_tokens(wanted_translit)
+
+    old_overlap = len(wanted_tokens & cand_tokens) / max(len(wanted_tokens), 1)
+    # boost overlap via transliteration: check if any translit token prefixes a cand token
+    translit_boost = 0
+    for tt in wanted_translit_tokens:
+        if len(tt) >= 3:
+            for ct in cand_tokens:
+                if ct.startswith(tt) or tt.startswith(ct):
+                    translit_boost = max(translit_boost, 1)
+                    break
+        if translit_boost:
+            break
+    old_overlap_boosted = max(old_overlap, translit_boost * 0.5)
+    unified_tokens = wanted_tokens | wanted_translit_tokens
+    jaccard = len(unified_tokens & cand_tokens) / max(len(unified_tokens | cand_tokens), 1)
+    blended_overlap = 0.7 * old_overlap_boosted + 0.3 * jaccard
     score = 0
-    if wanted and wanted in cand_title:
-        score += 45
-    score += int(overlap * 40)
+    if wanted and (wanted in cand_title or (wanted_translit and wanted_translit in cand_title)):
+        token_count = len(wanted_tokens)
+        factor = min(token_count, 4) / 4 if token_count > 0 else 1.0
+        score += int(45 * max(factor, 0.6))
+    score += int(blended_overlap * 40)
     if any(word in cand_title for word in ('trailer', 'трейлер')):
         score += 25
     if any(word in cand_title for word in ('official', 'официальный')):
@@ -731,15 +768,20 @@ def _score_youtube_candidate(candidate, title, year):
         score += 18
     if any(name in cand_channel for name in ('rapid trailer', 'kinocheck')):
         score -= 5
+    if any(name in cand_channel for name in ('wink', 'more.tv', 'ivi', 'start', 'ctc', 'ctc love')):
+        score -= 50
     if any(word in cand_title for word in TRAILER_NEGATIVE):
-        score -= 35
+        score -= 60
     duration = _duration_seconds(candidate.get('length') or '')
     if duration and duration > 8 * 60:
         score -= 15
-    if overlap < 0.6 and wanted not in cand_title:
+    if old_overlap < 0.6 and wanted not in cand_title and (not wanted_translit or wanted_translit not in cand_title):
         score -= 40
     if not any(word in cand_title for word in TRAILER_POSITIVE[:2]):
         score -= 30
+    title_proportion = min(len(wanted) / max(len(cand_title), 1), 1.0) if cand_title else 0
+    if title_proportion > 0.4:
+        score += int(title_proportion * 50)
     return score
 
 
@@ -770,7 +812,7 @@ def search_youtube_trailer_verified(title, year):
 
 
 def search_youtube_trailer_legacy(title, year, best=None):
-    if best and isinstance(best, dict) and best.get('score', 0) >= 40:
+    if best and isinstance(best, dict) and best.get('score', 0) >= 65:
         return f"https://www.youtube.com/watch?v={best['video_id']}"
     query = f"{title} {year} official trailer"
     url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
@@ -782,7 +824,7 @@ def search_youtube_trailer_legacy(title, year, best=None):
                 best = {**candidate, 'score': score}
     except Exception:
         pass
-    if isinstance(best, dict) and best.get('score', 0) >= 35:
+    if isinstance(best, dict) and best.get('score', 0) >= 65:
         return f"https://www.youtube.com/watch?v={best['video_id']}"
     return None
 
@@ -792,6 +834,41 @@ def search_youtube_trailer(title, year):
     if isinstance(best, str):
         return best
     return search_youtube_trailer_legacy(title, year, best)
+
+
+def search_youtube_by_kp_id(kp_id, title, year):
+    kp_id = str(kp_id or '').strip()
+    if not kp_id or kp_id == '0':
+        return None
+    kp_cache = load_json(KP_TRAILER_CACHE) or {}
+    kp_key = kp_id
+    cached = kp_cache.get(kp_key)
+    if cached and _validate_youtube_url(cached, title, year):
+        return cached
+    queries = [
+        f'кинопоиск {kp_id} трейлер',
+        f'kp {kp_id} trailer',
+        f'"{kp_id}" трейлер',
+    ]
+    best = None
+    for query in queries:
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        try:
+            r = SESSION.get(url, timeout=10)
+        except Exception:
+            continue
+        for candidate in _youtube_candidates(r.text):
+            score = _score_youtube_candidate(candidate, title, year) + 25
+            if not best or score > best['score']:
+                best = {**candidate, 'score': score}
+        time.sleep(0.1)
+    if isinstance(best, dict) and best.get('score', 0) >= 60:
+        url = f"https://www.youtube.com/watch?v={best['video_id']}"
+        if _validate_youtube_url(url, title, year):
+            kp_cache[kp_key] = url
+            save_json(KP_TRAILER_CACHE, kp_cache)
+            return url
+    return None
 
 
 def search_kinopoisk_trailer(kp_id):
@@ -894,7 +971,7 @@ def search_youtube_full_movie(title, year):
 
 def _validate_youtube_url(url, title, year):
     """Verify youtube URL by fetching oEmbed title and scoring.
-    Returns url if score >= 0, None otherwise."""
+    Returns url if score >= 50, None otherwise."""
     if not url:
         return None
     try:
@@ -909,11 +986,11 @@ def _validate_youtube_url(url, title, year):
                 'length': '2:00',
             }
             score = _score_youtube_candidate(cand, title, year)
-            if score < 0:
-                return None
+            if score >= 50:
+                return url
     except Exception:
         pass
-    return url
+    return None
 
 
 def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
@@ -940,6 +1017,11 @@ def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
                 save_json(IMDB_TRAILER_CACHE, imdb_cache)
         if imdb_url:
             return imdb_url
+
+    if kp_id and str(kp_id) != '0':
+        kp_yt_url = search_youtube_by_kp_id(kp_id, title, year)
+        if kp_yt_url:
+            return kp_yt_url
 
     result = search_youtube_trailer(title, year)
     if result and _validate_youtube_url(result, title, year):
@@ -1134,10 +1216,11 @@ def load_basics(needed_ids):
         return {}
 
 
-def parse_forum_page(html, collection='nashe_kino'):
+def parse_forum_page(html, collection='nashe_kino', skip_topics=0):
     soup = BeautifulSoup(html, 'html.parser')
     topics = []
     rows = soup.select('tr.hl-tr')
+    filtered = 0
     for row in rows:
         topic_id = row.get('data-topic_id')
         if not topic_id:
@@ -1145,6 +1228,10 @@ def parse_forum_page(html, collection='nashe_kino'):
         size_el = row.select_one('a.dl-stub')
         if not size_el:
             continue
+        if filtered < skip_topics:
+            filtered += 1
+            continue
+        filtered += 1
         title_el = row.select_one('a.torTopic.tt-text')
         if not title_el:
             continue
@@ -1181,6 +1268,7 @@ def parse_forum_page(html, collection='nashe_kino'):
             'date_str': date_str,
             'added_at': now_text(),
             'topic_url': TOPIC_URL_T.format(topic_id),
+            'listing_order': len(topics),
             'magnet': '',
             'imdb_id': None,
             'imdb_rating': None,
@@ -1399,6 +1487,113 @@ def fix_bad_topics(topics):
     return topics
 
 
+def recheck_trailers(topics):
+    """
+    Generator that scores all youtube_urls, stores yt_score, replaces weak ones.
+    Yields status lines for streaming. Processes from weakest to strongest.
+    After iteration completes, caller must save topics and regenerate HTML.
+    """
+    import requests as _req
+    scored_topics = []
+    total = scored = 0
+
+    yield 'Фаза 1: оценка всех трейлеров...'
+    for t in topics:
+        yt = t.get('youtube_url')
+        if not yt or yt == '0':
+            continue
+        title = t.get('movie_title', '')
+        year = t.get('movie_year', '')
+        try:
+            r = _req.get(f'https://www.youtube.com/oembed?url={yt}&format=json', timeout=5)
+            if r.status_code == 200:
+                info = r.json()
+                cand = {
+                    'title': info.get('title', ''),
+                    'channel': info.get('author_name', ''),
+                    'video_id': yt.split('v=')[-1].split('&')[0],
+                    'length': '2:00',
+                }
+                score = _score_youtube_candidate(cand, title, year)
+            else:
+                score = 0
+        except Exception:
+            score = 0
+        t['yt_score'] = score
+        scored_topics.append((score, yt, t))
+        total += 1
+        if total % 50 == 0:
+            yield f'  оценено: {total}'
+
+    yield f'Оценено: {total} трейлеров'
+
+    scored_topics.sort(key=lambda x: x[0])
+    weak = [st for st in scored_topics if st[0] < 50]
+    strong = [st for st in scored_topics if st[0] >= 50]
+    yield f'Слабых (<50): {len(weak)}, сильных (>=50): {len(strong)}'
+
+    if weak:
+        yield ''
+        yield 'Фаза 2: замена слабых...'
+
+    # build peer lookup: kp_id/imdb_id -> good url from strong topics
+    peer_url = {}
+    for s, u, t in strong:
+        kp = t.get('kp_id')
+        im = t.get('imdb_id')
+        if u and u != '0':
+            if kp:
+                peer_url.setdefault(('kp', str(kp)), u)
+            if im:
+                peer_url.setdefault(('im', str(im)), u)
+
+    replaced_weak = 0
+    kept_weak = 0
+    for score, yt, t in weak:
+        title = t.get('movie_title', '')
+        year = t.get('movie_year', '')
+        tid = t['topic_id']
+        new_yt = None
+        kp = t.get('kp_id')
+        im = t.get('imdb_id')
+        if kp and ('kp', str(kp)) in peer_url:
+            new_yt = peer_url[('kp', str(kp))]
+            yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (kp={kp})'
+        elif im and ('im', str(im)) in peer_url:
+            new_yt = peer_url[('im', str(im))]
+            yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (imdb={im})'
+        if not new_yt:
+            try:
+                new_yt = resolve_trailer_url(title, year, kp, im)
+            except Exception:
+                new_yt = None
+        if new_yt:
+            try:
+                r = _req.get(f'https://www.youtube.com/oembed?url={new_yt}&format=json', timeout=5)
+                if r.status_code == 200:
+                    info = r.json()
+                    cand = {
+                        'title': info.get('title', ''),
+                        'channel': info.get('author_name', ''),
+                        'video_id': new_yt.split('v=')[-1].split('&')[0],
+                        'length': '2:00',
+                    }
+                    new_score = _score_youtube_candidate(cand, title, year)
+                    if new_score >= 50:
+                        t['youtube_url'] = new_yt
+                        t['yt_score'] = new_score
+                        replaced_weak += 1
+                        yield f'  [{tid}] {title} ({year}) score {score} -> {new_score}: {new_yt}'
+                        continue
+            except Exception:
+                pass
+        kept_weak += 1
+        yield f'  [{tid}] {title} ({year}) score {score} — оставлено'
+
+    yield ''
+    yield f'Итого: заменено {replaced_weak}, слабых осталось {kept_weak}, всего оценено {total}'
+
+
 def clear_poster_failed(topic):
     topic.pop('_poster_failed_at', None)
     topic.pop('_poster_fallback_failed_at', None)
@@ -1532,6 +1727,51 @@ def enrich(topics, ratings, basics):
     return topics
 
 
+def sync_listing_order_for_collection(collection: str, cache_only: bool = False) -> dict[str, int]:
+    """Return {topic_id: listing_order} for page 1. If cache_only, skip network."""
+    coll_info = COLLECTIONS.get(collection)
+    if not coll_info:
+        return {}
+    base_url = coll_info['url']
+    m_fid = re.search(r'f=(\d+)', base_url)
+    forum_id = m_fid.group(1) if m_fid else collection
+    cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p0.html')
+    if cache_only:
+        if listing_cache_is_valid(cache_path):
+            with open(cache_path, 'rb') as f:
+                raw = f.read()
+            html = raw.decode('cp1251', errors='replace')
+            skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+            topics = parse_forum_page(html, collection=collection, skip_topics=skip)
+            return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+        return {}
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            r = SESSION.get(base_url, timeout=30)
+            r.raise_for_status()
+            raw = r.content
+            html = raw.decode('cp1251', errors='replace')
+            skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+            topics = parse_forum_page(html, collection=collection, skip_topics=skip)
+            if topics:
+                os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                with open(cache_path, 'wb') as f:
+                    f.write(raw)
+            return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+        except Exception as e:
+            if attempt < MAX_RETRY:
+                time.sleep(2)
+                continue
+            if listing_cache_is_valid(cache_path):
+                with open(cache_path, 'rb') as f:
+                    raw = f.read()
+                html = raw.decode('cp1251', errors='replace')
+                skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+                topics = parse_forum_page(html, collection=collection, skip_topics=skip)
+                return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+    return {}
+
+
 def generate_html(topics, hidden_ids: set[str] | None = None):
     if hidden_ids is None:
         hidden_ids = load_hidden_topic_ids()
@@ -1539,7 +1779,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
     tiles = []
 
     coll_opts = ''.join(f'<option value="{k}">{v["name"]}</option>' for k, v in COLLECTIONS.items())
-    sort_opts = '''<option value="s">По умолчанию</option><option value="na">Название А-Я</option><option value="nz">Название Я-А</option><option value="rh">Рейтинг (выс.)</option><option value="rl">Рейтинг (низ.)</option><option value="dh">Сначала новые</option><option value="dl">Сначала старые</option>'''
+    sort_opts = '''<option value="lo">Серверная</option><option value="dh">Сначала новые</option><option value="dl">Сначала старые</option><option value="na">Название А-Я</option><option value="nz">Название Я-А</option><option value="rh">Рейтинг (выс.)</option><option value="rl">Рейтинг (низ.)</option>'''
     filter_bar = '''<div class="gf"><span class="gl">Коллекция:</span><select class="gs" onchange="af()" id="cs"><option value="">Все</option>''' + coll_opts + '''</select>
 <span class="gl">Жанр:</span><select class="gs" onchange="af()" id="gs"><option value="">Все</option></select>
 <span class="gl">Дата:</span><select class="gs" onchange="af()" id="ds"><option value="0">Все</option><option value="7">Неделя</option><option value="14">2 недели</option><option value="30">Месяц</option><option value="60">2 месяца</option><option value="180">Полгода</option></select>
@@ -1610,7 +1850,8 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 
         rated_attr = '1' if t.get('kp_rating') or t.get('imdb_rating') else '0'
 
-        rows.append(f'''<tr data-date="{date_ts}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
+        listing_order = t.get('listing_order', 999)
+        rows.append(f'''<tr data-date="{date_ts}" data-order="{listing_order}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
 <td><a href="{escape(t['topic_url'])}" class="tn" target="_blank">{escape(t['title'])}</a>
 <div class="ml">
 <span class="tg" onclick="td(this)">+</span>
@@ -1630,7 +1871,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         poster_card = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" data-src="{escape(poster)}" class="tps" alt=""><span class="pb">▶</span></div>'
         cast_short = escape(cast_str)[:120] + '…' if len(cast_str) > 120 else escape(cast_str)
 
-        tiles.append(f'''<div class="tile-card" data-date="{date_ts}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
+        tiles.append(f'''<div class="tile-card" data-date="{date_ts}" data-order="{listing_order}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-size="{esize}" data-rating="{rating or '0'}" data-collection="{collection}" data-rated="{rated_attr}">
 {poster_card}
 <div class="tile-body">
 <a href="{escape(t['topic_url'])}" class="tile-title" target="_blank">{escape(t['title'])}</a>
@@ -1758,6 +1999,8 @@ body.mobile{{padding:10px}}body.mobile h1{{font-size:22px}}body.mobile .sub{{fon
 <div class="sub">
 <span id="stats-line">• Всего: <strong id="stat-total">{len(topics)}</strong> kino
 • С рейтингом: <strong id="stat-rated">{with_r}</strong></span>
+<a href="/sync_order" class="tv" title="Синхронизировать порядок" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">📋</a>
+<a href="/recheck_trailers" class="tv" title="Проверить трейлеры" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer">🎬</a>
 <span class="tv" onclick="tv()" id="tvb">Вид: плитка</span>
 <span class="tv" onclick="md()" id="mdb">📱</span>
 </div>
@@ -1794,7 +2037,7 @@ body.mobile{{padding:10px}}body.mobile h1{{font-size:22px}}body.mobile .sub{{fon
 </div>
 <script>
 var sd={{i:-1,d:1}};
-function sortTiles(){{var tg=document.getElementById('tile-grid'),cards=Array.from(tg.children),a=sd.d;if(sd.i===0){{cards.sort(function(x,y){{return a*((x.getAttribute('data-title')||'').localeCompare(y.getAttribute('data-title')||''))}})}}else if(sd.i===1){{cards.sort(function(x,y){{return a*((x.getAttribute('data-size')||'').localeCompare(y.getAttribute('data-size')||''))}})}}else if(sd.i===3){{cards.sort(function(x,y){{return a*(parseFloat(x.getAttribute('data-rating')||'0')-parseFloat(y.getAttribute('data-rating')||'0'))}})}}else{{cards.sort(function(x,y){{return a*(parseFloat(x.getAttribute('data-date')||'0')-parseFloat(y.getAttribute('data-date')||'0'))}})}}cards.forEach(function(c){{tg.appendChild(c)}})}}
+function sortTiles(){{var tg=document.getElementById('tile-grid'),cards=Array.from(tg.children),a=sd.d;if(sd.i===0){{cards.sort(function(x,y){{return a*((x.getAttribute('data-title')||'').localeCompare(y.getAttribute('data-title')||''))}})}}else if(sd.i===1){{cards.sort(function(x,y){{return a*((x.getAttribute('data-size')||'').localeCompare(y.getAttribute('data-size')||''))}})}}else if(sd.i===3){{cards.sort(function(x,y){{return a*(parseFloat(x.getAttribute('data-rating')||'0')-parseFloat(y.getAttribute('data-rating')||'0'))}})}}else if(sd.i===4){{cards.sort(function(x,y){{return a*(parseFloat(x.getAttribute('data-order')||'999')-parseFloat(y.getAttribute('data-order')||'999'))}})}}else{{cards.sort(function(x,y){{return a*(parseFloat(x.getAttribute('data-date')||'0')-parseFloat(y.getAttribute('data-date')||'0'))}})}}cards.forEach(function(c){{tg.appendChild(c)}})}}
 function st(c,t){{var tb=document.querySelector('#tbl tbody'),r=Array.from(tb.children),a=sd.i===c?sd.d*-1:1;
 r.sort(function(x,y){{var va=x.children[c].getAttribute('data-s')||(t==='n'?x.getAttribute('data-date')||'0':x.children[c].textContent.trim()),vb=y.children[c].getAttribute('data-s')||(t==='n'?y.getAttribute('data-date')||'0':y.children[c].textContent.trim());if(t==='n'){{return a*(parseFloat(va)-parseFloat(vb))}}return a*va.localeCompare(vb)}});
 r.forEach(function(r){{tb.appendChild(r)}});sd.i=c;sd.d=a;
@@ -1839,7 +2082,7 @@ async function watch(el){{var m=el.getAttribute('data-magnet'),container=(el.get
 function ac(){{af()}}
 function af(){{var d=document.getElementById('ds').value,g=document.getElementById('gs').value,c=document.getElementById('cs').value,s=document.getElementById('ss').value,h=JSON.parse(localStorage.getItem('ph')||'[]');localStorage.setItem('dv',d);localStorage.setItem('sv',s);var n=Date.now()/1000,cut=d>0?n-d*86400:0;
 [].forEach.call(document.querySelectorAll('#tbl tbody tr,.tile-card'),function(r){{var show=true,dt=parseFloat(r.getAttribute('data-date')||'0'),rg=(r.getAttribute('data-genre')||'').toLowerCase(),t=r.getAttribute('data-title')||'';if(c&&r.getAttribute('data-collection')!==c)show=false;if(show&&cut&&dt<cut)show=false;if(show&&g&&rg.indexOf(g)===-1)show=false;if(show&&(sx.test(rg)||sx.test(t)))show=false;if(show&&h.indexOf(t)!==-1)show=false;r.style.display=show?'':'none'}});
-bgf();updateStats();if(s==='na'){{sd.i=0;sd.d=1;sortTiles()}}else if(s==='nz'){{sd.i=0;sd.d=-1;sortTiles()}}else if(s==='rh'){{sd.i=3;sd.d=-1;sortTiles()}}else if(s==='rl'){{sd.i=3;sd.d=1;sortTiles()}}else if(s==='dh'){{sd.i=2;sd.d=-1;sortTiles()}}else if(s==='dl'){{sd.i=2;sd.d=1;sortTiles()}}}}
+bgf();updateStats();if(s==='lo'){{sd.i=4;sd.d=1;sortTiles()}}else if(s==='na'){{sd.i=0;sd.d=1;sortTiles()}}else if(s==='nz'){{sd.i=0;sd.d=-1;sortTiles()}}else if(s==='rh'){{sd.i=3;sd.d=-1;sortTiles()}}else if(s==='rl'){{sd.i=3;sd.d=1;sortTiles()}}else if(s==='dh'||s==='s'){{sd.i=2;sd.d=-1;sortTiles()}}else if(s==='dl'){{sd.i=2;sd.d=1;sortTiles()}}}}
 ['pointerdown','mousedown','click'].forEach(function(n){{document.addEventListener(n,function(e){{if(e.target&&e.target.id==='sound-button')unmutePlayer(e)}},true)}});
 document.addEventListener('click',function(e){{if(e.target&&e.target.id==='aac-button')useAacAudio(e)}},true);
 ['pointerdown','mousedown','click'].forEach(function(n){{document.addEventListener(n,function(e){{if(e.target&&e.target.id==='play-button')playPlayer(e)}},true)}});
@@ -2041,6 +2284,9 @@ def main():
     if not collections_to_process:
         print("Загружаю кеш...")
         topics = load_json(TORRENTS_CACHE) or []
+        for i, t in enumerate(topics):
+            if t.get('listing_order') is None:
+                t['listing_order'] = i
         cleaned_topics = clean_catalog_topics(topics)
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
@@ -2067,6 +2313,9 @@ def main():
 
     else:
         topics = load_json(TORRENTS_CACHE) or []
+        for i, t in enumerate(topics):
+            if t.get('listing_order') is None:
+                t['listing_order'] = i
         original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
 
@@ -2082,6 +2331,7 @@ def main():
             page1_ok = False
             page1_used_cache = False
             critical_collection_error = False
+            _skip_ids: set[str] = set()
             base_url = coll_info['url']
             m_fid = re.search(r'f=(\d+)', base_url)
             forum_id = m_fid.group(1) if m_fid else collection
@@ -2098,7 +2348,11 @@ def main():
                         r.raise_for_status()
                         raw = r.content
                         html = raw.decode('cp1251', errors='replace')
-                        page_topics = parse_forum_page(html, collection=collection)
+                        skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+                        page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
+                        if page == 0 and skip_top:
+                            all_page = parse_forum_page(html, collection=collection, skip_topics=0)
+                            _skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
                         if page_topics:
                             if page == 0:
                                 page1_ok = True
@@ -2117,7 +2371,11 @@ def main():
                         with open(listing_cache_path, 'rb') as f:
                             raw = f.read()
                         html = raw.decode('cp1251', errors='replace')
-                        page_topics = parse_forum_page(html, collection=collection)
+                        skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+                        page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
+                        if page == 0 and skip_top:
+                            all_page = parse_forum_page(html, collection=collection, skip_topics=0)
+                            _skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
                         if page == 0 and page_topics:
                             page1_ok = True
                             page1_used_cache = True
@@ -2162,12 +2420,17 @@ def main():
             cache_by_id = {t['topic_id']: t for t in topics if t.get('topic_id')}
 
             other = [t for t in topics if t.get('collection', 'nashe_kino') != collection]
-            # Keep ALL existing topics from this collection (no updates)
             existing_current = [
                 t for t in topics
-                if t.get('collection', 'nashe_kino') == collection
+                if t.get('collection', 'nashe_kino') == collection and t['topic_id'] not in _skip_ids
             ]
             existing_ids = {t['topic_id'] for t in existing_current}
+
+            # Update listing_order for topics still on the current page
+            fresh_order = {t['topic_id']: t.get('listing_order', 0) for t in all_topics}
+            for t in existing_current:
+                if t['topic_id'] in fresh_order:
+                    t['listing_order'] = fresh_order[t['topic_id']]
 
             # Add only genuinely new topics (not already in cache)
             new_current: list[dict] = []
@@ -2291,7 +2554,8 @@ def main():
         else:
             print("  Нет нуждающихся")
 
-        topics.sort(key=lambda t: t.get('seeders', 0) or 0, reverse=True)
+        coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
+        topics.sort(key=lambda t: (coll_order.get(t.get('collection', ''), 999), t.get('listing_order', 999)))
         save_json(TORRENTS_CACHE, topics)
 
     print("\nИсправление битых заголовков (весь кеш)...")

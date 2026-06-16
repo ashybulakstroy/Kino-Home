@@ -10,7 +10,7 @@ import threading
 import subprocess
 import shutil
 from datetime import date, datetime, timedelta
-from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect
+from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
 from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE
 
@@ -483,12 +483,44 @@ def _enrich_missing(force: bool = False):
         return
 
 
+def _sync_listing_order(cache_only: bool = False):
+    """Sync listing_order from rutracker page 1 for all collections.
+    If cache_only=True, use cached listing HTML only (no network)."""
+    try:
+        data_path = DATA_DIR / 'torrents_data.json'
+        if not data_path.exists():
+            return
+        with file_lock(data_path):
+            topics = json.loads(data_path.read_text('utf-8'))
+        changed = False
+        from generate_page import COLLECTIONS, sync_listing_order_for_collection
+        for coll in COLLECTIONS:
+            order_map = sync_listing_order_for_collection(coll, cache_only=cache_only)
+            if not order_map:
+                continue
+            for t in topics:
+                if t.get('collection') == coll and t['topic_id'] in order_map:
+                    new_order = order_map[t['topic_id']]
+                    if t.get('listing_order') != new_order:
+                        t['listing_order'] = new_order
+                        changed = True
+        if changed:
+            with file_lock(data_path):
+                atomic_write_json_unlocked(data_path, topics)
+                gen_path = DATA_DIR / 'index-kino.html'
+                atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
+            print(f'  [listing_order] синхронизировано')
+    except Exception as e:
+        print(f'  [listing_order] ошибка: {e}')
+
+
 def _periodic_enrich():
     print(f'Автообогащение запущено, интервал {ENRICH_INTERVAL_MINUTES} мин')
     while True:
         if _daily_refresh_lock.locked():
             print('  [enrich] пропуск: refresh выполняется')
         else:
+            _sync_listing_order()
             _enrich_missing()
         time.sleep(ENRICH_INTERVAL_MINUTES * 60)
 
@@ -1368,6 +1400,13 @@ def torrents_data():
     return send_file(str(DATA_DIR / 'torrents_data.json'))
 
 
+@app.route('/sync_order')
+def sync_order():
+    _reject_public_admin()
+    _sync_listing_order(cache_only=False)
+    return '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Синхронизация</title></head><body><h2>Порядок синхронизирован</h2><p><a href="/">Готово</a></p></body></html>'
+
+
 @app.route('/enrich/all', methods=['POST'])
 def enrich_all():
     _reject_public_admin()
@@ -1396,6 +1435,24 @@ def enrich_status(topic_id):
     with _enrich_lock:
         status = _enrich_status.get(topic_id, 'unknown')
     return jsonify(status=status)
+
+
+@app.route('/recheck_trailers')
+def recheck_trailers():
+    _reject_public_admin()
+    data_path = DATA_DIR / 'torrents_data.json'
+    topics = json.loads(data_path.read_text('utf-8'))
+
+    def generate():
+        yield '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Проверка трейлеров</title></head><body><h2>Проверка трейлеров</h2><pre>'
+        for line in gp.recheck_trailers(topics):
+            yield line + '\n'
+        data_path.write_text(json.dumps(topics, ensure_ascii=False, indent=2), 'utf-8')
+        html = gp.generate_html(topics)
+        atomic_write_text(DATA_DIR / 'index-kino.html', html)
+        yield '</pre><p><a href="/">Готово</a></p></body></html>'
+
+    return Response(stream_with_context(generate()), content_type='text/html; charset=utf-8')
 
 
 @app.route('/hide/<topic_id>', methods=['POST'])
@@ -2304,6 +2361,7 @@ if __name__ == '__main__':
         else:
             print(f'Старых тем старше {TOPIC_MAX_AGE_DAYS} дней нет.')
         _run_daily_refresh_if_due('startup')
+        _sync_listing_order(cache_only=True)
         _ensure_periodic_enrich()
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()
