@@ -707,11 +707,13 @@ def _score_youtube_candidate(candidate, title, year):
         score += 25
     if any(word in cand_title for word in ('official', 'официальный')):
         score += 10
-    if year and str(year) in cand_title:
-        score += 15
     title_years = set(re.findall(r'\b(19\d{2}|20\d{2})\b', cand_title))
+    if year and str(year) in title_years:
+        score += 15
     if year and title_years and str(year) not in title_years:
         score -= 70
+    if year and not title_years:
+        score -= 30
     if any(name in cand_channel for name in (
         'кинопоиск', 'kinopoisk', 'movieclips', 'amazon mgm', 'warner bros',
         'universal pictures', 'paramount pictures', 'sony pictures',
@@ -771,7 +773,7 @@ def search_youtube_trailer_legacy(title, year, best=None):
                 best = {**candidate, 'score': score}
     except Exception:
         pass
-    if isinstance(best, dict) and best.get('score', 0) >= 20:
+    if isinstance(best, dict) and best.get('score', 0) >= 35:
         return f"https://www.youtube.com/watch?v={best['video_id']}"
     return None
 
@@ -876,9 +878,33 @@ def search_youtube_full_movie(title, year):
             if not best or score > best['score']:
                 best = {**candidate, 'score': score}
         time.sleep(0.1)
-    if isinstance(best, dict) and best.get('score', 0) >= 15:
+    if isinstance(best, dict) and best.get('score', 0) >= 25:
         return f"https://www.youtube.com/watch?v={best['video_id']}"
     return None
+
+
+def _validate_youtube_url(url, title, year):
+    """Verify youtube URL by fetching oEmbed title and scoring.
+    Returns url if score >= 0, None otherwise."""
+    if not url:
+        return None
+    try:
+        oembed_url = f'https://www.youtube.com/oembed?url={urllib.parse.quote(url)}&format=json'
+        resp = SESSION.get(oembed_url, timeout=5)
+        if resp.status_code == 200:
+            info = resp.json()
+            cand = {
+                'title': info.get('title', ''),
+                'channel': info.get('author_name', ''),
+                'video_id': url.split('v=')[-1].split('&')[0],
+                'length': '2:00',
+            }
+            score = _score_youtube_candidate(cand, title, year)
+            if score < 0:
+                return None
+    except Exception:
+        pass
+    return url
 
 
 def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
@@ -907,9 +933,12 @@ def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
             return imdb_url
 
     result = search_youtube_trailer(title, year)
-    if result:
+    if result and _validate_youtube_url(result, title, year):
         return result
-    return search_youtube_full_movie(title, year)
+    result = search_youtube_full_movie(title, year)
+    if result and _validate_youtube_url(result, title, year):
+        return result
+    return None
 
 
 def download_poster(imdb_id, url):
@@ -1389,10 +1418,14 @@ def set_local_poster_from_url(topic, url):
 
 def fetch_magnets(topics):
     total = len(topics)
+    ok_count = 0
+    fail_count = 0
     for i, t in enumerate(topics, 1):
         if t.get('magnet') and has_real_poster(t):
+            ok_count += 1
             continue
         if t.get('_magnet_failed'):
+            fail_count += 1
             continue
         print(f"  [{i}/{total}] Загрузка магнета t={t['topic_id']}...", end=' ', flush=True)
         try:
@@ -1402,11 +1435,13 @@ def fetch_magnets(topics):
             data = parse_topic_for_magnet(html)
             t['magnet'] = data['magnet']
             if data['magnet']:
+                ok_count += 1
                 print("OK", end='')
                 if data.get('poster') and not has_real_poster(t):
                     if set_local_poster_from_url(t, data['poster']):
                         print(", постер ✓", end='')
             else:
+                fail_count += 1
                 print("нет магнета", end='')
             if data.get('imdb') and not t.get('imdb_id'):
                 t['imdb_id'] = data['imdb']
@@ -1415,9 +1450,10 @@ def fetch_magnets(topics):
         except Exception as e:
             print(f"ошибка: {e}", end='')
             t['_magnet_failed'] = True
+            fail_count += 1
         print()
         time.sleep(1.5)
-    return topics
+    return {'total': total, 'ok': ok_count, 'failed': fail_count}
 
 
 def prune_unplayable_topics(topics):
@@ -1499,7 +1535,8 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 <span class="gl">Дата:</span><select class="gs" onchange="af()" id="ds"><option value="0">Все</option><option value="7">Неделя</option><option value="14">2 недели</option><option value="30">Месяц</option><option value="60">2 месяца</option><option value="180">Полгода</option></select></div>'''
 
     for t in topics:
-        if not t.get('magnet'):
+        magnet = t.get('magnet')
+        if not magnet or magnet == '0':
             continue
         if str(t.get('topic_id', '')) in hidden_ids:
             continue
@@ -1895,9 +1932,13 @@ def enrich_topic(topic, force_poster_retry=False):
 
     if not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
-        if yt_cache.get(cache_key):
-            topic['youtube_url'] = yt_cache[cache_key]
+        cached_url = yt_cache.get(cache_key)
+        if cached_url and _validate_youtube_url(cached_url, title, year):
+            topic['youtube_url'] = cached_url
         else:
+            if cached_url:
+                yt_cache[cache_key] = None
+                save_json(YOUTUBE_CACHE, yt_cache)
             yt_url = resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
             topic['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
@@ -1934,9 +1975,11 @@ def main():
     refresh = '--refresh' in sys.argv
     quick = '--quick' in sys.argv
     pages_flag = False
-    pages_count = 10
+    pages_count = 1
     topics_limit = MAX_TOPICS
     collection_arg = None
+    refresh_failed = False
+    collection_summaries = []
 
     limit = 0
     for arg in sys.argv[1:]:
@@ -1963,9 +2006,18 @@ def main():
         print(f"Неизвестная коллекция '{collection_arg}'. Доступны: {', '.join(COLLECTIONS.keys())}")
         sys.exit(1)
 
+    if refresh:
+        if pages_flag and pages_count != 1:
+            print("  --pages игнорируется: refresh использует только первую страницу коллекции")
+        pages_count = 1
+        topics_limit = MAX_TOPICS
+
     if quick:
         pages_count = 1
         topics_limit = 0
+    if refresh:
+        pages_count = 1
+        topics_limit = MAX_TOPICS
 
     # Determine which collections to process
     if not refresh and os.path.exists(TORRENTS_CACHE):
@@ -2004,6 +2056,7 @@ def main():
 
     else:
         topics = load_json(TORRENTS_CACHE) or []
+        original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
 
         for col_idx, collection in enumerate(collections_to_process):
@@ -2014,6 +2067,10 @@ def main():
 
             print(f"1. Парсинг {coll_info['name']}...")
             all_topics = []
+            listing_errors = 0
+            page1_ok = False
+            page1_used_cache = False
+            critical_collection_error = False
             base_url = coll_info['url']
             m_fid = re.search(r'f=(\d+)', base_url)
             forum_id = m_fid.group(1) if m_fid else collection
@@ -2030,15 +2087,21 @@ def main():
                     html = raw.decode('cp1251', errors='replace')
                     page_topics = parse_forum_page(html, collection=collection)
                     if page_topics:
+                        if page == 0:
+                            page1_ok = True
                         os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
                         with open(listing_cache_path, 'wb') as f:
                             f.write(raw)
                 except Exception as e:
+                    listing_errors += 1
                     if listing_cache_is_valid(listing_cache_path):
                         with open(listing_cache_path, 'rb') as f:
                             raw = f.read()
                         html = raw.decode('cp1251', errors='replace')
                         page_topics = parse_forum_page(html, collection=collection)
+                        if page == 0 and page_topics:
+                            page1_ok = True
+                            page1_used_cache = True
                         print(f"ошибка: {e}; используем кеш", end=' ', flush=True)
                     else:
                         print(f"ошибка: {e}; свежего кеша нет")
@@ -2052,6 +2115,9 @@ def main():
                 time.sleep(0.5)
 
             print(f"\nВсего найдено тем: {len(all_topics)}")
+            if refresh and (not page1_ok or not all_topics):
+                print("  КРИТИЧНО: первая страница коллекции не получена; refresh коллекции невалиден")
+                critical_collection_error = True
 
             if limit and len(all_topics) > limit:
                 all_topics = all_topics[:limit]
@@ -2059,6 +2125,18 @@ def main():
 
             if not all_topics:
                 print("  Новых тем нет для этой коллекции")
+                collection_summaries.append({
+                    'collection': collection,
+                    'status': 'failed' if critical_collection_error else 'ok',
+                    'listing_errors': listing_errors,
+                    'fresh': 0,
+                    'new': 0,
+                    'magnet_ok': 0,
+                    'magnet_failed': 0,
+                    'page1_cache': page1_used_cache,
+                })
+                if critical_collection_error:
+                    refresh_failed = True
                 continue
 
             print("2. Слияние с кешем...")
@@ -2086,16 +2164,34 @@ def main():
             need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
             if need_fetch:
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} новых тем...")
-                fetch_magnets(need_fetch)
+                magnet_stats = fetch_magnets(need_fetch)
                 for t in need_fetch:
                     if is_forbidden_topic(t):
                         sanitize_topic(t)
                         print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
+            else:
+                magnet_stats = {'total': 0, 'ok': 0, 'failed': 0}
+
+            if magnet_stats['total'] and magnet_stats['failed'] / max(magnet_stats['total'], 1) > 0.5:
+                print("  КРИТИЧНО: больше 50% новых тем не получили magnet; refresh коллекции невалиден")
+                critical_collection_error = True
 
             topics = clean_catalog_topics(merged)
             topic_ids = {t.get('topic_id') for t in topics}
             all_new_topics.extend(t for t in new_current if t.get('topic_id') in topic_ids)
             save_json(TORRENTS_CACHE, topics)
+            if critical_collection_error:
+                refresh_failed = True
+            collection_summaries.append({
+                'collection': collection,
+                'status': 'failed' if critical_collection_error else 'ok',
+                'listing_errors': listing_errors,
+                'fresh': len(all_topics),
+                'new': len(new_current),
+                'magnet_ok': magnet_stats['ok'],
+                'magnet_failed': magnet_stats['failed'],
+                'page1_cache': page1_used_cache,
+            })
 
         # Enrich all new topics across all collections in one batch
         if all_new_topics:
@@ -2194,6 +2290,24 @@ def main():
     atomic_write_text(OUTPUT_FILE, output)
     print(f"Готово: {OUTPUT_FILE}")
     print(f"\nЗапусти: python stream_server.py")
+    if collection_summaries:
+        print("\nИтог refresh по коллекциям:")
+        for s in collection_summaries:
+            cache_note = ", page1 cache" if s.get('page1_cache') else ""
+            print(
+                f"  {s['collection']}: {s['status']}, "
+                f"listing errors={s['listing_errors']}, fresh={s['fresh']}, new={s['new']}, "
+                f"magnet ok={s['magnet_ok']}, magnet failed={s['magnet_failed']}{cache_note}"
+            )
+    if refresh_failed:
+        if refresh:
+            print("Откат данных к состоянию до refresh...")
+            topics = original_topics_snapshot
+            save_json(TORRENTS_CACHE, topics)
+            output = generate_html(topics, hidden_ids=load_hidden_topic_ids())
+            atomic_write_text(OUTPUT_FILE, output)
+        print("\nREFRESH_FAILED: есть критические ошибки, staging нельзя публиковать")
+        sys.exit(2)
 
 
 if __name__ == '__main__':

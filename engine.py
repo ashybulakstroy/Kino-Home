@@ -46,10 +46,10 @@ PIECE_PRIORITY_HIGH = 7
 PIECE_PRIORITY_LOW = 1
 HIGH_PRIORITY_COUNT = 2
 READY_START_PIECES = 4
-READY_MIN_PROGRESS = 0.03
+READY_MIN_PROGRESS = 0.02
 READY_SPEED_FACTOR = 1.3
 READY_MIN_BUFFER_SECONDS = 90
-READY_MIN_BUFFER_BYTES = 64 * 1024 * 1024
+READY_MIN_BUFFER_BYTES = 32 * 1024 * 1024
 READY_MAX_BUFFER_BYTES = 256 * 1024 * 1024
 READY_SPEED_FALLBACK_BYTES = 2 * 1024 * 1024
 MIN_PLAUSIBLE_BITRATE = 128 * 1024
@@ -68,7 +68,7 @@ class TorrentEngine:
             'enable_upnp': True,
             'enable_natpmp': True,
             'dht_bootstrap_nodes': 'dht.transmissionbt.com:6881',
-            'alert_mask': lt.alert.category_t.error_notification,
+            'alert_mask': lt.alert_category.error,
         }
         self.ses.apply_settings(settings)
         self.handles: dict[str, lt.torrent_handle] = {}

@@ -18,6 +18,38 @@ import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
 
 
+class _TimestampedStream:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self._line_start = True
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        if not text:
+            return 0
+        with self._lock:
+            for part in text.splitlines(True):
+                if self._line_start and part.strip():
+                    self.wrapped.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} | ')
+                self.wrapped.write(part)
+                self._line_start = part.endswith('\n')
+            self.wrapped.flush()
+        return len(text)
+
+    def flush(self):
+        self.wrapped.flush()
+
+    def isatty(self):
+        return self.wrapped.isatty()
+
+
+def _install_timestamped_logs():
+    if not isinstance(sys.stdout, _TimestampedStream):
+        sys.stdout = _TimestampedStream(sys.stdout)
+    if not isinstance(sys.stderr, _TimestampedStream):
+        sys.stderr = _TimestampedStream(sys.stderr)
+
+
 class _LazyEngine:
     _engine = None
     _lock = threading.Lock()
@@ -348,6 +380,8 @@ ENRICH_QUEUE: list[str] = []
 def _enrich_worker():
     while True:
         time.sleep(1)
+        if _daily_refresh_lock.locked():
+            continue
         topic_id = None
         with _enrich_lock:
             if ENRICH_QUEUE:
@@ -386,6 +420,9 @@ def _ensure_enrich_worker():
 
 
 def _enrich_missing(force: bool = False):
+    if _daily_refresh_lock.locked():
+        print('  [enrich] пропуск: refresh выполняется')
+        return
     data_path = DATA_DIR / 'torrents_data.json'
     if not data_path.exists():
         return
@@ -449,7 +486,10 @@ def _enrich_missing(force: bool = False):
 def _periodic_enrich():
     print(f'Автообогащение запущено, интервал {ENRICH_INTERVAL_MINUTES} мин')
     while True:
-        _enrich_missing()
+        if _daily_refresh_lock.locked():
+            print('  [enrich] пропуск: refresh выполняется')
+        else:
+            _enrich_missing()
         time.sleep(ENRICH_INTERVAL_MINUTES * 60)
 
 
@@ -1415,7 +1455,7 @@ def _get_movies():
         return []
     data = json.loads(p.read_text('utf-8'))
     hidden = gp.load_hidden_topic_ids()
-    return [m for m in data if not m.get('_sanitized') and str(m.get('topic_id', '')) not in hidden]
+    return [m for m in data if not m.get('_sanitized') and m.get('magnet') != '0' and str(m.get('topic_id', '')) not in hidden]
 
 
 BROWSE_CSS = '''
@@ -2239,6 +2279,7 @@ document.getElementById('root').addEventListener('click',e=>{{const h=e.target.c
 
 if __name__ == '__main__':
     import webbrowser
+    _install_timestamped_logs()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else SERVER_PORT
     print(f'LocaL-Kino server: http://localhost:{port}')
     print(f'Test with: http://localhost:{port}/player.html')
@@ -2263,6 +2304,7 @@ if __name__ == '__main__':
         else:
             print(f'Старых тем старше {TOPIC_MAX_AGE_DAYS} дней нет.')
         _run_daily_refresh_if_due('startup')
+        _ensure_periodic_enrich()
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
@@ -2270,7 +2312,6 @@ if __name__ == '__main__':
     webbrowser.open(f'http://localhost:{port}')
     _ensure_session_monitor()
     _ensure_enrich_worker()
-    _ensure_periodic_enrich()
     _ensure_daily_refresh_loop()
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
