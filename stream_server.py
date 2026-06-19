@@ -9,10 +9,11 @@ import socket
 import threading
 import subprocess
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -152,10 +153,12 @@ def _publish_staging_refresh(staging_dir):
                 os.replace(src, dst)
 
 
-def _run_refresh_process(collection=None):
+def _run_refresh_process(collection=None, fast=False):
     env = os.environ.copy()
     env['LOCAL_KINO_DATA_DIR'] = str(REFRESH_STAGING_DIR)
     args = [sys.executable, 'generate_page.py', '--refresh']
+    if fast:
+        args.append('--fast')
     if collection:
         args.append(f'--collection={collection}')
     return subprocess.Popen(
@@ -174,7 +177,7 @@ def _run_all_collections_refresh():
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
     for collection in gp.COLLECTIONS:
         print(f'Автообновление: коллекция {collection}')
-        proc = _run_refresh_process(collection)
+        proc = _run_refresh_process(collection, fast=True)
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end='')
@@ -184,13 +187,13 @@ def _run_all_collections_refresh():
     return 0
 
 
-def _iter_collections_refresh_output(collections=None):
+def _iter_collections_refresh_output(collections=None, fast=False):
     if collections is None:
         collections = gp.COLLECTIONS.keys()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
     for collection in collections:
         yield f'Автообновление: коллекция {collection}\n'
-        proc = _run_refresh_process(collection)
+        proc = _run_refresh_process(collection, fast=fast)
         assert proc.stdout is not None
         for line in proc.stdout:
             yield line
@@ -415,8 +418,44 @@ def _enrich_worker():
 
 
 def _ensure_enrich_worker():
-    t = threading.Thread(target=_enrich_worker, daemon=True)
-    t.start()
+    for i in range(WORKER_COUNT):
+        t = threading.Thread(target=_enrich_worker, name=f'enrich-worker-{i + 1}', daemon=True)
+        t.start()
+
+
+def _topic_enrich_needs(topic):
+    poster_due = (
+        not gp.has_real_poster(topic)
+        and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
+    )
+    rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
+    trailer_due = not topic.get('youtube_url')
+    core_due = (
+        not topic.get('magnet')
+        or topic.get('_magnet_failed')
+        or poster_due
+        or rating_due
+        or not topic.get('format')
+    )
+    return {
+        'poster': poster_due,
+        'rating': rating_due,
+        'trailer': trailer_due,
+        'core': core_due,
+        'any': core_due or trailer_due,
+    }
+
+
+def _enrich_priority(topic, needs):
+    trailer_only = needs['trailer'] and not needs['core']
+    return (
+        1 if trailer_only else 0,
+        0 if needs['poster'] else 1,
+        0 if needs['rating'] else 1,
+        0 if (not topic.get('magnet') or topic.get('_magnet_failed')) else 1,
+        0 if not topic.get('format') else 1,
+        int(topic.get('listing_order') or 999),
+    )
 
 
 def _enrich_missing(force: bool = False):
@@ -429,52 +468,59 @@ def _enrich_missing(force: bool = False):
     try:
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
-            changed = False
-            cleaned_topics = gp.clean_catalog_topics(topics)
-            if len(cleaned_topics) != len(topics):
-                topics = cleaned_topics
-                changed = True
-            MAX_RETRIES = 3
-            for topic in topics:
-                poster_due = (
-                    not gp.has_real_poster(topic)
-                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
-                )
-                rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
-                need = (not topic.get('magnet') or topic.get('_magnet_failed')
-                        or poster_due
-                        or rating_due
-                        or not topic.get('youtube_url')
-                        or not topic.get('format'))
-                if not need:
-                    if topic.get('_enrich_retries'):
-                        topic.pop('_enrich_retries', None)
-                        changed = True
-                    continue
-                retries = topic.get('_enrich_retries', 0)
-                if not force and retries >= MAX_RETRIES and not poster_due:
-                    continue
-                title = topic.get('movie_title') or topic.get('title', '?')
-                print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
-                topic['_enrich_retries'] = retries + 1
-                gp.enrich_topic(topic, force_poster_retry=force)
-                changed = True
-                poster_still_due = (
-                    not gp.has_real_poster(topic)
-                    and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
-                )
-                rating_still_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
-                still_missing = (not topic.get('magnet') or topic.get('_magnet_failed')
-                                 or poster_still_due
-                                 or rating_still_due
-                                 or not topic.get('youtube_url')
-                                 or not topic.get('format'))
-                if not still_missing:
+
+        changed = False
+        cleaned_topics = gp.clean_catalog_topics(topics)
+        if len(cleaned_topics) != len(topics):
+            topics = cleaned_topics
+            changed = True
+
+        MAX_RETRIES = 3
+        tasks = []
+        for idx, topic in enumerate(topics):
+            needs = _topic_enrich_needs(topic)
+            if not needs['any']:
+                if topic.get('_enrich_retries'):
                     topic.pop('_enrich_retries', None)
-                    print(f'    -> OK')
-                else:
-                    print(f'    -> ещё не все данные')
-            if changed:
+                    changed = True
+                continue
+            retries = topic.get('_enrich_retries', 0)
+            if not force and retries >= MAX_RETRIES and not needs['poster']:
+                continue
+            tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
+
+        tasks.sort(key=lambda item: item[0])
+        if tasks:
+            print(f'  [enrich] задач: {len(tasks)}, воркеров: {WORKER_COUNT}')
+
+        def process_task(item):
+            _priority, idx, needs, retries = item
+            topic = topics[idx]
+            title = topic.get('movie_title') or topic.get('title', '?')
+            include_trailer = bool(needs['trailer'] and not needs['core'])
+            print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
+            topic['_enrich_retries'] = retries + 1
+            gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
+            still = _topic_enrich_needs(topic)
+            if not still['any']:
+                topic.pop('_enrich_retries', None)
+                return topic.get('topic_id'), 'OK'
+            return topic.get('topic_id'), 'ещё не все данные'
+
+        if tasks:
+            with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(tasks))) as executor:
+                future_map = {executor.submit(process_task, item): item for item in tasks}
+                for future in as_completed(future_map):
+                    changed = True
+                    try:
+                        topic_id, result = future.result()
+                    except Exception as e:
+                        topic_id = topics[future_map[future][1]].get('topic_id')
+                        result = f'ошибка: {e}'
+                    print(f'    [enrich] #{topic_id} -> {result}')
+
+        if changed:
+            with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
                 atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
@@ -1259,6 +1305,11 @@ def stop_session():
     data = request.get_json(silent=True) or {}
     sid = data.get('sid') or request.form.get('sid')
     hash = data.get('hash') or request.form.get('hash')
+    if PUBLIC_MODE:
+        if not sid and not hash:
+            return jsonify(error='session or hash required'), 400
+        if not sid and hash:
+            sid = f'{request.remote_addr or "local"}:{hash}'
     _stop_stream_session(str(sid) if sid else None)
     if hash:
         if not sid:
@@ -1346,6 +1397,7 @@ def index():
 def refresh():
     _reject_public_admin()
     collection = (request.args.get('collection') or '').strip()
+    fast = (request.args.get('fast') or '').strip().lower() in ('1', 'true', 'yes', 'on')
     if collection and collection not in gp.COLLECTIONS:
         return Response(
             '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head>'
@@ -1359,9 +1411,10 @@ def refresh():
             yield '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head><body><h2>Обновление уже выполняется</h2><p><a href="/">Назад</a></p></body></html>'
             return
         label = gp.COLLECTIONS[collection]['name'] if collection else 'все коллекции'
-        yield f'<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head><body><h2>Обновляю: {label}</h2><pre>'
+        mode = 'быстрый refresh' if fast else 'полный refresh'
+        yield f'<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>Обновление</title></head><body><h2>Обновляю: {label} ({mode})</h2><pre>'
         try:
-            refresh_output = _iter_collections_refresh_output([collection] if collection else None)
+            refresh_output = _iter_collections_refresh_output([collection] if collection else None, fast=fast)
             code = 0
             while True:
                 try:

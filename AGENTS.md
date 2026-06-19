@@ -18,14 +18,18 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 
 Если был добавлен или изменён код, нельзя сообщать о готовности, пока не сделан смоук-тест именно затронутого сценария и не получено доказательство, что поведение работает как требовалось. В отчёте нужно кратко указать, чем именно проверено.
 
+## Снапшоты
+
+Папка для снапшотов проекта: `C:\Backup\Work\`.
+
 ## Команды
 
 | Команда | Назначение |
 |---------|------------|
 | `python generate_page.py` | Сгенерировать `index-kino.html` из кеша |
 | `python generate_page.py --refresh` | Обновить все коллекции |
+| `python generate_page.py --refresh --fast` | Быстрый refresh без тяжёлого обогащения рейтингов/трейлеров |
 | `python generate_page.py --refresh --quick` | Быстрый refresh первой страницы |
-| `python generate_page.py --refresh --pages 3` | Refresh первых 3 страниц |
 | `python generate_page.py --refresh --collection=kino_sng` | Обновить одну коллекцию |
 | `python generate_page.py --refresh --collection=kino_sng --limit 10` | Добавить до 10 новых тем из одной коллекции |
 | `python generate_page.py --collection=kino_sng` | Сгенерировать HTML из кеша одной коллекции |
@@ -93,6 +97,10 @@ Pipeline при `--refresh`:
 5. Дальше сервер повторяет проверку примерно каждые 12 часов.
 
 Чтобы сервис работал во время обновления, refresh выполняется через staging-папку `data/staging_refresh`, после чего готовые файлы переносятся в основную `data/`.
+
+Серверный авто-refresh запускается в быстром режиме `--fast`: новые темы получают magnet/poster, а тяжёлое обогащение рейтингов, трейлеров и дополнительных постеров пропускается. Полное обогащение запускается ручным `python generate_page.py --refresh` или админским `/refresh`.
+
+Параллельные сетевые операции используют общий параметр `.env` `WORKER_COUNT` (сейчас `8`): загрузка magnet/poster, ручная очередь enrich и фоновый enrich должны брать одно и то же значение.
 
 ## Public Mode
 

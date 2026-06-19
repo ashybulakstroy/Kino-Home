@@ -24,8 +24,8 @@ http://localhost:14876
 |---------|------------|
 | `python generate_page.py` | Сгенерировать HTML из кеша |
 | `python generate_page.py --refresh` | Обновить все коллекции |
+| `python generate_page.py --refresh --fast` | Быстро обновить каталог без тяжёлого обогащения |
 | `python generate_page.py --refresh --quick` | Быстро обновить первую страницу |
-| `python generate_page.py --refresh --pages 3` | Обновить первые 3 страницы |
 | `python generate_page.py --refresh --collection=kino_sng` | Обновить одну коллекцию |
 | `python generate_page.py --refresh --collection=kino_sng --limit 10` | Взять до 10 новых тем из коллекции |
 | `python generate_page.py --collection=kino_sng` | Сгенерировать HTML по кешу одной коллекции |
@@ -57,6 +57,10 @@ http://localhost:14876
 Метка содержит только дату без времени. После успешного refresh сервер обновляет эту метку.
 
 Чтобы веб-сервис продолжал работать во время обновления, refresh использует staging-каталог `data/staging_refresh`, а затем переносит готовые данные в основную папку.
+
+Автообновление сервера запускает быстрый refresh (`--fast`): новые темы добавляются с magnet/poster, а рейтинги, трейлеры и дополнительные постеры можно догнать полным ручным refresh.
+
+Параллельные сетевые операции используют общий параметр `.env` `WORKER_COUNT` (в проекте `8`): он применяется к загрузке magnet/poster и фоновому enrich.
 
 Кеш страниц форума (`data/topic_cache/f*_p*.html`) используется только как fallback при ошибке сети. При refresh сервис сначала пытается скачать свежий listing с rutracker. Максимальный возраст fallback-кеша задаёт `.env` параметр `LISTING_CACHE_MAX_AGE_DAYS`, по умолчанию `1`.
 

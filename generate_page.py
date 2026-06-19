@@ -8,13 +8,14 @@ import re
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html import escape, unescape
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import LISTING_CACHE_MAX_AGE_DAYS
+from config import LISTING_CACHE_MAX_AGE_DAYS, WORKER_COUNT
 from project_io import atomic_write_json, atomic_write_text
 
 COLLECTIONS = {
@@ -1624,39 +1625,51 @@ def fetch_magnets(topics):
     total = len(topics)
     ok_count = 0
     fail_count = 0
-    for i, t in enumerate(topics, 1):
+
+    def fetch_one(t):
         if t.get('magnet') and has_real_poster(t):
-            ok_count += 1
-            continue
+            return 'ok', 'уже есть'
         if t.get('_magnet_failed'):
-            fail_count += 1
-            continue
-        print(f"  [{i}/{total}] Загрузка магнета t={t['topic_id']}...", end=' ', flush=True)
+            return 'failed', 'ранее не удалось'
         try:
             html = get_topic_html(t['topic_id'], t['topic_url'], timeout=10)
             if html is None:
                 raise RuntimeError('fetch failed')
             data = parse_topic_for_magnet(html)
             t['magnet'] = data['magnet']
+            parts = []
             if data['magnet']:
-                ok_count += 1
-                print("OK", end='')
+                status = 'ok'
+                parts.append('OK')
                 if data.get('poster') and not has_real_poster(t):
                     if set_local_poster_from_url(t, data['poster']):
-                        print(", постер ✓", end='')
+                        parts.append('постер ✓')
             else:
-                fail_count += 1
-                print("нет магнета", end='')
+                status = 'failed'
+                parts.append('нет магнета')
             if data.get('imdb') and not t.get('imdb_id'):
                 t['imdb_id'] = data['imdb']
             if data.get('format') and not t.get('format'):
                 t['format'] = data['format']
+            return status, ', '.join(parts)
         except Exception as e:
-            print(f"ошибка: {e}", end='')
             t['_magnet_failed'] = True
-            fail_count += 1
-        print()
-        time.sleep(1.5)
+            return 'failed', f"ошибка: {e}"
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, max(total, 1))) as executor:
+        future_map = {executor.submit(fetch_one, t): (i, t) for i, t in enumerate(topics, 1)}
+        for future in as_completed(future_map):
+            i, t = future_map[future]
+            try:
+                status, message = future.result()
+            except Exception as e:
+                t['_magnet_failed'] = True
+                status, message = 'failed', f"ошибка: {e}"
+            if status == 'ok':
+                ok_count += 1
+            else:
+                fail_count += 1
+            print(f"  [{i}/{total}] Загрузка магнета t={t['topic_id']}... {message}", flush=True)
     return {'total': total, 'ok': ok_count, 'failed': fail_count}
 
 
@@ -2096,7 +2109,7 @@ async function enrich(el){{var tid=el.getAttribute('data-tid');if(!tid)return;el
     return html
 
 
-def enrich_topic(topic, force_poster_retry=False):
+def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     """Enrich a single topic dict with missing data (poster, magnet, ratings, trailers)."""
     if topic.get('_sanitized') or topic.get('imdb_id') == '0':
         return topic
@@ -2184,7 +2197,7 @@ def enrich_topic(topic, force_poster_retry=False):
     if not has_real_poster(topic) and retry_poster:
         mark_poster_failed(topic)
 
-    if not topic.get('youtube_url'):
+    if include_trailer and not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
         cached_url = yt_cache.get(cache_key)
         if cached_url and _validate_youtube_url(cached_url, title, year):
@@ -2228,8 +2241,7 @@ def remove_hidden_topic(topic_id: str):
 def main():
     refresh = '--refresh' in sys.argv
     quick = '--quick' in sys.argv
-    pages_flag = False
-    pages_count = 1
+    fast = '--fast' in sys.argv
     topics_limit = MAX_TOPICS
     collection_arg = None
     refresh_failed = False
@@ -2245,32 +2257,17 @@ def main():
             idx = sys.argv.index(arg)
             if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--'):
                 limit = int(sys.argv[idx + 1])
-        elif arg.startswith('--pages='):
-            pages_count = int(arg.split('=')[1])
-            pages_flag = True
-            topics_limit = 0
-        elif arg == '--pages' and not pages_flag:
-            idx = sys.argv.index(arg)
-            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('--'):
-                pages_count = int(sys.argv[idx + 1])
-                pages_flag = True
-                topics_limit = 0
 
     if collection_arg and collection_arg not in COLLECTIONS:
         print(f"Неизвестная коллекция '{collection_arg}'. Доступны: {', '.join(COLLECTIONS.keys())}")
         sys.exit(1)
 
     if refresh:
-        if pages_flag and pages_count != 1:
-            print("  --pages игнорируется: refresh использует только первую страницу коллекции")
-        pages_count = 1
         topics_limit = MAX_TOPICS
 
     if quick:
-        pages_count = 1
         topics_limit = 0
     if refresh:
-        pages_count = 1
         topics_limit = MAX_TOPICS
 
     # Determine which collections to process
@@ -2335,7 +2332,7 @@ def main():
             base_url = coll_info['url']
             m_fid = re.search(r'f=(\d+)', base_url)
             forum_id = m_fid.group(1) if m_fid else collection
-            for page in range(pages_count):
+            for page in range(1):
                 start = page * PAGE_SIZE
                 url = base_url if start == 0 else f"{base_url}&start={start}"
                 listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
@@ -2472,7 +2469,9 @@ def main():
             })
 
         # Enrich all new topics across all collections in one batch
-        if all_new_topics:
+        if fast and all_new_topics:
+            print(f"\nБыстрый refresh: обогащение {len(all_new_topics)} новых тем пропущено")
+        elif all_new_topics:
             print(f"\n{'='*60}")
             print("Обогащение новых тем за все коллекции")
             print(f"{'='*60}")
@@ -2540,19 +2539,22 @@ def main():
         else:
             print("  ОК")
 
-        print("\n10. Кинопоиск постеры (для всех)...")
-        kp_count = 0
-        for t in topics:
-            if not has_real_poster(t) and t.get('kp_id'):
-                kp_local = download_kinopoisk_poster(t['kp_id'])
-                if kp_local:
-                    t['poster_url'] = kp_local
-                    kp_count += 1
-                    print(f"  {t.get('movie_title','')}: KP постер ✓")
-        if kp_count:
-            print(f"  Загружено: {kp_count}")
+        if fast:
+            print("\n10. Быстрый refresh: проход Кинопоиск постеров для всех тем пропущен")
         else:
-            print("  Нет нуждающихся")
+            print("\n10. Кинопоиск постеры (для всех)...")
+            kp_count = 0
+            for t in topics:
+                if not has_real_poster(t) and t.get('kp_id'):
+                    kp_local = download_kinopoisk_poster(t['kp_id'])
+                    if kp_local:
+                        t['poster_url'] = kp_local
+                        kp_count += 1
+                        print(f"  {t.get('movie_title','')}: KP постер ✓")
+            if kp_count:
+                print(f"  Загружено: {kp_count}")
+            else:
+                print("  Нет нуждающихся")
 
         coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
         topics.sort(key=lambda t: (coll_order.get(t.get('collection', ''), 999), t.get('listing_order', 999)))
