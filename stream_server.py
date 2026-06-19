@@ -9,14 +9,19 @@ import socket
 import threading
 import subprocess
 import shutil
+import atexit
+from typing import TextIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
+
+
+_LOG_FILE: TextIO | None = None
 
 
 class _TimestampedStream:
@@ -31,24 +36,46 @@ class _TimestampedStream:
         with self._lock:
             for part in text.splitlines(True):
                 if self._line_start and part.strip():
-                    self.wrapped.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} | ')
+                    ts = f'{datetime.now():%Y-%m-%d %H:%M:%S} | '
+                    self.wrapped.write(ts)
+                    if _LOG_FILE:
+                        _LOG_FILE.write(ts)
                 self.wrapped.write(part)
+                if _LOG_FILE:
+                    _LOG_FILE.write(part)
                 self._line_start = part.endswith('\n')
             self.wrapped.flush()
+            if _LOG_FILE:
+                _LOG_FILE.flush()
         return len(text)
 
     def flush(self):
         self.wrapped.flush()
+        if _LOG_FILE:
+            _LOG_FILE.flush()
 
     def isatty(self):
         return self.wrapped.isatty()
 
 
-def _install_timestamped_logs():
+def _install_timestamped_logs(log_file: str | None = None):
+    global _LOG_FILE
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        _LOG_FILE = open(log_file, 'a', encoding='utf-8')
+        atexit.register(_close_log_file)
     if not isinstance(sys.stdout, _TimestampedStream):
         sys.stdout = _TimestampedStream(sys.stdout)
     if not isinstance(sys.stderr, _TimestampedStream):
         sys.stderr = _TimestampedStream(sys.stderr)
+
+
+def _close_log_file():
+    global _LOG_FILE
+    if _LOG_FILE:
+        _LOG_FILE.flush()
+        _LOG_FILE.close()
+        _LOG_FILE = None
 
 
 class _LazyEngine:
@@ -304,7 +331,8 @@ def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
             elif topic_date < cutoff:
                 collection_info = gp.COLLECTIONS.get(collection, {})
                 age_cleanup = bool(collection_info.get('age_cleanup', False))
-                if age_cleanup and collection_counts.get(collection, 0) > gp.MAX_TOPICS:
+                coll_max = collection_info.get('max_topics', gp.MAX_TOPICS)
+                if age_cleanup and collection_counts.get(collection, 0) > coll_max:
                     removed.append(topic)
                     collection_counts[collection] -= 1
                 else:
@@ -428,21 +456,40 @@ def _topic_enrich_needs(topic):
         not gp.has_real_poster(topic)
         and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
     )
-    rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
+    imdb_id = topic.get('imdb_id')
+    genre_due = bool(imdb_id) and (
+        not topic.get('genre') or gp.is_listing_category_genre(topic.get('genre'))
+    )
+    rating_due = (
+        (not topic.get('kp_rating') and not topic.get('imdb_rating'))
+        or (bool(imdb_id) and not topic.get('imdb_rating'))
+    )
     trailer_due = not topic.get('youtube_url')
+    kp_due = (
+        bool(topic.get('topic_id', '').startswith('pb_'))
+        and (
+            (bool(topic.get('kp_id')) and not topic.get('_kp_validated'))
+            or (not topic.get('kp_id') and topic.get('_kp_validated') and not topic.get('_kp_retried'))
+        )
+    )
     core_due = (
         not topic.get('magnet')
         or topic.get('_magnet_failed')
         or poster_due
         or rating_due
+        or genre_due
+        or kp_due
         or not topic.get('format')
     )
     return {
         'poster': poster_due,
         'rating': rating_due,
+        'genre': genre_due,
         'trailer': trailer_due,
+        'kp': kp_due,
         'core': core_due,
         'any': core_due or trailer_due,
+        'format_missing': not topic.get('format'),
     }
 
 
@@ -452,6 +499,7 @@ def _enrich_priority(topic, needs):
         1 if trailer_only else 0,
         0 if needs['poster'] else 1,
         0 if needs['rating'] else 1,
+        0 if needs.get('genre') else 1,
         0 if (not topic.get('magnet') or topic.get('_magnet_failed')) else 1,
         0 if not topic.get('format') else 1,
         int(topic.get('listing_order') or 999),
@@ -475,7 +523,6 @@ def _enrich_missing(force: bool = False):
             topics = cleaned_topics
             changed = True
 
-        MAX_RETRIES = 3
         tasks = []
         for idx, topic in enumerate(topics):
             needs = _topic_enrich_needs(topic)
@@ -485,7 +532,7 @@ def _enrich_missing(force: bool = False):
                     changed = True
                 continue
             retries = topic.get('_enrich_retries', 0)
-            if not force and retries >= MAX_RETRIES and not needs['poster']:
+            if not force and retries >= MAX_ENRICH_RETRIES and needs['core']:
                 continue
             tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
 
@@ -502,7 +549,7 @@ def _enrich_missing(force: bool = False):
             topic['_enrich_retries'] = retries + 1
             gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
             still = _topic_enrich_needs(topic)
-            if not still['any']:
+            if not still['core']:
                 topic.pop('_enrich_retries', None)
                 return topic.get('topic_id'), 'OK'
             return topic.get('topic_id'), 'ещё не все данные'
@@ -540,7 +587,9 @@ def _sync_listing_order(cache_only: bool = False):
             topics = json.loads(data_path.read_text('utf-8'))
         changed = False
         from generate_page import COLLECTIONS, sync_listing_order_for_collection
-        for coll in COLLECTIONS:
+        for coll, info in COLLECTIONS.items():
+            if info.get('source', 'rutracker') != 'rutracker':
+                continue
             order_map = sync_listing_order_for_collection(coll, cache_only=cache_only)
             if not order_map:
                 continue
@@ -2389,7 +2438,9 @@ document.getElementById('root').addEventListener('click',e=>{{const h=e.target.c
 
 if __name__ == '__main__':
     import webbrowser
-    _install_timestamped_logs()
+    log_path = str(DATA_DIR / '..' / 'logs' / 'server.log')
+    _install_timestamped_logs(log_file=log_path)
+    print(f'Лог-файл: {os.path.realpath(log_path)}')
     port = int(sys.argv[1]) if len(sys.argv) > 1 else SERVER_PORT
     print(f'LocaL-Kino server: http://localhost:{port}')
     print(f'Test with: http://localhost:{port}/player.html')

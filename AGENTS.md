@@ -56,6 +56,7 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 | `kino_sng` | Фильмы ближнего зарубежья | `https://rutracker.net/forum/viewforum.php?f=2540` |
 | `novinki_2026` | Новинки 2026 | `https://rutracker.net/forum/viewforum.php?f=252` |
 | `kino_sng_hd` | Фильмы Ближнего Зарубежья (HD Video) | `https://rutracker.net/forum/viewforum.php?f=1247` |
+| `piratebay_top` | World TOP | `https://1.piratebays.to/top/207` |
 
 `MAX_TOPICS=30` — лимит пополнения коллекции за один refresh. Это не жёсткий лимит размера коллекции. Если в коллекции уже больше 30 тем, они остаются валидными, пока не удалены housekeeping.
 
@@ -67,6 +68,8 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 
 1. Читать `viewforum.php` и брать список тем.
 2. Открывать `viewtopic.php?t=XXXXX`, извлекать magnet, постер, дату регистрации темы и дополнительные признаки.
+
+Коллекция `piratebay_top` использует отдельный одноуровневый парсер Pirate Bay: magnet берётся сразу из listing, `topic_id` формируется как `pb_<btih>`, постеры и рейтинги догоняются обычным enrich.
 
 Refresh должен сливать новые темы с существующим кешем, а не обрезать коллекцию до последних 30. Если новых тем нет, тяжёлое обогащение можно пропускать.
 
@@ -183,6 +186,50 @@ data/posters/placeholder.png
 `engine.py` отвечает за libtorrent и приоритеты загрузки. `stream_server.py` отдаёт видео и может использовать ffmpeg/ffprobe для проверки и транскодинга.
 
 Если пользователь выбирает файл, который плохо подходит для live-просмотра, сервер может искать более подходящую раздачу того же фильма по нормализованному названию, году, коллекции, magnet, размеру и количеству сидов. Пользовательское сообщение должно быть простым: найден быстрый способ live-просмотра, без технического перечисления контейнеров.
+
+## Известные баги и фиксы
+
+### has_real_poster — проверка соответствия IMDB
+
+`generate_page.py:has_real_poster()` проверял только существование файла. Если у темы менялся `imdb_id` (например, PirateBay detail-страница дала правильный ID), а `poster_url` указывал на старый `ttXXXXXXX.jpg`, то `has_real_poster` возвращал True и enrich не перекачивал постер.
+
+**Фикс**: если `poster_url` содержит `ttXXXXXXX` — проверять, что этот ID совпадает с текущим `imdb_id` темы.
+
+```python
+imdb_id = topic.get('imdb_id', '')
+if imdb_id and re.search(r'/tt\d+', poster_url):
+    m = re.search(r'tt(\d+)', poster_url)
+    if m and m.group(0) != imdb_id:
+        return False
+```
+
+### enrich_topic — fetch_imdb_rating не вызывался при listing-category genre
+
+`generate_page.py:2446`: условие было `(needs_genre and not topic.get('genre')) or not topic.get('imdb_rating')`. Когда жанр — категория листинга (не пустая, но бесполезная, например "спорт" с PirateBay), `not topic.get('genre')` давал False, и `fetch_imdb_rating` не вызывался. IMDB-постер (из `og:image`) не скачивался.
+
+**Фикс**: `if needs_genre or not topic.get('imdb_rating'):`
+
+### KP cache poisoning — search_kinopoisk возвращал неправильные ID
+
+`search_kinopoisk()` принимал `title` как есть — с тех-мусором из PirateBay (BONE, DDP5.1, WEB-DL, x265...). Кинопоиск не находил такой запрос и возвращал первый случайный фильм. Результат кешировался в `kp_search_cache.json` и использовался для всех последующих запросов с тем же названием.
+
+**Симптомы**: у 30+ PirateBay-тем был одинаковый `kp_id=6606844` (фильм "Давление").
+
+**Фиксы**:
+
+1. `_clean_kp_search_title(title)` — удаляет технические маркеры из заголовка перед поиском: 1080p, 4K, WEB-DL, BONE, DDP5, x265, HEVC и т.д.
+
+2. `_kp_verify_result(title, year, rating_html)` — после получения KP ID проверяет `og:title` страницы фильма: год в скобках должен совпадать с искомым, хотя бы одно слово (длиннее 2 символов) из названия должно присутствовать. Если проверка не проходит — возвращает None, неправильный результат не кешируется.
+
+3. В `enrich_topic()` для PirateBay-тем (`pb_*`) принудительно перезапрашивается KP ID (даже если `kp_rating` уже установлен). Если KP ID изменился — очищается `poster_url` и `_poster_failed_at` для перекачки.
+
+4. В `stream_server.py:_topic_enrich_needs()` добавлен `kp_due` — PirateBay-темы с невалидным или отсутствующим KP ID после валидации включаются в enrich для повторной проверки.
+
+### _kp_validated / _kp_retried флаги
+
+Для PirateBay-тем после попытки найти KP ID устанавливается `_kp_validated = True`. Если KP ID не найден — дополнительно `_kp_retried = True`, и снимается `_poster_failed_at`, чтобы не блокировать скачку постера от других источников (IMDB).
+
+Без этого тема помечалась как "готовая" на 7 дней (`POSTER_RETRY_DAYS`), даже если улучшенный поиск мог бы найти правильный фильм.
 
 ## API endpoints
 

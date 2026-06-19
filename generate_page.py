@@ -23,6 +23,7 @@ COLLECTIONS = {
     'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False, 'skip_topics': 0},
     'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252',   'age_cleanup': True,  'skip_topics': 0},
     'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False, 'skip_topics': 0},
+    'piratebay_top':       {'name': 'World TOP',                       'url': 'https://1.piratebays.to/top/207', 'age_cleanup': True, 'source': 'piratebay', 'max_topics': 60},
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
@@ -140,6 +141,11 @@ COUNTRY_STOP = {'Россия', 'Украина', 'США', 'Великобри�
                 'Индия', 'Турция', 'Мексика', 'Бразилия', 'Аргентина'}
 HIDDEN_GENRES = {'ужасы', 'эротика', 'порно', 'для взрослых', 'взрослый',
                  'horror', 'erotica', 'porn', 'adult'}
+
+
+def is_listing_category_genre(genre):
+    genre = (genre or '').strip().lower()
+    return genre.startswith('video >') or genre in {'video', 'hd - movies', 'movies'}
 
 
 def fetch(url, timeout=30):
@@ -333,6 +339,61 @@ def clean_title(raw):
     return t, year
 
 
+def parse_piratebay_date(raw):
+    raw = (raw or '').strip()
+    now = datetime.now(timezone.utc)
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', raw)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            int(m.group(4)), int(m.group(5)), tzinfo=timezone.utc).strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            return now_text()
+    m = re.match(r'^(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', raw)
+    if m:
+        try:
+            return datetime(now.year, int(m.group(1)), int(m.group(2)),
+                            int(m.group(3)), int(m.group(4)), tzinfo=timezone.utc).strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            return now_text()
+    m = re.match(r'^(?:Today|Сегодня)\s+(\d{1,2}):(\d{2})', raw)
+    if m:
+        return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0).strftime('%Y-%m-%d %H:%M')
+    m = re.match(r'^(?:Y[- ]?day|Yesterday|Вчера)\s+(\d{1,2}):(\d{2})', raw)
+    if m:
+        return (now - timedelta(days=1)).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0).strftime('%Y-%m-%d %H:%M')
+    for unit, delta_arg in (('min|mins|minute|minutes', 'minutes'), ('hour|hours', 'hours'), ('day|days', 'days'), ('week|weeks', 'weeks')):
+        m = re.match(rf'(\d+)\s+({unit})', raw, re.I)
+        if m:
+            return (now - timedelta(**{delta_arg: int(m.group(1))})).strftime('%Y-%m-%d %H:%M')
+    return now_text()
+
+
+def info_hash_from_magnet(magnet):
+    m = re.search(r'btih:([A-Fa-f0-9]{40})', magnet or '')
+    return m.group(1).lower() if m else ''
+
+
+def detect_format_from_text(text):
+    text = (text or '').lower()
+    if 'mkv' in text or 'matroska' in text:
+        return 'MKV'
+    if 'mp4' in text or 'mpeg-4' in text:
+        return 'MP4'
+    if 'avi' in text or 'xvid' in text or 'divx' in text:
+        return 'AVI'
+    if 'webm' in text:
+        return 'WEBM'
+    if re.search(r'\bmpeg\b', text):
+        return 'MPEG'
+    return ''
+
+
+def parse_int_text(value):
+    digits = re.sub(r'[^\d]', '', str(value or ''))
+    return int(digits) if digits else 0
+
+
 def clean_title_deep(raw):
     t = raw.strip()
     t = re.sub(r'^[a-fA-F0-9]{32,40}\s+', '', t)
@@ -459,19 +520,23 @@ def _parse_imdb_result(item):
 
 def search_imdb_ids(topics):
     total = len(topics)
+    processed = 0
     imdb_cache = load_json(SEARCH_CACHE) or {}
-    for i, t in enumerate(topics, 1):
+    for t in topics:
+        if t.get('imdb_id'):
+            continue
         title = t.get('orig_title') or t['movie_title']
         year = t['movie_year']
         raw_name = t['title']
         if not title:
             continue
+        processed += 1
         cache_key = f"{title}|{year}".lower()
         result = None
         if cache_key in imdb_cache and imdb_cache[cache_key] is not None:
             result = imdb_cache[cache_key]
         else:
-            print(f"  [{i}/{total}] {title}...", end=' ', flush=True)
+            print(f"  [{processed}/{total}] {title}...", end=' ', flush=True)
             result = search_imdb(title, year)
             if result is None:
                 deep_cache_key = f"deep:{raw_name.lower().strip()}"
@@ -539,6 +604,40 @@ def fetch_imdb_rating(imdb_id):
 _kp_session_init = False
 
 
+_KP_TECH_WORDS = {
+    '1080p','720p','2160p','4k','hd','web','webrip','web-dl','bluray','bdrip',
+    'hdr','dts','ac3','aac','ddp','ddp5','ddp7','x264','x265','hevc','h264',
+    'h265','10bit','8bit','bone','repack','proper','internal','readnfo',
+    'vf1','vf2','vf3','vostfr','multi','subs','sub','eng','rus',
+}
+
+
+def _clean_kp_search_title(title):
+    title = re.sub(r'\b\d{4}\b', '', title)
+    pattern = r'\b(?:' + '|'.join(_KP_TECH_WORDS) + r')\b'
+    title = re.sub(pattern, '', title, flags=re.IGNORECASE)
+    title = re.sub(r'[\s,;:.!?\-]+', ' ', title).strip()
+    return title
+
+
+def _kp_verify_result(title, year, rating_html):
+    """Verify that the KP film page matches the search query."""
+    og_m = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', rating_html)
+    if not og_m:
+        return True
+    og_title = og_m.group(1)
+    if year:
+        y_m = re.search(r'\((\d{4})\)', og_title)
+        if y_m and y_m.group(1) != year:
+            return False
+    title_lower = title.lower().strip()
+    if title_lower and title_lower not in og_title.lower():
+        words = [w for w in re.split(r'[\s,;:.!?-]+', title_lower) if len(w) > 2]
+        if words and not any(w in og_title.lower() for w in words):
+            return False
+    return True
+
+
 def search_kinopoisk(title, year):
     global _kp_session_init
     if not title:
@@ -550,7 +649,8 @@ def search_kinopoisk(title, year):
             pass
         _kp_session_init = True
 
-    query = f"{title} {year}" if year else title
+    clean_title = _clean_kp_search_title(title)
+    query = f"{clean_title} {year}" if year else clean_title
     search_url = f"https://www.kinopoisk.ru/index.php?kp_query={urllib.parse.quote(query)}"
     try:
         r = SESSION.get(search_url, timeout=10)
@@ -570,6 +670,9 @@ def search_kinopoisk(title, year):
         page_url = f"https://www.kinopoisk.ru/film/{kp_id}/"
         r2 = SESSION.get(page_url, timeout=10)
         rating_html = r2.text
+
+        if not _kp_verify_result(clean_title, year, rating_html):
+            return None
 
         rating = ''
         votes = ''
@@ -1284,6 +1387,163 @@ def parse_forum_page(html, collection='nashe_kino', skip_topics=0):
     return topics
 
 
+def parse_piratebay_page(html, collection='piratebay_top'):
+    soup = BeautifulSoup(html, 'html.parser')
+    topics = []
+    rows = soup.select('#searchResult tbody tr')
+    for row in rows:
+        title_el = row.select_one('a.detLink')
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        magnet_el = row.select_one('a[href^="magnet:"]')
+        magnet = magnet_el.get('href', '') if magnet_el else ''
+        info_hash = info_hash_from_magnet(magnet)
+        if not info_hash:
+            continue
+        tds = row.find_all('td')
+        category_el = row.select_one('.vertTh a')
+        category = category_el.get_text(strip=True) if category_el else ''
+        uploaded = tds[2].get_text(strip=True) if len(tds) > 2 else ''
+        size_str = tds[4].get_text(strip=True) if len(tds) > 4 else ''
+        seeders = tds[5].get_text(strip=True) if len(tds) > 5 else '0'
+        leechers = tds[6].get_text(strip=True) if len(tds) > 6 else '0'
+        author_el = tds[7].select_one('a') if len(tds) > 7 else None
+        author = author_el.get_text(strip=True) if author_el else ''
+        href = title_el.get('href') or ''
+        topic_url = urllib.parse.urljoin('https://1.piratebays.to', href)
+        movie_title, movie_year = clean_title(title)
+        size_bytes, size_clean = parse_size(size_str)
+        date_str = parse_piratebay_date(uploaded)
+
+        topics.append({
+            'topic_id': f'pb_{info_hash}',
+            'title': title,
+            'movie_title': movie_title,
+            'orig_title': '',
+            'movie_year': movie_year,
+            'genre': '',
+            'source_category': category,
+            'quality': '',
+            'collection': collection,
+            'source': 'piratebay',
+            'author': author,
+            'size_str': size_clean,
+            'size_bytes': size_bytes,
+            'seeders': parse_int_text(seeders),
+            'leechers': parse_int_text(leechers),
+            'date_str': date_str,
+            'added_at': now_text(),
+            'topic_url': topic_url,
+            'listing_order': len(topics),
+            'magnet': magnet,
+            'imdb_id': None,
+            'imdb_rating': None,
+            'imdb_votes': None,
+            'kp_id': None,
+            'kp_rating': None,
+            'kp_votes': None,
+            'poster_url': '',
+            'cast': '',
+            'youtube_url': None,
+            'format': detect_format_from_text(title),
+        })
+    return topics
+
+
+def parse_piratebay_detail(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    imdb = ''
+    for link in soup.select('a[href*="imdb.com/title/tt"]'):
+        href = link.get('href', '')
+        m = re.search(r'/title/(tt\d+)', href)
+        if m:
+            imdb = m.group(1)
+            break
+    return imdb
+
+
+_PB_CONTAINER_MAP = {
+    'matroska': 'MKV',
+    'mpeg-4': 'MP4',
+    'mpeg4': 'MP4',
+    'avi': 'AVI',
+    'webm': 'WEBM',
+    'mpeg': 'MPEG',
+}
+
+
+def parse_piratebay_format(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    nfo_pre = soup.select_one('.nfo pre')
+    if nfo_pre:
+        for line in nfo_pre.get_text('\n').splitlines():
+            line = line.strip()
+            m = re.match(r'Container[\.\s]+:\s*(.+)', line, re.IGNORECASE)
+            if m:
+                container = m.group(1).strip()
+                for key, fmt in _PB_CONTAINER_MAP.items():
+                    if container.lower() == key or key in container.lower():
+                        return fmt
+    if not nfo_pre:
+        title_div = soup.select_one('#title')
+        if title_div:
+            text = title_div.get_text()
+            for key, fmt in _PB_CONTAINER_MAP.items():
+                if key in text.lower():
+                    return fmt
+    return ''
+
+
+def fetch_piratebay_format(topic_id, topic_url, timeout=10):
+    html = get_topic_html(topic_id, topic_url, timeout=timeout)
+    if html:
+        fmt = parse_piratebay_format(html)
+        if fmt:
+            return fmt
+    m = re.search(r'/torrent/(\d+)', topic_url)
+    if m:
+        torrent_id = m.group(1)
+        try:
+            r = SESSION.get(f'https://1.piratebays.to/ajax_details_filelist.php?id={torrent_id}', timeout=timeout)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    for ext, fmt in [('.mkv', 'MKV'), ('.mp4', 'MP4'), ('.avi', 'AVI'), ('.webm', 'WEBM'), ('.mpeg', 'MPEG')]:
+                        if ext in line.lower():
+                            return fmt
+        except Exception:
+            pass
+    return ''
+
+
+def fetch_piratebay_imdb_ids(topics):
+    total = len(topics)
+    ok = 0
+    def fetch_one(t):
+        try:
+            html = get_topic_html(t['topic_id'], t['topic_url'], timeout=10)
+            if html is None:
+                return False
+            imdb = parse_piratebay_detail(html)
+            if imdb:
+                t['imdb_id'] = imdb
+                return True
+        except Exception:
+            pass
+        return False
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, max(total, 1))) as executor:
+        futures = {executor.submit(fetch_one, t): t for t in topics}
+        for future in as_completed(futures):
+            t = futures[future]
+            try:
+                if future.result():
+                    ok += 1
+            except Exception:
+                pass
+    print(f"  Получено IMDB: {ok}/{total}")
+
+
 def parse_topic_for_magnet(html):
     soup = BeautifulSoup(html, 'html.parser')
     magnet_el = soup.select_one('a.magnet-link')
@@ -1385,7 +1645,14 @@ def has_real_poster(topic):
     if not poster_url:
         return False
     local_path = local_poster_path(poster_url)
-    return bool(local_path and os.path.exists(local_path))
+    if not (local_path and os.path.exists(local_path)):
+        return False
+    imdb_id = topic.get('imdb_id', '')
+    if imdb_id and re.search(r'/tt\d+', poster_url):
+        m = re.search(r'tt(\d+)', poster_url)
+        if m and m.group(0) != imdb_id:
+            return False
+    return True
 
 
 def display_poster_url(topic):
@@ -1418,6 +1685,8 @@ def fix_bad_topics(topics):
     count = 0
     need_re_enrich = []
     for t in topics:
+        if t.get('source') == 'piratebay':
+            continue
         mt = t.get('movie_title', '')
         raw = t.get('title', '')
         if not raw:
@@ -1804,13 +2073,20 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
             continue
         if str(t.get('topic_id', '')) in hidden_ids:
             continue
-        rating = t['kp_rating'] or t['imdb_rating'] or '—'
-        rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
+        prefer_imdb = t.get('collection') == 'piratebay_top' or t.get('source') == 'piratebay'
+        if prefer_imdb:
+            rating = t['imdb_rating'] or t['kp_rating'] or '—'
+            rating_label = 'IMDB' if t['imdb_rating'] else 'КП' if t['kp_rating'] else ''
+        else:
+            rating = t['kp_rating'] or t['imdb_rating'] or '—'
+            rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
         rating_cls = ''
         if rating and rating != '—':
             r = float(rating)
             rating_cls = 'rh' if r >= 8 else 'rm' if r >= 7 else 'rl'
-        if t.get('kp_id'):
+        if prefer_imdb and t.get('imdb_id'):
+            rating_url = f"https://www.imdb.com/title/{t['imdb_id']}/"
+        elif t.get('kp_id'):
             rating_url = f"https://www.kinopoisk.ru/film/{t['kp_id']}/"
         elif t.get('imdb_id'):
             rating_url = f"https://www.imdb.com/title/{t['imdb_id']}/"
@@ -2158,6 +2434,24 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
         except Exception:
             pass
 
+    if topic.get('source') == 'piratebay':
+        try:
+            html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
+            if html:
+                imdb = parse_piratebay_detail(html)
+                if imdb:
+                    old_imdb = topic.get('imdb_id')
+                    topic['imdb_id'] = imdb
+                    if imdb != old_imdb:
+                        topic['poster_url'] = ''
+                        topic.pop('_poster_failed', None)
+                if not topic.get('format'):
+                    fmt = fetch_piratebay_format(topic['topic_id'], topic['topic_url'], timeout=10)
+                    if fmt:
+                        topic['format'] = fmt
+        except Exception:
+            pass
+
     if not topic.get('imdb_id'):
         result = search_imdb(title, year)
         if result is None:
@@ -2174,9 +2468,39 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                         clear_poster_failed(topic)
                 topic['cast'] = result.get('cast', '')
 
+    imdb_id = topic.get('imdb_id')
+    if imdb_id:
+        needs_genre = not topic.get('genre') or is_listing_category_genre(topic.get('genre'))
+        if needs_genre:
+            bdata = load_basics({imdb_id}).get(imdb_id)
+            genre = bdata.get('genres', '') if isinstance(bdata, dict) else ''
+            if genre:
+                topic['genre'] = clean_and_translate_genre(genre)
+        if not topic.get('imdb_rating'):
+            rdata = load_ratings({imdb_id}).get(imdb_id)
+            if isinstance(rdata, dict):
+                topic['imdb_rating'] = rdata.get('rating')
+                topic['imdb_votes'] = rdata.get('votes', '')
+        if needs_genre or not topic.get('imdb_rating'):
+            rating_data = fetch_imdb_rating(imdb_id)
+            if needs_genre and rating_data.get('genres'):
+                topic['genre'] = clean_and_translate_genre(rating_data['genres'])
+            if not topic.get('imdb_rating') and rating_data.get('rating'):
+                topic['imdb_rating'] = rating_data['rating']
+                topic['imdb_votes'] = rating_data.get('votes', '')
+            if not has_real_poster(topic) and retry_poster and rating_data.get('poster'):
+                local_url = download_poster(imdb_id, rating_data['poster'])
+                if local_url:
+                    topic['poster_url'] = local_url
+                    clear_poster_failed(topic)
+
     cache_key = f"{title}|{year}".lower()
     kp_key = f"{russian_title}|{year}".lower()
-    if not topic.get('kp_rating') and russian_title:
+    needs_kp = not topic.get('kp_rating')
+    is_pb = topic.get('topic_id', '').startswith('pb_')
+    if is_pb and topic.get('kp_id'):
+        needs_kp = True
+    if needs_kp and russian_title:
         if kp_key in kp_cache and kp_cache[kp_key] is not None:
             result = kp_cache[kp_key]
         else:
@@ -2184,9 +2508,25 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
             kp_cache[kp_key] = result
             save_json(KP_SEARCH_CACHE, kp_cache)
         if result:
+            old_kp_id = topic.get('kp_id')
             topic['kp_id'] = result['kp_id']
             topic['kp_rating'] = result['kp_rating']
             topic['kp_votes'] = result['kp_votes']
+            if old_kp_id != result['kp_id']:
+                topic.pop('_poster_failed_at', None)
+                if topic.get('poster_url', '').startswith('data/posters/kp_'):
+                    topic['poster_url'] = ''
+        elif is_pb:
+            topic.pop('kp_id', None)
+            topic.pop('kp_rating', None)
+            topic.pop('kp_votes', None)
+            if topic.get('poster_url', '').startswith('data/posters/kp_'):
+                topic['poster_url'] = ''
+        if is_pb:
+            topic['_kp_validated'] = True
+            if not topic.get('kp_id'):
+                topic.pop('_poster_failed_at', None)
+                topic['_kp_retried'] = True
 
     if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
         local_url = download_kinopoisk_poster(topic['kp_id'])
@@ -2236,6 +2576,119 @@ def remove_hidden_topic(topic_id: str):
     ids = load_hidden_topic_ids()
     ids.discard(str(topic_id))
     save_hidden_topic_ids(ids)
+
+
+def load_collection_listing(collection, coll_info, topics_limit):
+    all_topics = []
+    listing_errors = 0
+    page1_ok = False
+    page1_used_cache = False
+    skip_ids: set[str] = set()
+    base_url = coll_info['url']
+    source = coll_info.get('source', 'rutracker')
+
+    if source == 'piratebay':
+        listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'{collection}_p0.html')
+        page_topics = []
+        print("  Страница 1 (Pirate Bay)...", end=' ', flush=True)
+        last_error = None
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                r = SESSION.get(base_url, timeout=30)
+                r.raise_for_status()
+                raw = r.content
+                html = raw.decode(r.encoding or 'utf-8', errors='replace')
+                page_topics = parse_piratebay_page(html, collection=collection)
+                if page_topics:
+                    page1_ok = True
+                    os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                    with open(listing_cache_path, 'wb') as f:
+                        f.write(raw)
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRY:
+                    print(f"\n  попытка {attempt}/{MAX_RETRY}: {e}; жду 2с", flush=True)
+                    time.sleep(2)
+        else:
+            listing_errors += 1
+            if listing_cache_is_valid(listing_cache_path):
+                with open(listing_cache_path, 'rb') as f:
+                    raw = f.read()
+                html = raw.decode('utf-8', errors='replace')
+                page_topics = parse_piratebay_page(html, collection=collection)
+                if page_topics:
+                    page1_ok = True
+                    page1_used_cache = True
+                print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
+            else:
+                print(f"ошибка: {last_error}; свежего кеша нет")
+        all_topics.extend(page_topics)
+        if topics_limit and len(all_topics) >= topics_limit:
+            all_topics = all_topics[:topics_limit]
+            print(f"{len(page_topics)} тем; берём {topics_limit} (MAX_TOPICS)")
+        else:
+            print(f"{len(page_topics)} тем")
+        return all_topics, listing_errors, page1_ok, page1_used_cache, skip_ids
+
+    m_fid = re.search(r'f=(\d+)', base_url)
+    forum_id = m_fid.group(1) if m_fid else collection
+    for page in range(1):
+        start = page * PAGE_SIZE
+        url = base_url if start == 0 else f"{base_url}&start={start}"
+        listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
+        page_topics = []
+        print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
+        last_error = None
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                r = SESSION.get(url, timeout=30)
+                r.raise_for_status()
+                raw = r.content
+                html = raw.decode('cp1251', errors='replace')
+                skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+                page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
+                if page == 0 and skip_top:
+                    all_page = parse_forum_page(html, collection=collection, skip_topics=0)
+                    skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
+                if page_topics:
+                    if page == 0:
+                        page1_ok = True
+                    os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                    with open(listing_cache_path, 'wb') as f:
+                        f.write(raw)
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRY:
+                    print(f"\n  попытка {attempt}/{MAX_RETRY}: {e}; жду 2с", flush=True)
+                    time.sleep(2)
+        else:
+            listing_errors += 1
+            if listing_cache_is_valid(listing_cache_path):
+                with open(listing_cache_path, 'rb') as f:
+                    raw = f.read()
+                html = raw.decode('cp1251', errors='replace')
+                skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+                page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
+                if page == 0 and skip_top:
+                    all_page = parse_forum_page(html, collection=collection, skip_topics=0)
+                    skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
+                if page == 0 and page_topics:
+                    page1_ok = True
+                    page1_used_cache = True
+                print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
+            else:
+                print(f"ошибка: {last_error}; свежего кеша нет")
+                continue
+        print(f"{len(page_topics)} тем")
+        all_topics.extend(page_topics)
+        if topics_limit and len(all_topics) >= topics_limit:
+            all_topics = all_topics[:topics_limit]
+            print(f"  Берём {topics_limit} тем (MAX_TOPICS)")
+            break
+        time.sleep(0.5)
+    return all_topics, listing_errors, page1_ok, page1_used_cache, skip_ids
 
 
 def main():
@@ -2323,70 +2776,13 @@ def main():
             print(f"{'='*60}")
 
             print(f"1. Парсинг {coll_info['name']}...")
-            all_topics = []
-            listing_errors = 0
-            page1_ok = False
-            page1_used_cache = False
             critical_collection_error = False
-            _skip_ids: set[str] = set()
-            base_url = coll_info['url']
-            m_fid = re.search(r'f=(\d+)', base_url)
-            forum_id = m_fid.group(1) if m_fid else collection
-            for page in range(1):
-                start = page * PAGE_SIZE
-                url = base_url if start == 0 else f"{base_url}&start={start}"
-                listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p{page}.html')
-                page_topics = []
-                print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
-                last_error = None
-                for attempt in range(1, MAX_RETRY + 1):
-                    try:
-                        r = SESSION.get(url, timeout=30)
-                        r.raise_for_status()
-                        raw = r.content
-                        html = raw.decode('cp1251', errors='replace')
-                        skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
-                        page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
-                        if page == 0 and skip_top:
-                            all_page = parse_forum_page(html, collection=collection, skip_topics=0)
-                            _skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
-                        if page_topics:
-                            if page == 0:
-                                page1_ok = True
-                            os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
-                            with open(listing_cache_path, 'wb') as f:
-                                f.write(raw)
-                        break
-                    except Exception as e:
-                        last_error = e
-                        if attempt < MAX_RETRY:
-                            print(f"\n  попытка {attempt}/{MAX_RETRY}: {e}; жду 2с", flush=True)
-                            time.sleep(2)
-                else:
-                    listing_errors += 1
-                    if listing_cache_is_valid(listing_cache_path):
-                        with open(listing_cache_path, 'rb') as f:
-                            raw = f.read()
-                        html = raw.decode('cp1251', errors='replace')
-                        skip_top = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
-                        page_topics = parse_forum_page(html, collection=collection, skip_topics=skip_top)
-                        if page == 0 and skip_top:
-                            all_page = parse_forum_page(html, collection=collection, skip_topics=0)
-                            _skip_ids.update(t['topic_id'] for t in all_page[:skip_top])
-                        if page == 0 and page_topics:
-                            page1_ok = True
-                            page1_used_cache = True
-                        print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
-                    else:
-                        print(f"ошибка: {last_error}; свежего кеша нет")
-                        continue
-                print(f"{len(page_topics)} тем")
-                all_topics.extend(page_topics)
-                if topics_limit and len(all_topics) >= topics_limit:
-                    all_topics = all_topics[:topics_limit]
-                    print(f"  Берём {topics_limit} тем (MAX_TOPICS)")
-                    break
-                time.sleep(0.5)
+            coll_topics_limit = coll_info.get('max_topics', topics_limit)
+            all_topics, listing_errors, page1_ok, page1_used_cache, _skip_ids = load_collection_listing(
+                collection,
+                coll_info,
+                coll_topics_limit,
+            )
 
             print(f"\nВсего найдено тем: {len(all_topics)}")
             if refresh and (not page1_ok or not all_topics):
@@ -2424,10 +2820,20 @@ def main():
             existing_ids = {t['topic_id'] for t in existing_current}
 
             # Update listing_order for topics still on the current page
-            fresh_order = {t['topic_id']: t.get('listing_order', 0) for t in all_topics}
+            fresh_by_id = {t['topic_id']: t for t in all_topics}
+            fresh_order = {tid: t.get('listing_order', 0) for tid, t in fresh_by_id.items()}
+            listing_update_fields = (
+                'title', 'movie_title', 'orig_title', 'movie_year', 'genre', 'quality',
+                'author', 'size_str', 'size_bytes', 'seeders', 'leechers', 'date_str',
+                'topic_url', 'magnet', 'format', 'source',
+            )
             for t in existing_current:
-                if t['topic_id'] in fresh_order:
-                    t['listing_order'] = fresh_order[t['topic_id']]
+                fresh_topic = fresh_by_id.get(t['topic_id'])
+                if fresh_topic:
+                    t['listing_order'] = fresh_topic.get('listing_order', t.get('listing_order', 999))
+                    for field in listing_update_fields:
+                        if field in fresh_topic and fresh_topic.get(field) not in (None, ''):
+                            t[field] = fresh_topic[field]
 
             # Add only genuinely new topics (not already in cache)
             new_current: list[dict] = []
@@ -2440,7 +2846,11 @@ def main():
                   f"новых: {len(new_current)}, "
                   f"из других коллекций: {len(other)}, всего: {len(merged)}")
 
-            need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
+            source = coll_info.get('source', 'rutracker')
+            if source == 'piratebay':
+                need_fetch = []
+            else:
+                need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
             if need_fetch:
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} новых тем...")
                 magnet_stats = fetch_magnets(need_fetch)
@@ -2467,6 +2877,12 @@ def main():
                 'magnet_failed': magnet_stats['failed'],
                 'page1_cache': page1_used_cache,
             })
+
+        # Fetch IMDB IDs from PirateBay detail pages before title-based search
+        piratebay_new = [t for t in all_new_topics if t.get('source') == 'piratebay' and not t.get('imdb_id')]
+        if piratebay_new:
+            print(f"\nЗагрузка IMDB со страниц PirateBay для {len(piratebay_new)} тем...")
+            fetch_piratebay_imdb_ids(piratebay_new)
 
         # Enrich all new topics across all collections in one batch
         if fast and all_new_topics:
