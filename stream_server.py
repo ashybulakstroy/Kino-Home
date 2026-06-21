@@ -598,11 +598,46 @@ def _enrich_missing(force: bool = False):
             retries = topic.get('_enrich_retries', 0)
             if not force and retries >= MAX_ENRICH_RETRIES and needs['core']:
                 continue
+            trailer_retries = topic.get('_trailer_retries', 0)
+            if not force and needs['trailer'] and not needs['core'] and trailer_retries >= MAX_ENRICH_RETRIES:
+                continue
             tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
 
         tasks.sort(key=lambda item: item[0])
         if tasks:
             print(f'  [enrich] задач: {len(tasks)}, воркеров: {WORKER_COUNT}')
+
+        def _topic_snapshot(t):
+            return {k: t.get(k) for k in [
+                'magnet', 'imdb_id', 'kp_id', 'imdb_rating', 'kp_rating',
+                'genre', 'youtube_url', 'poster_url', 'format', '_kp_validated'
+            ]}
+
+        def _what_changed(snap, t):
+            changes = []
+            for k, v in snap.items():
+                nv = t.get(k)
+                if nv == v:
+                    continue
+                if k == '_kp_validated':
+                    changes.append('kp_valid')
+                elif k == 'magnet' and not v and nv:
+                    changes.append('magnet')
+                elif k == 'poster_url' and not v and nv:
+                    changes.append('poster')
+                elif k == 'youtube_url' and not v and nv:
+                    changes.append('trailer')
+                elif k in ('imdb_id', 'kp_id') and not v and nv:
+                    changes.append(k)
+                elif k in ('imdb_rating', 'kp_rating') and not v and nv:
+                    changes.append(k)
+                elif k == 'genre' and not v and nv:
+                    changes.append('genre')
+                elif k == 'format' and not v and nv:
+                    changes.append('format')
+                else:
+                    changes.append(k)
+            return changes
 
         def process_task(item):
             _priority, idx, needs, retries = item
@@ -610,13 +645,25 @@ def _enrich_missing(force: bool = False):
             title = topic.get('movie_title') or topic.get('title', '?')
             include_trailer = bool(needs['trailer'] and not needs['core'])
             print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
-            topic['_enrich_retries'] = retries + 1
+            if include_trailer:
+                topic['_trailer_retries'] = topic.get('_trailer_retries', 0) + 1
+            else:
+                topic['_enrich_retries'] = retries + 1
+            snap = _topic_snapshot(topic)
             gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
+            changes = _what_changed(snap, topic)
             still = _topic_enrich_needs(topic)
             if not still['core']:
                 topic.pop('_enrich_retries', None)
-                return topic.get('topic_id'), 'OK'
-            return topic.get('topic_id'), 'ещё не все данные'
+                status = 'OK' if changes else 'без успешно'
+                still_labels = []
+                for k in ['poster', 'rating', 'genre', 'trailer', 'kp', 'format_missing']:
+                    if still.get(k):
+                        still_labels.append('format' if k == 'format_missing' else k)
+                if still_labels:
+                    status += ': ' + ', '.join(still_labels)
+                return topic.get('topic_id'), status, changes
+            return topic.get('topic_id'), 'ещё не все данные', changes
 
         if tasks:
             with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(tasks))) as executor:
@@ -624,11 +671,15 @@ def _enrich_missing(force: bool = False):
                 for future in as_completed(future_map):
                     changed = True
                     try:
-                        topic_id, result = future.result()
+                        topic_id, result, changes = future.result()
                     except Exception as e:
                         topic_id = topics[future_map[future][1]].get('topic_id')
                         result = f'ошибка: {e}'
-                    print(f'    [enrich] #{topic_id} -> {result}')
+                        changes = []
+                    if changes:
+                        print(f'    [enrich] #{topic_id} -> {result}: {", ".join(changes)}')
+                    else:
+                        print(f'    [enrich] #{topic_id} -> {result}')
 
         if changed:
             with file_lock(data_path):

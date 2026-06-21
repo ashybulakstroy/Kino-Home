@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -25,10 +26,28 @@ def _get_in_process_lock(path):
         return lock
 
 
+def _fallback_lock_path(path):
+    base_dir = os.environ.get("LOCAL_KINO_LOCK_DIR")
+    if base_dir:
+        root = Path(base_dir)
+    else:
+        root = Path(tempfile.gettempdir()) / "local_kino_file_locks"
+    digest = hashlib.sha1(str(Path(path).resolve()).encode("utf-8")).hexdigest()
+    name = f"{Path(path).name}.{digest}.lock"
+    return root / name
+
+
 @contextlib.contextmanager
 def file_lock(path):
-    lock_path = Path(str(path) + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    primary_lock_path = Path(str(path) + ".lock")
+    lock_path = primary_lock_path
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        open(lock_path, "a+b").close()
+    except PermissionError:
+        lock_path = _fallback_lock_path(path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        open(lock_path, "a+b").close()
     in_process_lock = _get_in_process_lock(lock_path)
     with in_process_lock:
         with open(lock_path, "a+b") as lock_file:
@@ -66,9 +85,14 @@ def _replace_with_retry(src, dst, attempts=5):
 def atomic_write_text_unlocked(path, text, encoding="utf-8"):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+    except PermissionError:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{target.name}.", suffix=".tmp", dir=tempfile.gettempdir()
+        )
     try:
         with os.fdopen(fd, "w", encoding=encoding, newline="") as tmp:
             tmp.write(text)

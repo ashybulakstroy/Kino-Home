@@ -1406,6 +1406,14 @@ def clean_and_translate_genre(genre_text):
     return ', '.join(clean)
 
 
+def _dataset_is_fresh(path, max_age_days=7):
+    if not path or not os.path.exists(path):
+        return False
+    mtime = os.path.getmtime(path)
+    age_days = (time.time() - mtime) / 86400
+    return age_days < max_age_days
+
+
 def download_imdb_dataset(url, path, label):
     print(f"Скачиваю IMDB {label} dataset...")
     r = SESSION.get(url, stream=True, timeout=120)
@@ -1427,6 +1435,26 @@ def remove_file_quietly(path):
         os.remove(path)
     except FileNotFoundError:
         pass
+
+
+def _verify_imdb_ids_exist(ids, label):
+    """Проверить, существуют ли IMDB ID через лёгкий GET-запрос.
+    Возвращает множество ID, которые существуют (HTTP 200)."""
+    valid = set()
+    not_found = set()
+    for imdb_id in sorted(ids):
+        try:
+            r = SESSION.get(f'https://www.imdb.com/title/{imdb_id}/',
+                            timeout=8, allow_redirects=True)
+            if r.status_code == 200 and 'Page not found' not in r.text[:500]:
+                valid.add(imdb_id)
+            else:
+                not_found.add(imdb_id)
+        except Exception:
+            valid.add(imdb_id)
+    if not_found:
+        print(f"   IMDB IDs не найдены ({len(not_found)}): {', '.join(sorted(not_found)[:5])}{'...' if len(not_found) > 5 else ''}")
+    return valid
 
 
 def scan_ratings_dataset(path, needed_ids):
@@ -1471,15 +1499,23 @@ def load_ratings(needed_ids):
     missing_ids = set(needed_ids) - set(cached.keys())
     try:
         ratings = scan_ratings_dataset(RATINGS_DATASET, missing_ids)
-        if missing_ids and not missing_ids.issubset(ratings.keys()):
-            tmp_path = download_imdb_dataset(RATINGS_URL, RATINGS_DATASET, "ratings")
-            fresh_ratings = scan_ratings_dataset(tmp_path, missing_ids)
-            if fresh_ratings:
-                promote_imdb_dataset(tmp_path, RATINGS_DATASET)
-                ratings = fresh_ratings
+        still_missing = {tid for tid in missing_ids if tid not in ratings}
+        if still_missing:
+            valid_ids = _verify_imdb_ids_exist(still_missing, "ratings")
+            if valid_ids:
+                if _dataset_is_fresh(RATINGS_DATASET):
+                    print(f"   Dataset свежий (<7 дней), скачка пропущена")
+                else:
+                    tmp_path = download_imdb_dataset(RATINGS_URL, RATINGS_DATASET, "ratings")
+                    fresh_ratings = scan_ratings_dataset(tmp_path, valid_ids)
+                    if fresh_ratings:
+                        promote_imdb_dataset(tmp_path, RATINGS_DATASET)
+                        ratings = {**ratings, **fresh_ratings}
+                    else:
+                        remove_file_quietly(tmp_path)
+                        print("   Свежий ratings dataset не содержит нужные ID; оставляю текущий файл")
             else:
-                remove_file_quietly(tmp_path)
-                print("   Свежий ratings dataset не содержит нужные ID; оставляю текущий файл")
+                print("   Все недостающие ID не найдены в IMDB, скачка dataset пропущена")
         for tid in missing_ids:
             if tid not in ratings:
                 ratings[tid] = None
@@ -1500,15 +1536,23 @@ def load_basics(needed_ids):
     missing_ids = set(needed_ids) - set(cached.keys())
     try:
         basics = scan_basics_dataset(BASICS_DATASET, missing_ids)
-        if missing_ids and not missing_ids.issubset(basics.keys()):
-            tmp_path = download_imdb_dataset(BASICS_URL, BASICS_DATASET, "basics")
-            fresh_basics = scan_basics_dataset(tmp_path, missing_ids)
-            if fresh_basics:
-                promote_imdb_dataset(tmp_path, BASICS_DATASET)
-                basics = fresh_basics
+        still_missing = {tid for tid in missing_ids if tid not in basics}
+        if still_missing:
+            valid_ids = _verify_imdb_ids_exist(still_missing, "basics")
+            if valid_ids:
+                if _dataset_is_fresh(BASICS_DATASET):
+                    print(f"   Dataset свежий (<7 дней), скачка пропущена")
+                else:
+                    tmp_path = download_imdb_dataset(BASICS_URL, BASICS_DATASET, "basics")
+                    fresh_basics = scan_basics_dataset(tmp_path, valid_ids)
+                    if fresh_basics:
+                        promote_imdb_dataset(tmp_path, BASICS_DATASET)
+                        basics = {**basics, **fresh_basics}
+                    else:
+                        remove_file_quietly(tmp_path)
+                        print("   Свежий basics dataset не содержит нужные ID; оставляю текущий файл")
             else:
-                remove_file_quietly(tmp_path)
-                print("   Свежий basics dataset не содержит нужные ID; оставляю текущий файл")
+                print("   Все недостающие ID не найдены в IMDB, скачка dataset пропущена")
         for tid in missing_ids:
             if tid not in basics:
                 basics[tid] = None
