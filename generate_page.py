@@ -17,13 +17,26 @@ from bs4 import BeautifulSoup
 
 from config import LISTING_CACHE_MAX_AGE_DAYS, WORKER_COUNT
 from project_io import atomic_write_json, atomic_write_text
+from world_sources import (
+    deduplicate_world_topics,
+    filter_world_top,
+    is_verified_world_youtube_trailer,
+    is_world_collection,
+    is_world_source,
+    is_world_topic,
+    merge_world_duplicates,
+    parse_world_page,
+    search_world_youtube_trailer,
+    world_page_hash,
+)
 
 COLLECTIONS = {
     'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22',     'age_cleanup': True,  'skip_topics': 2},
     'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False, 'skip_topics': 0},
     'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252',   'age_cleanup': True,  'skip_topics': 0},
     'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False, 'skip_topics': 0},
-    'piratebay_top':       {'name': 'World TOP',                       'url': 'https://1.piratebays.to/top/207', 'age_cleanup': True, 'source': 'piratebay', 'max_topics': 60},
+    'piratebay_top':       {'name': 'World *',                         'url': 'https://1.piratebays.to/top/207', 'age_cleanup': True, 'source': 'piratebay', 'max_topics': 60},
+    'tpbparty_top':        {'name': 'World **',                        'url': 'https://tpb.party/top/207',       'age_cleanup': True, 'source': 'tpbparty',  'max_topics': 60},
 }
 FORUM_URL = COLLECTIONS['nashe_kino']['url']
 TOPIC_URL_T = "https://rutracker.net/forum/viewtopic.php?t={}"
@@ -80,6 +93,19 @@ POSTERS_URL = "data/posters"
 POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.png"
 POSTER_RETRY_DAYS = 7
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
+WORLD_HASH_CACHE_DIR = os.path.join(DATA_DIR, "world_hash")
+WORLD_LEGACY_SOURCE_CACHE = {
+    'piratebay': {
+        'page_cache': os.path.join(DATA_DIR, 'piratebay_page.html'),
+        'torrents_cache': os.path.join(DATA_DIR, 'torrents_data.json'),
+        'hash_cache': os.path.join(DATA_DIR, 'piratebay_hash.txt'),
+    },
+    'tpbparty': {
+        'page_cache': os.path.join(DATA_DIR, 'tpbparty_page.html'),
+        'torrents_cache': os.path.join(DATA_DIR, 'torrents_data_tpbparty.json'),
+        'hash_cache': os.path.join(DATA_DIR, 'tpbparty_hash.txt'),
+    },
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -104,6 +130,156 @@ def listing_cache_is_valid(path):
         return False
     age_seconds = time.time() - os.path.getmtime(path)
     return age_seconds <= LISTING_CACHE_MAX_AGE_DAYS * 86400
+
+
+def world_hash_cache_path(collection):
+    return os.path.join(WORLD_HASH_CACHE_DIR, f"{collection}.txt")
+
+
+def load_world_page_hash(collection):
+    path = world_hash_cache_path(collection)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def save_world_page_hash(collection, html):
+    os.makedirs(WORLD_HASH_CACHE_DIR, exist_ok=True)
+    path = world_hash_cache_path(collection)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(world_page_hash(html))
+
+
+def world_legacy_cache_cfg(source):
+    return WORLD_LEGACY_SOURCE_CACHE.get(str(source or '').strip().lower(), {})
+
+
+def world_legacy_page_cache_path(source):
+    return world_legacy_cache_cfg(source).get('page_cache', '')
+
+
+def world_legacy_hash_cache_path(source):
+    return world_legacy_cache_cfg(source).get('hash_cache', '')
+
+
+def world_legacy_torrents_cache_path(source):
+    return world_legacy_cache_cfg(source).get('torrents_cache', '')
+
+
+def save_world_legacy_page_cache(source, raw, html):
+    page_path = world_legacy_page_cache_path(source)
+    hash_path = world_legacy_hash_cache_path(source)
+    if page_path:
+        os.makedirs(os.path.dirname(page_path), exist_ok=True)
+        with open(page_path, 'wb') as f:
+            f.write(raw)
+    if hash_path:
+        os.makedirs(os.path.dirname(hash_path), exist_ok=True)
+        with open(hash_path, 'w', encoding='utf-8') as f:
+            f.write(world_page_hash(html))
+
+
+def load_world_listing_cache_bytes(collection, source):
+    candidates = [os.path.join(TOPIC_CACHE_DIR, f'{collection}_p0.html')]
+    legacy_page = world_legacy_page_cache_path(source)
+    if legacy_page and legacy_page not in candidates:
+        candidates.append(legacy_page)
+    for path in candidates:
+        if not path or not listing_cache_is_valid(path) or not os.path.exists(path):
+            continue
+        with open(path, 'rb') as f:
+            raw = f.read()
+        return path, raw
+    return '', b''
+
+
+def normalize_legacy_world_topic(topic, collection, source):
+    topic = dict(topic or {})
+    title = topic.get('title') or topic.get('name') or ''
+    movie_title = topic.get('movie_title') or ''
+    movie_year = str(topic.get('movie_year') or '')
+    magnet = topic.get('magnet') or ''
+    source = str(source or topic.get('source') or '').strip().lower()
+    prefix = 'pb' if source == 'piratebay' else 'tpb'
+    topic_id = topic.get('topic_id') or world_topic_id(prefix, magnet, info_hash_from_magnet)
+    if not topic_id:
+        return None
+    size_str = topic.get('size_str') or topic.get('size') or ''
+    size_bytes = topic.get('size_bytes')
+    if size_bytes in (None, ''):
+        size_bytes, size_str = parse_size(size_str)
+    topic_url = topic.get('topic_url') or topic.get('detail_url') or ''
+    if topic_url and not topic_url.startswith('http'):
+        base = 'https://1.piratebays.to' if source == 'piratebay' else 'https://tpb.party'
+        topic_url = urllib.parse.urljoin(base, topic_url)
+    normalized = {
+        'topic_id': topic_id,
+        'title': title or movie_title,
+        'movie_title': movie_title or clean_title(title)[0],
+        'orig_title': topic.get('orig_title', '') or '',
+        'movie_year': movie_year or clean_title(title)[1],
+        'genre': topic.get('genre') or '',
+        'quality': topic.get('quality') or '',
+        'collection': collection,
+        'source': source,
+        'source_category': topic.get('source_category') or topic.get('category') or '',
+        'author': topic.get('author') or topic.get('uploader') or '',
+        'size_str': size_str,
+        'size_bytes': size_bytes or 0,
+        'seeders': int(topic.get('seeders') or 0),
+        'leechers': int(topic.get('leechers') or 0),
+        'date_str': topic.get('date_str') or parse_world_date(topic.get('uploaded') or ''),
+        'added_at': topic.get('added_at') or now_text(),
+        'topic_url': topic_url,
+        'listing_order': topic.get('listing_order', 999999),
+        'magnet': magnet,
+        'imdb_id': topic.get('imdb_id'),
+        'imdb_rating': topic.get('imdb_rating'),
+        'imdb_votes': topic.get('imdb_votes'),
+        'kp_id': topic.get('kp_id'),
+        'kp_rating': topic.get('kp_rating'),
+        'kp_votes': topic.get('kp_votes'),
+        'poster_url': normalize_poster_url(topic.get('poster_url', '')),
+        'cast': topic.get('cast', '') or '',
+        'youtube_url': topic.get('youtube_url'),
+        'format': topic.get('format') or detect_format_from_text(title),
+    }
+    return ensure_topic_defaults(normalized)
+
+
+def load_legacy_world_torrents(collection, source):
+    cache_path = world_legacy_torrents_cache_path(source)
+    if not cache_path or not os.path.exists(cache_path):
+        return []
+    data = load_json(cache_path) or []
+    if not isinstance(data, list):
+        return []
+    topics = []
+    for item in data:
+        normalized = normalize_legacy_world_topic(item, collection, source)
+        if normalized:
+            topics.append(normalized)
+    topics.sort(key=lambda t: t.get('listing_order', 999999))
+    return deduplicate_world_topics(topics)
+
+
+def bootstrap_missing_world_collections(topics):
+    topics = list(topics or [])
+    have = {str(t.get('collection') or '') for t in topics}
+    bootstrapped = []
+    for collection, coll_info in COLLECTIONS.items():
+        source = coll_info.get('source', 'rutracker')
+        if not is_world_source(source) or collection in have:
+            continue
+        legacy_topics = load_legacy_world_torrents(collection, source)
+        if legacy_topics:
+            bootstrapped.extend(legacy_topics)
+    if bootstrapped:
+        topics.extend(bootstrapped)
+        topics = clean_catalog_topics(topics)
+    return topics, bootstrapped
 
 
 def date_to_timestamp(value):
@@ -216,12 +392,17 @@ def save_json(path, data):
 
 def parse_size(text):
     text = text.strip().replace('\xa0', ' ').replace(',', '.')
-    m = re.match(r'([\d.]+)\s*(TB|GB|MB|KB)', text, re.I)
+    m = re.match(r'([\d.]+)\s*(TB|GB|MB|KB|TIB|GIB|MIB|KIB)', text, re.I)
     if not m:
         return 0, text
     val = float(m.group(1))
     unit = m.group(2).upper()
-    multipliers = {'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+    multipliers = {
+        'KB': 1024, 'KIB': 1024,
+        'MB': 1024**2, 'MIB': 1024**2,
+        'GB': 1024**3, 'GIB': 1024**3,
+        'TB': 1024**4, 'TIB': 1024**4,
+    }
     return int(val * multipliers.get(unit, 1)), text
 
 
@@ -1136,6 +1317,26 @@ def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
     return None
 
 
+def resolve_topic_trailer_url(topic):
+    title = topic.get('orig_title') or topic.get('movie_title') or ''
+    year = topic.get('movie_year')
+    if not title:
+        return None
+    if is_world_topic(topic):
+        cache_key = f"{title}|{year}".lower()
+        yt_cache = load_json(YOUTUBE_CACHE) or {}
+        cached_url = yt_cache.get(cache_key)
+        if cached_url and is_verified_world_youtube_trailer(SESSION, cached_url, title, year):
+            return cached_url
+        yt_url = search_world_youtube_trailer(SESSION, title, year)
+        if yt_url and is_verified_world_youtube_trailer(SESSION, yt_url, title, year):
+            yt_cache[cache_key] = yt_url
+            save_json(YOUTUBE_CACHE, yt_cache)
+            return yt_url
+        return None
+    return resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
+
+
 def download_poster(imdb_id, url):
     if not imdb_id or not url:
         return ''
@@ -1544,6 +1745,10 @@ def fetch_piratebay_imdb_ids(topics):
     print(f"  Получено IMDB: {ok}/{total}")
 
 
+def fetch_world_imdb_ids(topics):
+    return fetch_piratebay_imdb_ids(topics)
+
+
 def parse_topic_for_magnet(html):
     soup = BeautifulSoup(html, 'html.parser')
     magnet_el = soup.select_one('a.magnet-link')
@@ -1655,6 +1860,28 @@ def has_real_poster(topic):
     return True
 
 
+def resolve_existing_local_poster(topic):
+    """Set poster_url from already-downloaded poster by imdb_id or kp_id.
+    Returns True if a local poster file was found and assigned."""
+    imdb_id = topic.get('imdb_id')
+    if imdb_id:
+        filename = f"{imdb_id}.jpg"
+        local_path = os.path.join(POSTERS_DIR, filename)
+        if os.path.exists(local_path):
+            topic['poster_url'] = f"{POSTERS_URL}/{filename}"
+            clear_poster_failed(topic)
+            return True
+    kp_id = topic.get('kp_id')
+    if kp_id:
+        filename = f"kp_{kp_id}.jpg"
+        local_path = os.path.join(POSTERS_DIR, filename)
+        if os.path.exists(local_path):
+            topic['poster_url'] = f"{POSTERS_URL}/{filename}"
+            clear_poster_failed(topic)
+            return True
+    return False
+
+
 def display_poster_url(topic):
     poster_url = topic.get('poster_url', '') or ''
     local_path = local_poster_path(poster_url)
@@ -1685,7 +1912,7 @@ def fix_bad_topics(topics):
     count = 0
     need_re_enrich = []
     for t in topics:
-        if t.get('source') == 'piratebay':
+        if is_world_source(t.get('source')):
             continue
         mt = t.get('movie_title', '')
         raw = t.get('title', '')
@@ -1757,6 +1984,44 @@ def fix_bad_topics(topics):
     return topics
 
 
+def repair_world_titles(topics):
+    """Restore clean movie_title for world topics corrupted by fix_bad_topics."""
+    tech = re.compile(
+        r'(1080p|720p|4K|2160p|WEBRip|WEB-DL|BluRay|HDRip|DVDRip|DCPRip|'
+        r'x264|x265|h264|h265|HEVC|AAC|AC3|DDP|DTS|MP4|MKV|'
+        r'10bit|8bit|BONE|VOSTFR|TELESYNC|CAM|HDTS|SCREENER|'
+        r'YIFY|YTS|RARBG|RMTeam|NeoNoir|SupaCvnt|FLUX|BrRip)',
+        re.I,
+    )
+    count = 0
+    for t in topics:
+        if not is_world_topic(t):
+            continue
+        mt = t.get('movie_title', '') or ''
+        raw = t.get('title', '') or ''
+        if not raw or not tech.search(mt):
+            continue
+        new_title, year = clean_title(raw)
+        if not new_title or new_title == mt:
+            continue
+        old = mt[:50]
+        t['movie_title'] = new_title
+        if year:
+            t['movie_year'] = year
+        t['imdb_id'] = None
+        t['imdb_rating'] = None
+        t['imdb_votes'] = None
+        t['kp_id'] = None
+        t['kp_rating'] = None
+        t['kp_votes'] = None
+        t['poster_url'] = ''
+        count += 1
+        print(f"  title: {old} -> {new_title} ({t['movie_year']})")
+    if count:
+        print(f"  World-тем восстановлено: {count}")
+    return topics
+
+
 def recheck_trailers(topics):
     """
     Generator that scores all youtube_urls, stores yt_score, replaces weak ones.
@@ -1774,6 +2039,14 @@ def recheck_trailers(topics):
             continue
         title = t.get('movie_title', '')
         year = t.get('movie_year', '')
+        if is_world_topic(t):
+            score = 100 if is_verified_world_youtube_trailer(SESSION, yt, title, year) else 0
+            t['yt_score'] = score
+            scored_topics.append((score, yt, t))
+            total += 1
+            if total % 50 == 0:
+                yield f'  оценено: {total}'
+            continue
         try:
             r = _req.get(f'https://www.youtube.com/oembed?url={yt}&format=json', timeout=5)
             if r.status_code == 200:
@@ -1834,10 +2107,20 @@ def recheck_trailers(topics):
             yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (imdb={im})'
         if not new_yt:
             try:
-                new_yt = resolve_trailer_url(title, year, kp, im)
+                new_yt = resolve_topic_trailer_url(t)
             except Exception:
                 new_yt = None
         if new_yt:
+            if is_world_topic(t):
+                if is_verified_world_youtube_trailer(SESSION, new_yt, title, year):
+                    t['youtube_url'] = new_yt
+                    t['yt_score'] = 100
+                    replaced_weak += 1
+                    yield f'  [{tid}] {title} ({year}) score {score} -> 100: {new_yt}'
+                    continue
+                kept_weak += 1
+                yield f'  [{tid}] {title} ({year}) score {score} — оставлено'
+                continue
             try:
                 r = _req.get(f'https://www.youtube.com/oembed?url={new_yt}&format=json', timeout=5)
                 if r.status_code == 200:
@@ -1950,8 +2233,38 @@ def prune_unplayable_topics(topics):
     return playable
 
 
+def ensure_topic_defaults(topic):
+    defaults = {
+        'title': '',
+        'movie_title': '',
+        'orig_title': '',
+        'movie_year': '',
+        'genre': '',
+        'format': '',
+        'poster_url': '',
+        'kp_id': '',
+        'kp_rating': '',
+        'kp_votes': '',
+        'imdb_id': '',
+        'imdb_rating': '',
+        'imdb_votes': '',
+        'youtube_url': '',
+        'cast': '',
+        'source': '',
+        'collection': '',
+        'size_str': '',
+        'size_bytes': 0,
+        'seeders': 0,
+        'leechers': 0,
+        'listing_order': 999999,
+    }
+    for key, value in defaults.items():
+        topic.setdefault(key, value)
+    return topic
+
+
 def clean_catalog_topics(topics):
-    return prune_unplayable_topics(topics)
+    return [ensure_topic_defaults(t) for t in prune_unplayable_topics(topics)]
 
 
 def enrich(topics, ratings, basics):
@@ -1965,6 +2278,10 @@ def enrich(topics, ratings, basics):
         cache_key = f"{eng_title}|{year}".lower()
         imdb_id = t.get('imdb_id')
         print(f"  [{i}/{total}] {t['movie_title']}...", end=' ', flush=True)
+
+        if not has_real_poster(t):
+            resolve_existing_local_poster(t)
+
         if imdb_id:
             bdata = basics.get(imdb_id)
             genre = bdata.get('genres', '') if isinstance(bdata, dict) else ''
@@ -1996,9 +2313,24 @@ def enrich(topics, ratings, basics):
         if t.get('youtube_url'):
             pass
         elif yt_cache.get(cache_key):
-            t['youtube_url'] = yt_cache[cache_key]
+            cached_url = yt_cache[cache_key]
+            cached_ok = False
+            if is_world_topic(t):
+                cached_ok = bool(is_verified_world_youtube_trailer(SESSION, cached_url, eng_title, year))
+            else:
+                cached_ok = True
+            if cached_ok:
+                t['youtube_url'] = cached_url
+            else:
+                yt_url = resolve_topic_trailer_url(t)
+                t['youtube_url'] = yt_url
+                yt_cache[cache_key] = yt_url
+                save_json(YOUTUBE_CACHE, yt_cache)
+                if yt_url:
+                    print(f", трейлер ✓", end='')
+                time.sleep(0.1)
         else:
-            yt_url = resolve_trailer_url(eng_title, year, t.get('kp_id'), t.get('imdb_id'))
+            yt_url = resolve_topic_trailer_url(t)
             t['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
@@ -2015,6 +2347,43 @@ def sync_listing_order_for_collection(collection: str, cache_only: bool = False)
     if not coll_info:
         return {}
     base_url = coll_info['url']
+    source = coll_info.get('source', 'rutracker')
+    if is_world_source(source):
+        cache_path = os.path.join(TOPIC_CACHE_DIR, f'{collection}_p0.html')
+        if cache_only:
+            cache_used, raw = load_world_listing_cache_bytes(collection, source)
+            if raw:
+                html = raw.decode('utf-8', errors='replace')
+                topics = parse_world_page(html, collection, source, clean_title, parse_size, now_text, info_hash_from_magnet, detect_format_from_text)
+                topics = deduplicate_world_topics(topics)
+                return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+            return {}
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                r = SESSION.get(base_url, timeout=30)
+                r.raise_for_status()
+                raw = r.content
+                html = raw.decode(r.encoding or 'utf-8', errors='replace')
+                topics = parse_world_page(html, collection, source, clean_title, parse_size, now_text, info_hash_from_magnet, detect_format_from_text)
+                topics = deduplicate_world_topics(topics)
+                if topics:
+                    os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
+                    with open(cache_path, 'wb') as f:
+                        f.write(raw)
+                    save_world_page_hash(collection, html)
+                    save_world_legacy_page_cache(source, raw, html)
+                return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+            except Exception:
+                if attempt < MAX_RETRY:
+                    time.sleep(2)
+                    continue
+                cache_used, raw = load_world_listing_cache_bytes(collection, source)
+                if raw:
+                    html = raw.decode('utf-8', errors='replace')
+                    topics = parse_world_page(html, collection, source, clean_title, parse_size, now_text, info_hash_from_magnet, detect_format_from_text)
+                    topics = deduplicate_world_topics(topics)
+                    return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+        return {}
     m_fid = re.search(r'f=(\d+)', base_url)
     forum_id = m_fid.group(1) if m_fid else collection
     cache_path = os.path.join(TOPIC_CACHE_DIR, f'f{forum_id}_p0.html')
@@ -2040,7 +2409,7 @@ def sync_listing_order_for_collection(collection: str, cache_only: bool = False)
                 with open(cache_path, 'wb') as f:
                     f.write(raw)
             return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
-        except Exception as e:
+        except Exception:
             if attempt < MAX_RETRY:
                 time.sleep(2)
                 continue
@@ -2073,13 +2442,13 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
             continue
         if str(t.get('topic_id', '')) in hidden_ids:
             continue
-        prefer_imdb = t.get('collection') == 'piratebay_top' or t.get('source') == 'piratebay'
+        prefer_imdb = is_world_topic(t)
         if prefer_imdb:
-            rating = t['imdb_rating'] or t['kp_rating'] or '—'
-            rating_label = 'IMDB' if t['imdb_rating'] else 'КП' if t['kp_rating'] else ''
+            rating = t.get('imdb_rating') or t.get('kp_rating') or '—'
+            rating_label = 'IMDB' if t.get('imdb_rating') else 'КП' if t.get('kp_rating') else ''
         else:
-            rating = t['kp_rating'] or t['imdb_rating'] or '—'
-            rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
+            rating = t.get('kp_rating') or t.get('imdb_rating') or '—'
+            rating_label = 'КП' if t.get('kp_rating') else 'IMDB' if t.get('imdb_rating') else ''
         rating_cls = ''
         if rating and rating != '—':
             r = float(rating)
@@ -2092,7 +2461,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
             rating_url = f"https://www.imdb.com/title/{t['imdb_id']}/"
         else:
             rating_url = '#'
-        votes = t['kp_votes'] or t['imdb_votes'] or ''
+        votes = t.get('kp_votes') or t.get('imdb_votes') or ''
         votes_str = f" ({votes})" if votes else ''
         votes_html = f'<span class="rv">{escape(votes_str)}</span>' if votes_str else ''
         votes_title = f' title="{votes} голосов"' if votes else ''
@@ -2182,7 +2551,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 </div>
 </div>''')
 
-    with_r = sum(1 for t in topics if t['kp_rating'] or t['imdb_rating'])
+    with_r = sum(1 for t in topics if t.get('kp_rating') or t.get('imdb_rating'))
 
     html = f'''<!DOCTYPE html>
 <html lang="ru">
@@ -2405,6 +2774,9 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if not has_real_poster(topic) and retry_poster:
         localize_existing_poster(topic)
 
+    if not has_real_poster(topic):
+        resolve_existing_local_poster(topic)
+
     if not topic.get('magnet') or topic.get('_magnet_failed'):
         try:
             html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
@@ -2434,7 +2806,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
         except Exception:
             pass
 
-    if topic.get('source') == 'piratebay':
+    if is_world_topic(topic):
         try:
             html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
             if html:
@@ -2445,7 +2817,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                     if imdb != old_imdb:
                         topic['poster_url'] = ''
                         topic.pop('_poster_failed', None)
-                if not topic.get('format'):
+                if topic.get('source') == 'piratebay' and not topic.get('format'):
                     fmt = fetch_piratebay_format(topic['topic_id'], topic['topic_url'], timeout=10)
                     if fmt:
                         topic['format'] = fmt
@@ -2497,8 +2869,8 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     cache_key = f"{title}|{year}".lower()
     kp_key = f"{russian_title}|{year}".lower()
     needs_kp = not topic.get('kp_rating')
-    is_pb = topic.get('topic_id', '').startswith('pb_')
-    if is_pb and topic.get('kp_id'):
+    is_world = is_world_topic(topic)
+    if is_world and topic.get('kp_id'):
         needs_kp = True
     if needs_kp and russian_title:
         if kp_key in kp_cache and kp_cache[kp_key] is not None:
@@ -2516,13 +2888,13 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                 topic.pop('_poster_failed_at', None)
                 if topic.get('poster_url', '').startswith('data/posters/kp_'):
                     topic['poster_url'] = ''
-        elif is_pb:
+        elif is_world:
             topic.pop('kp_id', None)
             topic.pop('kp_rating', None)
             topic.pop('kp_votes', None)
             if topic.get('poster_url', '').startswith('data/posters/kp_'):
                 topic['poster_url'] = ''
-        if is_pb:
+        if is_world:
             topic['_kp_validated'] = True
             if not topic.get('kp_id'):
                 topic.pop('_poster_failed_at', None)
@@ -2540,13 +2912,13 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if include_trailer and not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
         cached_url = yt_cache.get(cache_key)
-        if cached_url and _validate_youtube_url(cached_url, title, year):
+        if cached_url and (is_verified_world_youtube_trailer(SESSION, cached_url, title, year) if is_world_topic(topic) else _validate_youtube_url(cached_url, title, year)):
             topic['youtube_url'] = cached_url
         else:
             if cached_url:
                 yt_cache[cache_key] = None
                 save_json(YOUTUBE_CACHE, yt_cache)
-            yt_url = resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
+            yt_url = resolve_topic_trailer_url(topic)
             topic['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
@@ -2587,10 +2959,11 @@ def load_collection_listing(collection, coll_info, topics_limit):
     base_url = coll_info['url']
     source = coll_info.get('source', 'rutracker')
 
-    if source == 'piratebay':
+    if is_world_source(source):
         listing_cache_path = os.path.join(TOPIC_CACHE_DIR, f'{collection}_p0.html')
         page_topics = []
-        print("  Страница 1 (Pirate Bay)...", end=' ', flush=True)
+        world_label = coll_info.get('name', collection)
+        print(f"  Страница 1 ({world_label})...", end=' ', flush=True)
         last_error = None
         for attempt in range(1, MAX_RETRY + 1):
             try:
@@ -2598,12 +2971,21 @@ def load_collection_listing(collection, coll_info, topics_limit):
                 r.raise_for_status()
                 raw = r.content
                 html = raw.decode(r.encoding or 'utf-8', errors='replace')
-                page_topics = parse_piratebay_page(html, collection=collection)
+                current_hash = world_page_hash(html)
+                cached_hash = load_world_page_hash(collection)
+                if cached_hash and current_hash == cached_hash and listing_cache_is_valid(listing_cache_path):
+                    with open(listing_cache_path, 'rb') as f:
+                        raw = f.read()
+                    html = raw.decode('utf-8', errors='replace')
+                page_topics = parse_world_page(html, collection, source, clean_title, parse_size, now_text, info_hash_from_magnet, detect_format_from_text)
+                page_topics = deduplicate_world_topics(page_topics)
                 if page_topics:
                     page1_ok = True
                     os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
                     with open(listing_cache_path, 'wb') as f:
                         f.write(raw)
+                    save_world_page_hash(collection, html)
+                    save_world_legacy_page_cache(source, raw, html)
                 break
             except Exception as e:
                 last_error = e
@@ -2612,19 +2994,27 @@ def load_collection_listing(collection, coll_info, topics_limit):
                     time.sleep(2)
         else:
             listing_errors += 1
-            if listing_cache_is_valid(listing_cache_path):
-                with open(listing_cache_path, 'rb') as f:
-                    raw = f.read()
+            cache_used, raw = load_world_listing_cache_bytes(collection, source)
+            if raw:
                 html = raw.decode('utf-8', errors='replace')
-                page_topics = parse_piratebay_page(html, collection=collection)
+                page_topics = parse_world_page(html, collection, source, clean_title, parse_size, now_text, info_hash_from_magnet, detect_format_from_text)
+                page_topics = deduplicate_world_topics(page_topics)
                 if page_topics:
                     page1_ok = True
                     page1_used_cache = True
                 print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
             else:
-                print(f"ошибка: {last_error}; свежего кеша нет")
+                page_topics = load_legacy_world_torrents(collection, source)
+                if page_topics:
+                    page1_ok = True
+                    page1_used_cache = True
+                    print(f"ошибка: {last_error}; используем legacy cache", end=' ', flush=True)
+                else:
+                    print(f"ошибка: {last_error}; свежего кеша нет")
         all_topics.extend(page_topics)
-        if topics_limit and len(all_topics) >= topics_limit:
+        if is_world_source(source):
+            print(f"{len(page_topics)} тем (загружены все)")
+        elif topics_limit and len(all_topics) >= topics_limit:
             all_topics = all_topics[:topics_limit]
             print(f"{len(page_topics)} тем; берём {topics_limit} (MAX_TOPICS)")
         else:
@@ -2737,6 +3127,10 @@ def main():
         for i, t in enumerate(topics):
             if t.get('listing_order') is None:
                 t['listing_order'] = i
+        topics, bootstrapped_world = bootstrap_missing_world_collections(topics)
+        if bootstrapped_world:
+            print(f"  Подхвачены world-кеши: {len(bootstrapped_world)}")
+            save_json(TORRENTS_CACHE, topics)
         cleaned_topics = clean_catalog_topics(topics)
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
@@ -2847,7 +3241,7 @@ def main():
                   f"из других коллекций: {len(other)}, всего: {len(merged)}")
 
             source = coll_info.get('source', 'rutracker')
-            if source == 'piratebay':
+            if is_world_source(source):
                 need_fetch = []
             else:
                 need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
@@ -2862,6 +3256,10 @@ def main():
                 magnet_stats = {'total': 0, 'ok': 0, 'failed': 0}
 
             topics = clean_catalog_topics(merged)
+            if is_world_source(source):
+                legacy_world_topics = [t for t in topics if t.get('collection') == collection]
+                if legacy_world_topics:
+                    save_json(world_legacy_torrents_cache_path(source), legacy_world_topics)
             topic_ids = {t.get('topic_id') for t in topics}
             all_new_topics.extend(t for t in new_current if t.get('topic_id') in topic_ids)
             save_json(TORRENTS_CACHE, topics)
@@ -2879,10 +3277,10 @@ def main():
             })
 
         # Fetch IMDB IDs from PirateBay detail pages before title-based search
-        piratebay_new = [t for t in all_new_topics if t.get('source') == 'piratebay' and not t.get('imdb_id')]
-        if piratebay_new:
-            print(f"\nЗагрузка IMDB со страниц PirateBay для {len(piratebay_new)} тем...")
-            fetch_piratebay_imdb_ids(piratebay_new)
+        world_new = [t for t in all_new_topics if is_world_topic(t) and not t.get('imdb_id')]
+        if world_new:
+            print(f"\nЗагрузка IMDB со страниц world-источников для {len(world_new)} тем...")
+            fetch_world_imdb_ids(world_new)
 
         # Enrich all new topics across all collections in one batch
         if fast and all_new_topics:
@@ -2961,12 +3359,15 @@ def main():
             print("\n10. Кинопоиск постеры (для всех)...")
             kp_count = 0
             for t in topics:
-                if not has_real_poster(t) and t.get('kp_id'):
-                    kp_local = download_kinopoisk_poster(t['kp_id'])
-                    if kp_local:
-                        t['poster_url'] = kp_local
-                        kp_count += 1
-                        print(f"  {t.get('movie_title','')}: KP постер ✓")
+                if not has_real_poster(t):
+                    if resolve_existing_local_poster(t):
+                        continue
+                    if t.get('kp_id'):
+                        kp_local = download_kinopoisk_poster(t['kp_id'])
+                        if kp_local:
+                            t['poster_url'] = kp_local
+                            kp_count += 1
+                            print(f"  {t.get('movie_title','')}: KP постер ✓")
             if kp_count:
                 print(f"  Загружено: {kp_count}")
             else:
@@ -2974,16 +3375,45 @@ def main():
 
         coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
         topics.sort(key=lambda t: (coll_order.get(t.get('collection', ''), 999), t.get('listing_order', 999)))
+
         save_json(TORRENTS_CACHE, topics)
 
     print("\nИсправление битых заголовков (весь кеш)...")
     fix_bad_topics(topics)
+    
+    print("\nВосстановление названий world-тем...")
+    repair_world_titles(topics)
+
+    # World deduplication: merge duplicates, keep best seeders, preserve enrich
+    # Must run AFTER title repair so clean titles match correctly
+    if any(is_world_topic(t) for t in topics):
+        before = len(topics)
+        topics = merge_world_duplicates(topics)
+        removed = before - len(topics)
+        if removed:
+            print(f"  Мировые дубликаты: удалено {removed}, объединены enrich-поля")
+
+    # Re-enrich world topics that lost enrich data due to title repair
+    need_enrich = [t for t in topics if is_world_topic(t) and not t.get('_sanitized')
+                   and (not t.get('imdb_id') or not t.get('kp_id') or not has_real_poster(t))]
+    if need_enrich:
+        print(f"\nПовторное обогащение {len(need_enrich)} world-тем (восстановленные названия)...")
+        for topic in need_enrich:
+            title = topic.get('movie_title', '?')
+            print(f"  {title[:50]}...", end=' ', flush=True)
+            enrich_topic(topic, force_poster_retry=True, include_trailer=False)
+            if has_real_poster(topic):
+                print("OK")
+            else:
+                print("poster ne najden")
+
     save_json(TORRENTS_CACHE, topics)
 
     hidden_ids = load_hidden_topic_ids()
+    display_topics = filter_world_top(topics)
     print(f"\n{'='*60}")
-    print(f"Генерация HTML ({len(topics)} фильмов, скрыто: {len(hidden_ids)})...")
-    output = generate_html(topics, hidden_ids=hidden_ids)
+    print(f"Генерация HTML ({len(display_topics)}/{len(topics)} фильмов, скрыто: {len(hidden_ids)})...")
+    output = generate_html(display_topics, hidden_ids=hidden_ids)
     atomic_write_text(OUTPUT_FILE, output)
     print(f"Готово: {OUTPUT_FILE}")
     print(f"\nЗапусти: python stream_server.py")
@@ -3009,3 +3439,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

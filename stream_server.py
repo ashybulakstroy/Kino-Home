@@ -9,7 +9,9 @@ import socket
 import threading
 import subprocess
 import shutil
+import tempfile
 import atexit
+from pathlib import Path
 from typing import TextIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -121,7 +123,6 @@ DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
 _html_cache: tuple[float, str, str] | None = None  # (mtime, etag, html)
 _html_cache_lock = threading.Lock()
 DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
-REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
 REFRESH_FILES = [
     'torrents_data.json',
     'imdb_basics_cache.json',
@@ -135,6 +136,48 @@ REFRESH_FILES = [
     'index-kino.html',
 ]
 REFRESH_DIRS = ['posters', 'topic_cache', 'imdb']
+
+
+def load_display_topics():
+    """Load all topics from torrents_data.json and filter world collections
+    to top 60 by seeders for display purposes."""
+    path = DATA_DIR / 'torrents_data.json'
+    try:
+        topics = json.loads(path.read_text('utf-8'))
+        return gp.filter_world_top(topics)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def load_full_topics():
+    """Load all topics from torrents_data.json without filtering."""
+    path = DATA_DIR / 'torrents_data.json'
+    try:
+        return json.loads(path.read_text('utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _resolve_refresh_staging_dir():
+    override = os.environ.get('LOCAL_KINO_STAGING_DIR')
+    candidates = []
+    if override:
+        candidates.append(Path(override))
+    candidates.append(DATA_DIR / 'staging_refresh')
+    candidates.append(Path(tempfile.gettempdir()) / 'local_kino_staging')
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / '.write_probe'
+            probe.write_text('ok', encoding='utf-8')
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return DATA_DIR / 'staging_refresh'
+
+
+REFRESH_STAGING_DIR = _resolve_refresh_staging_dir()
 
 
 def _today_stamp() -> str:
@@ -273,6 +316,27 @@ def _ensure_daily_refresh_loop():
     threading.Thread(target=_daily_refresh_loop, daemon=True).start()
 
 
+def _ensure_startup_refresh():
+    def _startup_refresh_worker():
+        _run_daily_refresh_if_due('startup')
+
+    threading.Thread(target=_startup_refresh_worker, daemon=True).start()
+
+
+def _open_browser_when_ready(port: int):
+    if os.environ.get('LOCAL_KINO_NO_BROWSER', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return
+
+    def _worker():
+        time.sleep(0.8)
+        try:
+            webbrowser.open(f'http://localhost:{port}')
+        except Exception as e:
+            print(f'Не удалось открыть браузер автоматически: {e}')
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _parse_topic_date(value: str):
     if not value:
         return None
@@ -345,7 +409,7 @@ def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
             return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': skipped_topics}
 
         atomic_write_json_unlocked(data_path, keep)
-        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(keep))
+        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(gp.filter_world_top(keep)))
 
     if removed:
         try:
@@ -466,7 +530,7 @@ def _topic_enrich_needs(topic):
     )
     trailer_due = not topic.get('youtube_url')
     kp_due = (
-        bool(topic.get('topic_id', '').startswith('pb_'))
+        gp.is_world_topic(topic)
         and (
             (bool(topic.get('kp_id')) and not topic.get('_kp_validated'))
             or (not topic.get('kp_id') and topic.get('_kp_validated') and not topic.get('_kp_retried'))
@@ -588,8 +652,6 @@ def _sync_listing_order(cache_only: bool = False):
         changed = False
         from generate_page import COLLECTIONS, sync_listing_order_for_collection
         for coll, info in COLLECTIONS.items():
-            if info.get('source', 'rutracker') != 'rutracker':
-                continue
             order_map = sync_listing_order_for_collection(coll, cache_only=cache_only)
             if not order_map:
                 continue
@@ -1422,6 +1484,12 @@ def index():
             return Response(_html_cache[2], content_type='text/html; charset=utf-8')
 
     html = index_path.read_text('utf-8')
+    old_world_opt = '<option value="piratebay_top">World TOP</option>'
+    new_world_opts = '<option value="piratebay_top">World *</option><option value="tpbparty_top">World **</option>'
+    if old_world_opt in html:
+        html = html.replace(old_world_opt, new_world_opts)
+    elif 'value="tpbparty_top"' not in html and 'value="piratebay_top">World *' in html:
+        html = html.replace('<option value="piratebay_top">World *</option>', new_world_opts)
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
     browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
@@ -1499,7 +1567,9 @@ def cleanup_trigger():
 def torrents_data():
     if PUBLIC_MODE:
         abort(404)
-    return send_file(str(DATA_DIR / 'torrents_data.json'))
+    data = load_display_topics()
+    return Response(json.dumps(data, ensure_ascii=False, indent=2),
+                    content_type='application/json; charset=utf-8')
 
 
 @app.route('/sync_order')
@@ -1550,7 +1620,7 @@ def recheck_trailers():
         for line in gp.recheck_trailers(topics):
             yield line + '\n'
         data_path.write_text(json.dumps(topics, ensure_ascii=False, indent=2), 'utf-8')
-        html = gp.generate_html(topics)
+        html = gp.generate_html(gp.filter_world_top(topics))
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
         yield '</pre><p><a href="/">Готово</a></p></body></html>'
 
@@ -1565,7 +1635,7 @@ def hide_topic(topic_id):
     gp.add_hidden_topic(topic_id)
     data_path = DATA_DIR / 'torrents_data.json'
     if data_path.exists():
-        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        html = gp.generate_html(gp.filter_world_top(json.loads(data_path.read_text('utf-8'))))
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
     return jsonify(ok=True)
 
@@ -1578,7 +1648,7 @@ def unhide_topic(topic_id):
     gp.remove_hidden_topic(topic_id)
     data_path = DATA_DIR / 'torrents_data.json'
     if data_path.exists():
-        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        html = gp.generate_html(gp.filter_world_top(json.loads(data_path.read_text('utf-8'))))
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
     return jsonify(ok=True)
 
@@ -1609,10 +1679,7 @@ def add_cors_and_gzip(response):
 # Browse modes
 # ---------------------------------------------------------------------------
 def _get_movies():
-    p = DATA_DIR / 'torrents_data.json'
-    if not p.exists():
-        return []
-    data = json.loads(p.read_text('utf-8'))
+    data = load_display_topics()
     hidden = gp.load_hidden_topic_ids()
     return [m for m in data if not m.get('_sanitized') and m.get('magnet') != '0' and str(m.get('topic_id', '')) not in hidden]
 
@@ -2464,14 +2531,13 @@ if __name__ == '__main__':
             print(f'  Постеров: {topic_cleanup["removed_posters"]}')
         else:
             print(f'Старых тем старше {TOPIC_MAX_AGE_DAYS} дней нет.')
-        _run_daily_refresh_if_due('startup')
         _sync_listing_order(cache_only=True)
         _ensure_periodic_enrich()
+        _ensure_startup_refresh()
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
     print()
-    webbrowser.open(f'http://localhost:{port}')
     _ensure_session_monitor()
     _ensure_enrich_worker()
     _ensure_daily_refresh_loop()
@@ -2484,4 +2550,5 @@ if __name__ == '__main__':
     server = make_server('::', port, app, threaded=True, fd=sock.fileno())
     sock.close()
     print(f' * Running on http://127.0.0.1:{port}')
+    _open_browser_when_ready(port)
     server.serve_forever()
