@@ -3217,20 +3217,37 @@ def main():
         original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
 
+        # === PHASE 1: Parallel listing parse for all collections ===
+        def _parse_listing(collection, topics_limit):
+            coll_info = COLLECTIONS[collection]
+            return load_collection_listing(collection, coll_info, coll_info.get('max_topics', topics_limit))
+
+        parse_results: dict[str, tuple] = {}
+        if len(collections_to_process) > 1:
+            print(f"\n--- Параллельный парсинг {len(collections_to_process)} коллекций ({WORKER_COUNT} потоков) ---")
+            with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(collections_to_process))) as executor:
+                futures = {executor.submit(_parse_listing, c, topics_limit): c for c in collections_to_process}
+                for future in as_completed(futures):
+                    c = futures[future]
+                    try:
+                        parse_results[c] = future.result()
+                    except Exception as e:
+                        print(f"  ОШИБКА {c}: {e}")
+                        parse_results[c] = ([], 999, False, False, set())
+        else:
+            for c in collections_to_process:
+                parse_results[c] = _parse_listing(c, topics_limit)
+
+        # === PHASE 2: Sequential merge + fetch for each collection ===
         for col_idx, collection in enumerate(collections_to_process):
             coll_info = COLLECTIONS[collection]
             print(f"\n{'='*60}")
             print(f"Коллекция ({col_idx+1}/{len(collections_to_process)}): {coll_info['name']}")
             print(f"{'='*60}")
 
-            print(f"1. Парсинг {coll_info['name']}...")
+            print(f"1. Данные получены (параллельный парсинг)")
             critical_collection_error = False
-            coll_topics_limit = coll_info.get('max_topics', topics_limit)
-            all_topics, listing_errors, page1_ok, page1_used_cache, _skip_ids = load_collection_listing(
-                collection,
-                coll_info,
-                coll_topics_limit,
-            )
+            all_topics, listing_errors, page1_ok, page1_used_cache, _skip_ids = parse_results[collection]
 
             print(f"\nВсего найдено тем: {len(all_topics)}")
             if refresh and (not page1_ok or not all_topics):
@@ -3330,16 +3347,22 @@ def main():
                 'page1_cache': page1_used_cache,
             })
 
-        # Fetch IMDB IDs from PirateBay detail pages before title-based search
-        world_new = [t for t in all_new_topics if is_world_topic(t) and not t.get('imdb_id')]
-        if world_new:
-            print(f"\nЗагрузка IMDB со страниц world-источников для {len(world_new)} тем...")
-            fetch_world_imdb_ids(world_new)
-
         # Enrich all new topics across all collections in one batch
-        if fast and all_new_topics:
+        if not all_new_topics:
+            print("\nНовых тем нет, обогащение пропущено")
+            skip_kp_posters = True
+        elif fast:
             print(f"\nБыстрый refresh: обогащение {len(all_new_topics)} новых тем пропущено")
-        elif all_new_topics:
+            skip_kp_posters = True
+        else:
+            skip_kp_posters = False
+
+            # Fetch IMDB IDs from PirateBay detail pages before title-based search
+            world_new = [t for t in all_new_topics if is_world_topic(t) and not t.get('imdb_id')]
+            if world_new:
+                print(f"\nЗагрузка IMDB со страниц world-источников для {len(world_new)} тем...")
+                fetch_world_imdb_ids(world_new)
+
             print(f"\n{'='*60}")
             print("Обогащение новых тем за все коллекции")
             print(f"{'='*60}")
@@ -3370,15 +3393,13 @@ def main():
             print(f"\n8. Обогащение данных...")
             enrich(all_new_topics, ratings, basics)
 
-            print(f"\n9. Проверка запрещённых тем...")
+            print(f"\n9. Проверка запрещённых тем (новые)...")
             for t in all_new_topics:
                 if t.get('_sanitized'):
                     continue
                 if is_forbidden_topic(t):
                     sanitize_topic(t)
                     print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
-        else:
-            print("\nНовых тем нет, обогащение пропущено")
 
         print("\n9. Проверка запрещённых тем (весь кеш)...")
         sanitized = 0
@@ -3407,8 +3428,9 @@ def main():
         else:
             print("  ОК")
 
-        if fast:
-            print("\n10. Быстрый refresh: проход Кинопоиск постеров для всех тем пропущен")
+        if skip_kp_posters:
+            mode = "нет новых тем" if not all_new_topics else "--fast"
+            print(f"\n10. Кинопоиск постеры пропущены ({mode})")
         else:
             print("\n10. Кинопоиск постеры (для всех)...")
             kp_count = 0
