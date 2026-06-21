@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -702,36 +703,48 @@ def _parse_imdb_result(item):
 
 def search_imdb_ids(topics):
     total = len(topics)
-    processed = 0
     imdb_cache = load_json(SEARCH_CACHE) or {}
-    for t in topics:
+    cache_lock = threading.Lock()
+    processed = 0
+    processed_lock = threading.Lock()
+
+    def _search_one(t):
+        nonlocal processed
         if t.get('imdb_id'):
-            continue
+            return
         title = t.get('orig_title') or t['movie_title']
         year = t['movie_year']
         raw_name = t['title']
         if not title:
-            continue
-        processed += 1
+            return
+        with processed_lock:
+            processed += 1
+            idx = processed
+
         cache_key = f"{title}|{year}".lower()
-        result = None
-        if cache_key in imdb_cache and imdb_cache[cache_key] is not None:
-            result = imdb_cache[cache_key]
+        with cache_lock:
+            result = imdb_cache.get(cache_key) if cache_key in imdb_cache else None
+        if result is not None:
+            pass
         else:
-            print(f"  [{processed}/{total}] {title}...", end=' ', flush=True)
+            print(f"  [{idx}/{total}] {title}...", end=' ', flush=True)
             result = search_imdb(title, year)
             if result is None:
                 deep_cache_key = f"deep:{raw_name.lower().strip()}"
-                if deep_cache_key in imdb_cache and imdb_cache[deep_cache_key] is not None:
-                    result = imdb_cache[deep_cache_key]
+                with cache_lock:
+                    cached_deep = imdb_cache.get(deep_cache_key) if deep_cache_key in imdb_cache else None
+                if cached_deep is not None:
+                    result = cached_deep
                 else:
                     result = search_imdb_deep(raw_name)
-                    if result is not None:
-                        imdb_cache[deep_cache_key] = result
-            if result is not None:
-                imdb_cache[cache_key] = result
-                save_json(SEARCH_CACHE, imdb_cache)
-            time.sleep(0.1)
+                    with cache_lock:
+                        if result is not None:
+                            imdb_cache[deep_cache_key] = result
+                        save_json(SEARCH_CACHE, imdb_cache)
+            with cache_lock:
+                if result is not None:
+                    imdb_cache[cache_key] = result
+                    save_json(SEARCH_CACHE, imdb_cache)
         if result:
             if isinstance(result, str):
                 imdb_id = result
@@ -750,6 +763,9 @@ def search_imdb_ids(topics):
         else:
             print("не найдено", end='')
         print()
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, total or 1)) as executor:
+        executor.map(_search_one, topics)
     return topics
 
 
@@ -884,22 +900,30 @@ def _extract_year_from_title(topic):
 def search_kinopoisk_ids(topics):
     total = len(topics)
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    for i, t in enumerate(topics, 1):
-        title, year = t['movie_title'], t['movie_year']
+    cache_lock = threading.Lock()
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def _search_one(t):
+        nonlocal counter
+        title, year = t.get('movie_title'), t.get('movie_year')
         if not title:
-            continue
+            return
         if not year:
             year = _extract_year_from_title(t)
         cache_key = f"{title}|{year}".lower()
-        if cache_key in kp_cache and kp_cache[cache_key] is not None:
-            result = kp_cache[cache_key]
-        else:
-            print(f"  [{i}/{total}] {title}...", end=' ', flush=True)
+        with counter_lock:
+            counter += 1
+            idx = counter
+        with cache_lock:
+            result = kp_cache.get(cache_key) if cache_key in kp_cache else None
+        if result is None:
+            print(f"  [{idx}/{total}] {title}...", end=' ', flush=True)
             result = search_kinopoisk(title, year)
-            kp_cache[cache_key] = result
-            if result:
-                save_json(KP_SEARCH_CACHE, kp_cache)
-            time.sleep(0.3)
+            with cache_lock:
+                kp_cache[cache_key] = result
+                if result:
+                    save_json(KP_SEARCH_CACHE, kp_cache)
         if result:
             t['kp_id'] = result['kp_id']
             t['kp_rating'] = result['kp_rating']
@@ -908,6 +932,9 @@ def search_kinopoisk_ids(topics):
         else:
             print("не найдено", end='')
         print()
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, total or 1)) as executor:
+        executor.map(_search_one, topics)
     return topics
 
 
