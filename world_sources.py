@@ -354,40 +354,56 @@ _ENRICH_FIELDS = {
 }
 
 
-def merge_world_duplicates(topics):
-    """Merge duplicate world topics, keeping the one with most seeders.
+def _merge_duplicates_in_group(group):
+    """Merge a single group of duplicate topics, keeping the one with most seeders.
+    Preserves enrich fields from any member."""
+    if len(group) == 1:
+        return group[0]
 
-    For each fuzzy-duplicate group (movie_title + movie_year):
-    - Pick the topic with highest seeders as the primary
-    - Preserve enrich fields (ratings, poster, trailer, ids, genre) from
-      any group member
-    - Listing fields (magnet, size, format, seeders, etc.) come from primary
-    - Non-world topics pass through unchanged
-    """
-    world = []
-    non_world = []
-    for t in topics:
-        if is_world_topic(t):
-            world.append(t)
-        else:
-            non_world.append(t)
+    def _seeders(t):
+        s = t.get('seeders')
+        try:
+            return int(s) if s is not None else -1
+        except (ValueError, TypeError):
+            return -1
 
-    if not world:
-        return topics
+    def _has_magnet(t):
+        return bool(t.get('magnet'))
 
+    best_candidates = [t for t in group if _has_magnet(t)]
+    if best_candidates:
+        best = max(best_candidates, key=_seeders)
+    else:
+        best = max(group, key=_seeders)
+
+    for field in _ENRICH_FIELDS:
+        if _enrich_field_empty(best, field):
+            for member in group:
+                if member is not best and not _enrich_field_empty(member, field):
+                    best[field] = member[field]
+                    break
+
+    return best
+
+
+def _dedup_one_collection(topics_list, collection_name):
+    """Deduplicate topics within a single world collection.
+    Returns deduplicated list."""
+    if not topics_list:
+        return []
     groups = []
     used = set()
-    for i, t in enumerate(world):
+    for i, t in enumerate(topics_list):
         if i in used:
             continue
         title = str(t.get("movie_title") or "").lower().strip()
         year = str(t.get("movie_year") or "")
         if not title:
-            non_world.append(t)
+            groups.append([t])
             continue
         group = [t]
         used.add(i)
-        for j, u in enumerate(world):
+        for j, u in enumerate(topics_list):
             if j in used:
                 continue
             u_title = str(u.get("movie_title") or "").lower().strip()
@@ -399,38 +415,52 @@ def merge_world_duplicates(topics):
                 used.add(j)
         groups.append(group)
 
-    result = []
-    for group in groups:
-        if len(group) == 1:
-            result.append(group[0])
-            continue
+    result = [_merge_duplicates_in_group(g) for g in groups]
+    removed = len(topics_list) - len(result)
+    if removed:
+        print(f"    {collection_name}: удалено {removed} дубликатов")
+    return result
 
-        def _seeders(t):
-            s = t.get('seeders')
-            try:
-                return int(s) if s is not None else -1
-            except (ValueError, TypeError):
-                return -1
 
-        def _has_magnet(t):
-            return bool(t.get('magnet'))
+def merge_world_duplicates(topics):
+    """Merge duplicate world topics within each collection separately.
 
-        best_candidates = [t for t in group if _has_magnet(t)]
-        if best_candidates:
-            best = max(best_candidates, key=_seeders)
+    Deduplication runs per collection (piratebay_top, tpbparty_top)
+    so that the same movie in different world collections is kept in each.
+
+    For each fuzzy-duplicate group (movie_title + movie_year):
+    - Pick the topic with highest seeders as the primary
+    - Preserve enrich fields (ratings, poster, trailer, ids, genre) from
+      any group member
+    - Listing fields (magnet, size, format, seeders, etc.) come from primary
+    - Non-world topics pass through unchanged
+    """
+    by_collection: dict[str, list[dict]] = {}
+    non_world = []
+    for t in topics:
+        coll = t.get('collection', '')
+        if is_world_collection(coll):
+            by_collection.setdefault(coll, []).append(t)
         else:
-            best = max(group, key=_seeders)
+            non_world.append(t)
 
-        for field in _ENRICH_FIELDS:
-            if _enrich_field_empty(best, field):
-                for member in group:
-                    if member is not best and not _enrich_field_empty(member, field):
-                        best[field] = member[field]
-                        break
+    if not by_collection:
+        return topics
 
-        result.append(best)
+    total_before = sum(len(v) for v in by_collection.values())
+    for coll in by_collection:
+        by_collection[coll] = _dedup_one_collection(by_collection[coll], coll)
+    total_after = sum(len(v) for v in by_collection.values())
 
-    return non_world + result
+    result = non_world[:]
+    for coll in sorted(by_collection.keys()):
+        result.extend(by_collection[coll])
+
+    removed_total = total_before - total_after
+    if removed_total:
+        print(f"  Всего мировых дубликатов: удалено {removed_total}, объединены enrich-поля")
+
+    return result
 
 
 def world_page_hash(html):
