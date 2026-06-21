@@ -458,8 +458,105 @@ def merge_world_duplicates(topics):
 
     removed_total = total_before - total_after
     if removed_total:
-        print(f"  Всего мировых дубликатов: удалено {removed_total}, объединены enrich-поля")
+        print(f"  Всего мировых дубликатов (по названию): удалено {removed_total}, объединены enrich-поля")
 
+    return result
+
+
+def merge_world_by_id(topics):
+    """Merge world topics with identical imdb_id or kp_id.
+
+    Deduplication runs per collection (piratebay_top, tpbparty_top).
+    Within each collection, topics sharing the same imdb_id (non-empty)
+    are grouped and merged.  Remaining topics without imdb_id are then
+    checked by kp_id.
+
+    For each matching group:
+    - Pick the topic with highest seeders as the primary
+    - Preserve enrich fields from any group member
+    - Listing fields (magnet, size, format, seeders, etc.) come from primary
+    - Non-world topics pass through unchanged
+    """
+    by_collection: dict[str, list[dict]] = {}
+    non_world = []
+    for t in topics:
+        coll = t.get('collection', '')
+        if is_world_collection(coll):
+            by_collection.setdefault(coll, []).append(t)
+        else:
+            non_world.append(t)
+
+    if not by_collection:
+        return topics
+
+    total_before = sum(len(v) for v in by_collection.values())
+    for coll in by_collection:
+        by_collection[coll] = _dedup_one_collection_by_id(by_collection[coll], coll)
+    total_after = sum(len(v) for v in by_collection.values())
+
+    result = non_world[:]
+    for coll in sorted(by_collection.keys()):
+        result.extend(by_collection[coll])
+
+    removed_total = total_before - total_after
+    if removed_total:
+        print(f"  Всего мировых дубликатов (по ID): удалено {removed_total}, объединены enrich-поля")
+
+    return result
+
+
+def _dedup_one_collection_by_id(topics_list, collection_name):
+    """Deduplicate world topics within a single collection by imdb_id / kp_id."""
+    if not topics_list:
+        return []
+
+    def _id_key(t):
+        """Return (imdb_id, kp_id) tuple, empty strings for missing."""
+        return ((t.get('imdb_id') or '').strip(),
+                (t.get('kp_id') or '').strip())
+
+    groups = []
+    used = set()
+
+    # Pass 1: group by non-empty imdb_id
+    by_imdb: dict[str, list[int]] = {}
+    for i, t in enumerate(topics_list):
+        imdb = (t.get('imdb_id') or '').strip()
+        if imdb:
+            by_imdb.setdefault(imdb, []).append(i)
+
+    for imdb, indices in by_imdb.items():
+        if len(indices) >= 2:
+            group = [topics_list[i] for i in indices]
+            groups.append(group)
+            used.update(indices)
+
+    # Pass 2: remaining topics grouped by non-empty kp_id (only if validated)
+    remaining = [i for i in range(len(topics_list)) if i not in used]
+    by_kp: dict[str, list[int]] = {}
+    for i in remaining:
+        t = topics_list[i]
+        if not t.get('_kp_validated'):
+            continue
+        kp = (t.get('kp_id') or '').strip()
+        if kp:
+            by_kp.setdefault(kp, []).append(i)
+
+    for kp, indices in by_kp.items():
+        if len(indices) >= 2:
+            group = [topics_list[i] for i in indices]
+            groups.append(group)
+            used.update(indices)
+
+    # Pass 3: singletons pass through
+    result = [_merge_duplicates_in_group(g) for g in groups]
+    for i in range(len(topics_list)):
+        if i not in used:
+            result.append(topics_list[i])
+
+    removed = len(topics_list) - len(result)
+    if removed:
+        print(f"    {collection_name}: удалено {removed} дубликатов по ID")
     return result
 
 

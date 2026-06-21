@@ -25,6 +25,7 @@ from world_sources import (
     is_world_source,
     is_world_topic,
     merge_world_duplicates,
+    merge_world_by_id,
     parse_world_page,
     search_world_youtube_trailer,
     world_page_hash,
@@ -499,20 +500,20 @@ def clean_title(raw):
     t = raw.strip()
     t = re.sub(r'^tt\d+\s*', '', t)
     t = re.sub(r'\s*\[.*?\]', '', t)
+    t = re.sub(r'[._]', ' ', t)
     year_m = re.search(r'\((\d{4})\)', t) or re.search(r'\b(19\d{2}|20\d{2})\b', t)
     year = year_m.group(1) if year_m else ''
     t = re.sub(r'\s*\(\d{4}\)\s*', ' ', t)
     t = re.sub(r'\(.*?\)', ' ', t)
     t = re.sub(r'\[.*?\]', ' ', t)
     t = re.sub(r'(?i)\b(1080p|720p|2160p|480p|WEBRip|WEB-DL|WEB|BluRay|BRRip|HDRip|DVDRip|DCPRip|'
-               r'x264|x265|h264|h265|HEVC|AVC|AAC|AC3|DDP|DTS|MP4|MKV|AVI|'
+               r'x264|x265|h264|h265|HEVC|AVC|AAC\d*|AC3\d*|DDP\d*|DTS|MP4|MKV|AVI|'
                r'10bit|8bit|5\s*[. ]\s*1|2\s*[. ]\s*0|6CH|'
                r'REPACK|PROPER|READNFO|iNTERNAL|EXTENDED|UNRATED|DC|FINAL|COMPLETE|'
                r'YTS|RARBG|RMTeam|NeoNoir|SupaCvnt|FLUX|BTM|'
                r'WEBRip|WEB\s*[.-]\s*DL|WEB\s*Line|AMZN|DSNP|NF|MA|PMNTP|PLAY|Early\s*Release|'
                r'CAM|TELESYNC|HDTS|TS|TC|SCREENER'
                r')\b', ' ', t, flags=re.I)
-    t = re.sub(r'[._]', ' ', t)
     t = re.sub(r'\s+', ' ', t).strip()
     t = re.sub(r'\s*-\s*\w+$', '', t)
     t = re.sub(r'(?i)\b(LEAK|PLAY|DUAL|LINKS|SCREENER|TS|CAM|HDRip)\b', '', t)
@@ -586,7 +587,7 @@ def clean_title_deep(raw):
     t = re.sub(r'\s*-\s*\S+$', '', t)
     t = re.sub(r'(?i)\b(1080p|720p|2160p|480p|WEBRip|WEB-DL|WEB|BluRay|BRRip|HDRip|DVDRip|'
                r'DCPRip|HDTS|HDRip|CAM|TS|TC|TELESYNC|'
-               r'x264|x265|h264|h265|HEVC|AVC|AAC|AC3|DDP|DTS|MP4|MKV|AVI|'
+               r'x264|x265|h264|h265|HEVC|AVC|AAC\d*|AC3\d*|DDP\d*|DTS|MP4|MKV|AVI|'
                r'10bit|8bit|5[.\s]+1|2[.\s]+0|6CH|7CH|'
                r'REPACK|PROPER|READNFO|iNTERNAL|EXTENDED|UNRATED|DC|FINAL|COMPLETE|'
                r'YTS|RARBG|RMTeam|NeoNoir|SupaCvnt|FLUX|BTM|'
@@ -2002,6 +2003,15 @@ def repair_world_titles(topics):
         if not raw or not tech.search(mt):
             continue
         new_title, year = clean_title(raw)
+        if year:
+            idx = new_title.find(year)
+            if idx >= 0:
+                before = new_title[:idx].strip()
+                words = before.split()
+                new_title = ' '.join(words)
+            new_title = new_title.replace(f' {year}', '').strip()
+            new_title = re.sub(rf'\s*{year}\s*', ' ', new_title).strip()
+            new_title = re.sub(r'\s+', ' ', new_title).strip()
         if not new_title or new_title == mt:
             continue
         old = mt[:50]
@@ -3406,6 +3416,15 @@ def main():
                 print("OK")
             else:
                 print("poster ne najden")
+
+    # Advanced dedup: merge topics with identical imdb_id or kp_id
+    # Must run AFTER re-enrich so IDs are populated
+    if any(is_world_topic(t) for t in topics):
+        before = len(topics)
+        topics = merge_world_by_id(topics)
+        removed = before - len(topics)
+        if removed:
+            print(f"  Мировые дубликаты по ID: удалено {removed}, объединены enrich-поля")
 
     save_json(TORRENTS_CACHE, topics)
 

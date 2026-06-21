@@ -56,7 +56,8 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 | `kino_sng` | Фильмы ближнего зарубежья | `https://rutracker.net/forum/viewforum.php?f=2540` |
 | `novinki_2026` | Новинки 2026 | `https://rutracker.net/forum/viewforum.php?f=252` |
 | `kino_sng_hd` | Фильмы Ближнего Зарубежья (HD Video) | `https://rutracker.net/forum/viewforum.php?f=1247` |
-| `piratebay_top` | World TOP | `https://1.piratebays.to/top/207` |
+| `piratebay_top` | World * | `https://1.piratebays.to/top/207` |
+| `tpbparty_top` | World ** | `https://tpb.party/top/207` |
 
 `MAX_TOPICS=30` — лимит пополнения коллекции за один refresh. Это не жёсткий лимит размера коллекции. Если в коллекции уже больше 30 тем, они остаются валидными, пока не удалены housekeeping.
 
@@ -69,7 +70,9 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 1. Читать `viewforum.php` и брать список тем.
 2. Открывать `viewtopic.php?t=XXXXX`, извлекать magnet, постер, дату регистрации темы и дополнительные признаки.
 
-Коллекция `piratebay_top` использует отдельный одноуровневый парсер Pirate Bay: magnet берётся сразу из listing, `topic_id` формируется как `pb_<btih>`, постеры и рейтинги догоняются обычным enrich.
+Коллекции `piratebay_top` и `tpbparty_top` используют отдельные одноуровневые парсеры world-источников: magnet берётся сразу из listing, `topic_id` формируется как `pb_<btih>` и `tpb_<btih>`, постеры и рейтинги догоняются обычным enrich.
+
+Для world-коллекций применяется дедупликация по `movie_title + movie_year` с fuzzy-проверкой близких названий. Улучшенная верификация YouTube-трейлеров используется только для `World *` и `World **`.
 
 Refresh должен сливать новые темы с существующим кешем, а не обрезать коллекцию до последних 30. Если новых тем нет, тяжёлое обогащение можно пропускать.
 
