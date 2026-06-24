@@ -15,8 +15,8 @@ from html import escape, unescape
 import requests
 from bs4 import BeautifulSoup
 
-from config import LISTING_CACHE_MAX_AGE_DAYS, WORKER_COUNT
-from project_io import atomic_write_json, atomic_write_text
+from config import IMDB_DATASET_MAX_AGE_DAYS, LISTING_CACHE_MAX_AGE_DAYS, WORKER_COUNT
+from project_io import atomic_write_json, atomic_write_text, file_lock
 
 COLLECTIONS = {
     'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22',     'age_cleanup': True,  'skip_topics': 2},
@@ -39,6 +39,7 @@ BASICS_CACHE = os.path.join(DATA_DIR, "imdb_basics_cache.json")
 IMDB_DATA_DIR = os.path.join(DATA_DIR, "imdb")
 RATINGS_DATASET = os.path.join(IMDB_DATA_DIR, "title.ratings.tsv.gz")
 BASICS_DATASET = os.path.join(IMDB_DATA_DIR, "title.basics.tsv.gz")
+IMDB_DATASET_DOWNLOAD_LOCK = os.path.join(IMDB_DATA_DIR, "datasets.download")
 
 FORBIDDEN_GENRES = {'ужасы', 'horror', 'секс', 'sex', 'эротика', 'erotica', 'порно', 'porn'}
 
@@ -1227,6 +1228,37 @@ def remove_file_quietly(path):
         pass
 
 
+def is_imdb_dataset_fresh(path):
+    if not os.path.exists(path):
+        return False
+    max_age_seconds = IMDB_DATASET_MAX_AGE_DAYS * 86400
+    return time.time() - os.path.getmtime(path) < max_age_seconds
+
+
+def scan_or_download_imdb_dataset(path, url, label, needed_ids, scan_func):
+    found = scan_func(path, needed_ids)
+    if not needed_ids or needed_ids.issubset(found.keys()):
+        return found
+
+    with file_lock(IMDB_DATASET_DOWNLOAD_LOCK):
+        found = scan_func(path, needed_ids)
+        if needed_ids.issubset(found.keys()):
+            return found
+        if is_imdb_dataset_fresh(path):
+            print(f"   IMDB {label} dataset свежее {IMDB_DATASET_MAX_AGE_DAYS} дней; не скачиваю повторно")
+            return found
+
+        tmp_path = download_imdb_dataset(url, path, label)
+        fresh = scan_func(tmp_path, needed_ids)
+        if fresh:
+            promote_imdb_dataset(tmp_path, path)
+            return fresh
+
+        remove_file_quietly(tmp_path)
+        print(f"   Свежий {label} dataset не содержит нужные ID; оставляю текущий файл")
+        return found
+
+
 def scan_ratings_dataset(path, needed_ids):
     found = {}
     if not os.path.exists(path):
@@ -1268,16 +1300,13 @@ def load_ratings(needed_ids):
         return {k: v for k, v in cached.items() if k in needed_ids and v is not None}
     missing_ids = set(needed_ids) - set(cached.keys())
     try:
-        ratings = scan_ratings_dataset(RATINGS_DATASET, missing_ids)
-        if missing_ids and not missing_ids.issubset(ratings.keys()):
-            tmp_path = download_imdb_dataset(RATINGS_URL, RATINGS_DATASET, "ratings")
-            fresh_ratings = scan_ratings_dataset(tmp_path, missing_ids)
-            if fresh_ratings:
-                promote_imdb_dataset(tmp_path, RATINGS_DATASET)
-                ratings = fresh_ratings
-            else:
-                remove_file_quietly(tmp_path)
-                print("   Свежий ratings dataset не содержит нужные ID; оставляю текущий файл")
+        ratings = scan_or_download_imdb_dataset(
+            RATINGS_DATASET,
+            RATINGS_URL,
+            "ratings",
+            missing_ids,
+            scan_ratings_dataset,
+        )
         for tid in missing_ids:
             if tid not in ratings:
                 ratings[tid] = None
@@ -1297,16 +1326,13 @@ def load_basics(needed_ids):
         return {k: v for k, v in cached.items() if k in needed_ids and v is not None}
     missing_ids = set(needed_ids) - set(cached.keys())
     try:
-        basics = scan_basics_dataset(BASICS_DATASET, missing_ids)
-        if missing_ids and not missing_ids.issubset(basics.keys()):
-            tmp_path = download_imdb_dataset(BASICS_URL, BASICS_DATASET, "basics")
-            fresh_basics = scan_basics_dataset(tmp_path, missing_ids)
-            if fresh_basics:
-                promote_imdb_dataset(tmp_path, BASICS_DATASET)
-                basics = fresh_basics
-            else:
-                remove_file_quietly(tmp_path)
-                print("   Свежий basics dataset не содержит нужные ID; оставляю текущий файл")
+        basics = scan_or_download_imdb_dataset(
+            BASICS_DATASET,
+            BASICS_URL,
+            "basics",
+            missing_ids,
+            scan_basics_dataset,
+        )
         for tid in missing_ids:
             if tid not in basics:
                 basics[tid] = None
@@ -1950,8 +1976,31 @@ def prune_unplayable_topics(topics):
     return playable
 
 
+def ensure_topic_defaults(topic):
+    defaults = {
+        'imdb_id': None,
+        'imdb_rating': None,
+        'imdb_votes': None,
+        'kp_id': None,
+        'kp_rating': None,
+        'kp_votes': None,
+        'poster_url': '',
+        'youtube_url': '',
+        'genre': '',
+        'format': '',
+        'cast': '',
+    }
+    for key, value in defaults.items():
+        topic.setdefault(key, value)
+    return topic
+
+
 def clean_catalog_topics(topics):
-    return prune_unplayable_topics(topics)
+    playable = prune_unplayable_topics(topics)
+    for topic in playable:
+        ensure_topic_defaults(topic)
+    return playable
+
 
 
 def enrich(topics, ratings, basics):
@@ -2074,12 +2123,14 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         if str(t.get('topic_id', '')) in hidden_ids:
             continue
         prefer_imdb = t.get('collection') == 'piratebay_top' or t.get('source') == 'piratebay'
+        kp_rating = t.get('kp_rating') or ''
+        imdb_rating = t.get('imdb_rating') or ''
         if prefer_imdb:
-            rating = t['imdb_rating'] or t['kp_rating'] or '—'
-            rating_label = 'IMDB' if t['imdb_rating'] else 'КП' if t['kp_rating'] else ''
+            rating = imdb_rating or kp_rating or '—'
+            rating_label = 'IMDB' if imdb_rating else 'КП' if kp_rating else ''
         else:
-            rating = t['kp_rating'] or t['imdb_rating'] or '—'
-            rating_label = 'КП' if t['kp_rating'] else 'IMDB' if t['imdb_rating'] else ''
+            rating = kp_rating or imdb_rating or '—'
+            rating_label = 'КП' if kp_rating else 'IMDB' if imdb_rating else ''
         rating_cls = ''
         if rating and rating != '—':
             r = float(rating)
@@ -2092,7 +2143,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
             rating_url = f"https://www.imdb.com/title/{t['imdb_id']}/"
         else:
             rating_url = '#'
-        votes = t['kp_votes'] or t['imdb_votes'] or ''
+        votes = t.get('kp_votes') or t.get('imdb_votes') or ''
         votes_str = f" ({votes})" if votes else ''
         votes_html = f'<span class="rv">{escape(votes_str)}</span>' if votes_str else ''
         votes_title = f' title="{votes} голосов"' if votes else ''

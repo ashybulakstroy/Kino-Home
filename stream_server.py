@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_NO_CHANGE_RETRY_DAYS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -103,6 +103,81 @@ SESSION_SWEEP_INTERVAL = 10
 MAX_STREAM_SESSIONS = 10
 _sessions_lock = threading.Lock()
 _stream_sessions: dict[str, dict[str, float | str]] = {}
+
+
+def _get_path_size(path: str) -> int:
+    if os.path.isdir(path):
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    continue
+        return total
+    return os.path.getsize(path)
+
+
+def _remove_temp_path(path: str):
+    def _onerror(func, p, _exc_info):
+        os.chmod(p, 0o777)
+        func(p)
+
+    if os.path.isdir(path):
+        shutil.rmtree(path, onexc=_onerror)
+        return
+    try:
+        os.chmod(path, 0o777)
+    except OSError:
+        pass
+    os.remove(path)
+
+
+def cleanup_temp_files(max_size_bytes: int, max_age_secs: float, max_files: int = 0) -> list[str]:
+    """Clean temp files without instantiating libtorrent at server startup."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    active: set[str] = set()
+    if engine._engine is not None:
+        active = engine._engine.get_active_folder_names()
+
+    candidates: list[tuple[str, float, int]] = []
+    for entry in os.listdir(TEMP_DIR):
+        full_path = os.path.join(TEMP_DIR, entry)
+        if entry.lower() in active:
+            continue
+        try:
+            mtime = os.path.getmtime(full_path)
+            size = _get_path_size(full_path)
+        except OSError:
+            continue
+        candidates.append((full_path, mtime, size))
+
+    removed: list[str] = []
+    now = time.time()
+    for path, mtime, _size in candidates:
+        if now - mtime > max_age_secs:
+            _remove_temp_path(path)
+            removed.append(path)
+
+    candidates = [(p, m, s) for p, m, s in candidates if os.path.exists(p)]
+    candidates.sort(key=lambda x: x[1])
+    total = sum(s for _p, _m, s in candidates)
+    for path, _mtime, size in candidates:
+        if total <= max_size_bytes:
+            break
+        _remove_temp_path(path)
+        total -= size
+        removed.append(path)
+
+    if max_files > 0:
+        candidates = [(p, m, s) for p, m, s in candidates if os.path.exists(p)]
+        while len(candidates) > max_files:
+            path, _mtime, _size = candidates.pop(0)
+            _remove_temp_path(path)
+            removed.append(path)
+
+    return removed
 _session_monitor_started = False
 
 _transcode_lock = threading.Lock()
@@ -488,15 +563,13 @@ def _topic_enrich_needs(topic):
         'trailer': trailer_due,
         'kp': kp_due,
         'core': core_due,
-        'any': core_due or trailer_due,
+        'any': core_due,
         'format_missing': not topic.get('format'),
     }
 
 
 def _enrich_priority(topic, needs):
-    trailer_only = needs['trailer'] and not needs['core']
     return (
-        1 if trailer_only else 0,
         0 if needs['poster'] else 1,
         0 if needs['rating'] else 1,
         0 if needs.get('genre') else 1,
@@ -504,6 +577,71 @@ def _enrich_priority(topic, needs):
         0 if not topic.get('format') else 1,
         int(topic.get('listing_order') or 999),
     )
+
+
+_ENRICH_TRACKED_FIELDS = {
+    'magnet': 'magnet',
+    'poster_url': 'poster',
+    'imdb_id': 'IMDB ID',
+    'imdb_rating': 'IMDB rating',
+    'imdb_votes': 'IMDB votes',
+    'kp_id': 'KP ID',
+    'kp_rating': 'KP rating',
+    'kp_votes': 'KP votes',
+    'genre': 'genre',
+    'format': 'format',
+    'youtube_url': 'trailer',
+    'cast': 'cast',
+    '_kp_validated': 'KP validation',
+    '_kp_retried': 'KP retry mark',
+    '_poster_failed_at': 'poster retry delay',
+    '_poster_failed': 'poster failed',
+    '_magnet_failed': 'magnet failed',
+    '_enrich_no_change_at': 'no-change retry delay',
+}
+
+
+def _snapshot_enrich_fields(topic):
+    return {field: topic.get(field) for field in _ENRICH_TRACKED_FIELDS}
+
+
+def _describe_enrich_changes(before, topic):
+    added = []
+    updated = []
+    cleared = []
+    for field, label in _ENRICH_TRACKED_FIELDS.items():
+        old = before.get(field)
+        new = topic.get(field)
+        if old == new:
+            continue
+        if not old and new:
+            added.append(label)
+        elif old and not new:
+            cleared.append(label)
+        else:
+            updated.append(label)
+
+    parts = []
+    if added:
+        parts.append('добавлено: ' + ', '.join(added))
+    if updated:
+        parts.append('обновлено: ' + ', '.join(updated))
+    if cleared:
+        parts.append('очищено: ' + ', '.join(cleared))
+    return '; '.join(parts) if parts else 'без изменений'
+
+
+def _enrich_no_change_cooldown_active(topic):
+    if ENRICH_NO_CHANGE_RETRY_DAYS <= 0:
+        return False
+    value = topic.get('_enrich_no_change_at')
+    if not value:
+        return False
+    try:
+        last_date = datetime.fromisoformat(str(value)).date()
+    except ValueError:
+        return False
+    return date.today() - last_date < timedelta(days=ENRICH_NO_CHANGE_RETRY_DAYS)
 
 
 def _enrich_missing(force: bool = False):
@@ -534,6 +672,8 @@ def _enrich_missing(force: bool = False):
             retries = topic.get('_enrich_retries', 0)
             if not force and retries >= MAX_ENRICH_RETRIES and needs['core']:
                 continue
+            if not force and _enrich_no_change_cooldown_active(topic):
+                continue
             tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
 
         tasks.sort(key=lambda item: item[0])
@@ -544,15 +684,24 @@ def _enrich_missing(force: bool = False):
             _priority, idx, needs, retries = item
             topic = topics[idx]
             title = topic.get('movie_title') or topic.get('title', '?')
-            include_trailer = bool(needs['trailer'] and not needs['core'])
+            include_trailer = bool(needs['trailer'])
             print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
+            before = _snapshot_enrich_fields(topic)
             topic['_enrich_retries'] = retries + 1
             gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
             still = _topic_enrich_needs(topic)
+            changes = _describe_enrich_changes(before, topic)
+            if still['core'] and changes == 'без изменений':
+                topic['_enrich_no_change_at'] = date.today().isoformat()
+                changes = _describe_enrich_changes(before, topic)
+            elif changes != 'без изменений':
+                topic.pop('_enrich_no_change_at', None)
+                changes = _describe_enrich_changes(before, topic)
             if not still['core']:
                 topic.pop('_enrich_retries', None)
-                return topic.get('topic_id'), 'OK'
-            return topic.get('topic_id'), 'ещё не все данные'
+                topic.pop('_enrich_no_change_at', None)
+                return topic.get('topic_id'), f'OK ({changes})'
+            return topic.get('topic_id'), f'ещё не все данные ({changes})'
 
         if tasks:
             with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(tasks))) as executor:
@@ -1490,7 +1639,7 @@ def cleanup_trigger():
     _reject_public_admin()
     if not _rate_limit(f'cleanup:{request.remote_addr}', seconds=10):
         return jsonify(error='rate limited'), 429
-    removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
+    removed = cleanup_temp_files(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
     topics = cleanup_old_topics()
     return jsonify(removed=removed, count=len(removed), topics=topics)
 
@@ -2447,7 +2596,7 @@ if __name__ == '__main__':
 
     def _deferred_cleanup():
         print('Запускаю очистку temp...')
-        removed = engine.cleanup(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
+        removed = cleanup_temp_files(MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES)
         if removed:
             print(f'  Удалено папок: {len(removed)}')
             for p in removed:
