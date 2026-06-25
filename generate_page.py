@@ -2324,6 +2324,46 @@ def ensure_topic_defaults(topic):
     return topic
 
 
+def world_duplicate_hash(topic):
+    topic_id = str(topic.get('topic_id') or '')
+    if topic_id.startswith(('pb_', 'tpb_')):
+        return topic_id.split('_', 1)[1].lower()
+    return ''
+
+
+def sync_world_duplicate_posters(topics):
+    by_hash = {}
+    for topic in topics:
+        if not is_world_topic(topic):
+            continue
+        key = world_duplicate_hash(topic)
+        if key:
+            by_hash.setdefault(key, []).append(topic)
+
+    updated = 0
+    for group in by_hash.values():
+        if len(group) < 2:
+            continue
+        source = next((t for t in group if has_real_poster(t)), None)
+        if not source:
+            continue
+        poster_url = source.get('poster_url') or ''
+        for topic in group:
+            if topic is source or has_real_poster(topic):
+                continue
+            old_url = topic.get('poster_url', '')
+            topic['poster_url'] = poster_url
+            if has_real_poster(topic):
+                clear_poster_failed(topic)
+                updated += 1
+            else:
+                topic['poster_url'] = old_url
+
+    if updated:
+        print(f"  World постеры: перенесено между дублями: {updated}")
+    return updated
+
+
 def clean_catalog_topics(topics):
     playable = prune_unplayable_topics(topics)
     for topic in playable:
@@ -2332,6 +2372,7 @@ def clean_catalog_topics(topics):
     playable = merge_world_by_id(playable)
     for topic in playable:
         ensure_topic_defaults(topic)
+    sync_world_duplicate_posters(playable)
     return playable
 
 
