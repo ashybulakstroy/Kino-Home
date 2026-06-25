@@ -786,6 +786,7 @@ _KP_TECH_WORDS = {
     'hdr','dts','ac3','aac','ddp','ddp5','ddp7','x264','x265','hevc','h264',
     'h265','10bit','8bit','bone','repack','proper','internal','readnfo',
     'vf1','vf2','vf3','vostfr','multi','subs','sub','eng','rus',
+    'yg',
 }
 
 
@@ -793,6 +794,7 @@ def _clean_kp_search_title(title):
     title = re.sub(r'\b\d{4}\b', '', title)
     pattern = r'\b(?:' + '|'.join(_KP_TECH_WORDS) + r')\b'
     title = re.sub(pattern, '', title, flags=re.IGNORECASE)
+    title = re.sub(r'[^\w\s,;:.!?-]+', ' ', title, flags=re.UNICODE)
     title = re.sub(r'[\s,;:.!?\-]+', ' ', title).strip()
     return title
 
@@ -890,7 +892,8 @@ def search_kinopoisk_ids(topics):
             return
         if not year:
             year = _extract_year_from_title(t)
-        cache_key = f"{title}|{year}".lower()
+        cache_title = _clean_kp_search_title(title)
+        cache_key = f"{cache_title}|{year}".lower()
         with counter_lock:
             counter += 1
             idx = counter
@@ -1370,11 +1373,11 @@ def download_kinopoisk_poster(kp_id):
     if not kp_id:
         return ''
     os.makedirs(POSTERS_DIR, exist_ok=True)
-    filename = f"kp_{kp_id}.jpg"
-    local_path = os.path.join(POSTERS_DIR, filename)
-    poster_path = f"{POSTERS_URL}/{filename}"
-    if os.path.exists(local_path):
-        return poster_path
+    for ext in ('jpg', 'jpeg', 'png', 'webp'):
+        filename = f"kp_{kp_id}.{ext}"
+        local_path = os.path.join(POSTERS_DIR, filename)
+        if os.path.exists(local_path):
+            return f"{POSTERS_URL}/{filename}"
     urls = [
         f"https://st.kp.yandex.net/images/film_big/{kp_id}.jpg",
         f"https://st.kp.yandex.net/images/film_iphone/iphone360_{kp_id}.jpg",
@@ -1386,13 +1389,67 @@ def download_kinopoisk_poster(kp_id):
         try:
             r = SESSION.get(url, timeout=15, headers=headers)
             content_type = r.headers.get('content-type', '').lower()
-            if r.status_code == 200 and 'image' in content_type and r.content.startswith(b'\xff\xd8'):
+            ext = ''
+            if r.content.startswith(b'\xff\xd8'):
+                ext = 'jpg'
+            elif r.content.startswith(b'\x89PNG'):
+                ext = 'png'
+            elif r.content.startswith(b'RIFF') and b'WEBP' in r.content[:16]:
+                ext = 'webp'
+            if r.status_code == 200 and 'image' in content_type and ext:
+                filename = f"kp_{kp_id}.{ext}"
+                local_path = os.path.join(POSTERS_DIR, filename)
                 with open(local_path, 'wb') as f:
                     f.write(r.content)
-                return poster_path
+                return f"{POSTERS_URL}/{filename}"
         except Exception:
             continue
     return ''
+
+
+def _image_extension(content):
+    if content.startswith(b'\xff\xd8'):
+        return 'jpg'
+    if content.startswith(b'\x89PNG'):
+        return 'png'
+    if content.startswith(b'RIFF') and b'WEBP' in content[:16]:
+        return 'webp'
+    return ''
+
+
+def download_impawards_poster(topic):
+    title = topic.get('movie_title') or topic.get('orig_title') or ''
+    year = str(topic.get('movie_year') or '').strip()
+    if not title or not year:
+        return ''
+    clean_title = _clean_kp_search_title(title)
+    slug = re.sub(r'[^a-z0-9]+', '_', clean_title.lower()).strip('_')
+    if not slug:
+        return ''
+    page_url = f"http://www.impawards.com/{year}/{slug}.html"
+    headers = dict(HEADERS)
+    headers['Referer'] = f"http://www.impawards.com/{year}/"
+    try:
+        r = SESSION.get(page_url, timeout=12, headers=headers)
+        if r.status_code != 200:
+            return ''
+        m = re.search(r'<img[^>]+src="([^"]*posters/[^"]+)"', r.text, flags=re.IGNORECASE)
+        if not m:
+            return ''
+        image_url = urllib.parse.urljoin(page_url, m.group(1))
+        img = SESSION.get(image_url, timeout=15, headers=headers)
+        content_type = img.headers.get('content-type', '').lower()
+        ext = _image_extension(img.content)
+        if img.status_code != 200 or 'image' not in content_type or not ext:
+            return ''
+        os.makedirs(POSTERS_DIR, exist_ok=True)
+        filename = f"imp_{topic.get('topic_id')}.{ext}"
+        local_path = os.path.join(POSTERS_DIR, filename)
+        with open(local_path, 'wb') as f:
+            f.write(img.content)
+        return f"{POSTERS_URL}/{filename}"
+    except Exception:
+        return ''
 
 
 def clean_and_translate_genre(genre_text):
@@ -2941,7 +2998,8 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                     clear_poster_failed(topic)
 
     cache_key = f"{title}|{year}".lower()
-    kp_key = f"{russian_title}|{year}".lower()
+    kp_title = _clean_kp_search_title(russian_title)
+    kp_key = f"{kp_title}|{year}".lower()
     needs_kp = not topic.get('kp_rating')
     is_world = is_world_topic(topic)
     if is_world and topic.get('kp_id'):
@@ -2976,6 +3034,12 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
 
     if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
         local_url = download_kinopoisk_poster(topic['kp_id'])
+        if local_url:
+            topic['poster_url'] = local_url
+            clear_poster_failed(topic)
+
+    if is_world and not has_real_poster(topic) and retry_poster:
+        local_url = download_impawards_poster(topic)
         if local_url:
             topic['poster_url'] = local_url
             clear_poster_failed(topic)
