@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_NO_CHANGE_RETRY_DAYS
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_RETRY_COOLDOWN_MINUTES, ENRICH_NO_CHANGE_RETRY_DAYS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -197,6 +197,7 @@ _html_cache: tuple[float, str, str] | None = None  # (mtime, etag, html)
 _html_cache_lock = threading.Lock()
 DAILY_REFRESH_LIMIT = max(1, DAILY_REFRESH_MAX_PER_DAY)
 DAILY_REFRESH_CHECK_SECONDS = max(60 * 15, int(24 * 60 * 60 / DAILY_REFRESH_LIMIT))
+DAILY_REFRESH_STARTUP_COOLDOWN_SECONDS = max(0, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES * 60)
 REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
 REFRESH_FILES = [
     'torrents_data.json',
@@ -242,19 +243,20 @@ def _read_daily_refresh_state() -> dict:
     try:
         raw = DAILY_REFRESH_STAMP.read_text('utf-8').strip()
     except FileNotFoundError:
-        return {'date': '', 'count': 0}
+        return {'date': '', 'count': 0, 'last_success_at': ''}
     if not raw:
-        return {'date': '', 'count': 0}
+        return {'date': '', 'count': 0, 'last_success_at': ''}
     if raw.startswith('{'):
         try:
             data = json.loads(raw)
             return {
                 'date': str(data.get('date') or ''),
                 'count': int(data.get('count') or 0),
+                'last_success_at': str(data.get('last_success_at') or ''),
             }
         except (ValueError, TypeError, json.JSONDecodeError):
-            return {'date': '', 'count': 0}
-    return {'date': raw, 'count': 1}
+            return {'date': '', 'count': 0, 'last_success_at': ''}
+    return {'date': raw, 'count': 1, 'last_success_at': ''}
 
 
 def _daily_refresh_count_today() -> int:
@@ -266,12 +268,30 @@ def _daily_refresh_due() -> bool:
     return _daily_refresh_count_today() < DAILY_REFRESH_LIMIT
 
 
+def _daily_refresh_startup_cooldown_active() -> bool:
+    if DAILY_REFRESH_STARTUP_COOLDOWN_SECONDS <= 0:
+        return False
+    last_success_at = _read_daily_refresh_state().get('last_success_at')
+    if last_success_at:
+        try:
+            last_success = datetime.fromisoformat(str(last_success_at))
+        except ValueError:
+            return False
+    else:
+        try:
+            last_success = datetime.fromtimestamp(DAILY_REFRESH_STAMP.stat().st_mtime)
+        except OSError:
+            return False
+    return datetime.now() - last_success < timedelta(seconds=DAILY_REFRESH_STARTUP_COOLDOWN_SECONDS)
+
+
 def _write_daily_refresh_stamp():
     count = _daily_refresh_count_today() + 1
     atomic_write_text(DAILY_REFRESH_STAMP, json.dumps({
         'date': _today_stamp(),
         'count': count,
         'limit': DAILY_REFRESH_LIMIT,
+        'last_success_at': datetime.now().isoformat(timespec='seconds'),
     }, ensure_ascii=False))
 
 
@@ -358,6 +378,9 @@ def _iter_all_collections_refresh_output():
 
 
 def _run_daily_refresh_if_due(reason: str = 'timer'):
+    if reason == 'startup' and _daily_refresh_startup_cooldown_active():
+        print(f'Автообновление: startup пропущен, последний refresh был недавно ({DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES} мин cooldown, {DAILY_REFRESH_STAMP})')
+        return
     if not _daily_refresh_due():
         print(f'Автообновление: дневной лимит исчерпан ({_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}, {DAILY_REFRESH_STAMP})')
         return
@@ -365,6 +388,9 @@ def _run_daily_refresh_if_due(reason: str = 'timer'):
         print('Автообновление: refresh уже выполняется')
         return
     try:
+        if reason == 'startup' and _daily_refresh_startup_cooldown_active():
+            print(f'Автообновление: startup пропущен, последний refresh был недавно ({DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES} мин cooldown, {DAILY_REFRESH_STAMP})')
+            return
         if not _daily_refresh_due():
             print(f'Автообновление: дневной лимит исчерпан ({_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}, {DAILY_REFRESH_STAMP})')
             return
@@ -692,6 +718,19 @@ def _enrich_no_change_cooldown_active(topic):
     return date.today() - last_date < timedelta(days=ENRICH_NO_CHANGE_RETRY_DAYS)
 
 
+def _enrich_retry_cooldown_active(topic):
+    if ENRICH_RETRY_COOLDOWN_MINUTES <= 0:
+        return False
+    value = topic.get('_enrich_attempt_at')
+    if not value:
+        return False
+    try:
+        last_attempt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return False
+    return datetime.now() - last_attempt < timedelta(minutes=ENRICH_RETRY_COOLDOWN_MINUTES)
+
+
 def _enrich_missing(force: bool = False):
     if _daily_refresh_lock.locked():
         print('  [enrich] пропуск: refresh выполняется')
@@ -722,6 +761,8 @@ def _enrich_missing(force: bool = False):
                 continue
             if not force and _enrich_no_change_cooldown_active(topic):
                 continue
+            if not force and _enrich_retry_cooldown_active(topic):
+                continue
             tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
 
         tasks.sort(key=lambda item: item[0])
@@ -736,6 +777,7 @@ def _enrich_missing(force: bool = False):
             print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
             before = _snapshot_enrich_fields(topic)
             topic['_enrich_retries'] = retries + 1
+            topic['_enrich_attempt_at'] = datetime.now().isoformat(timespec='seconds')
             gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
             still = _topic_enrich_needs(topic)
             changes = _describe_enrich_changes(before, topic)
@@ -748,6 +790,7 @@ def _enrich_missing(force: bool = False):
             if not still['core']:
                 topic.pop('_enrich_retries', None)
                 topic.pop('_enrich_no_change_at', None)
+                topic.pop('_enrich_attempt_at', None)
                 return topic.get('topic_id'), f'OK ({changes})'
             return topic.get('topic_id'), f'ещё не все данные ({changes})'
 
