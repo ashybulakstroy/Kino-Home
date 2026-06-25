@@ -1444,6 +1444,29 @@ def is_imdb_dataset_fresh(path):
     return time.time() - os.path.getmtime(path) < max_age_seconds
 
 
+def verify_imdb_ids_exist(ids, label):
+    valid = set()
+    not_found = set()
+    for imdb_id in sorted(ids):
+        try:
+            r = SESSION.get(
+                f'https://www.imdb.com/title/{imdb_id}/',
+                timeout=8,
+                allow_redirects=True,
+            )
+            if r.status_code == 200 and 'Page not found' not in r.text[:500]:
+                valid.add(imdb_id)
+            else:
+                not_found.add(imdb_id)
+        except Exception:
+            valid.add(imdb_id)
+    if not_found:
+        sample = ', '.join(sorted(not_found)[:5])
+        suffix = '...' if len(not_found) > 5 else ''
+        print(f"   IMDB IDs не найдены ({label}, {len(not_found)}): {sample}{suffix}")
+    return valid
+
+
 def scan_or_download_imdb_dataset(path, url, label, needed_ids, scan_func):
     found = scan_func(path, needed_ids)
     if not needed_ids or needed_ids.issubset(found.keys()):
@@ -1453,15 +1476,20 @@ def scan_or_download_imdb_dataset(path, url, label, needed_ids, scan_func):
         found = scan_func(path, needed_ids)
         if needed_ids.issubset(found.keys()):
             return found
+        missing_ids = set(needed_ids) - set(found.keys())
+        valid_missing_ids = verify_imdb_ids_exist(missing_ids, label)
+        if not valid_missing_ids:
+            print(f"   Все недостающие IMDB ID для {label} не найдены; dataset не скачиваю")
+            return found
         if is_imdb_dataset_fresh(path):
             print(f"   IMDB {label} dataset свежее {IMDB_DATASET_MAX_AGE_DAYS} дней; не скачиваю повторно")
             return found
 
         tmp_path = download_imdb_dataset(url, path, label)
-        fresh = scan_func(tmp_path, needed_ids)
+        fresh = scan_func(tmp_path, valid_missing_ids)
         if fresh:
             promote_imdb_dataset(tmp_path, path)
-            return fresh
+            return {**found, **fresh}
 
         remove_file_quietly(tmp_path)
         print(f"   Свежий {label} dataset не содержит нужные ID; оставляю текущий файл")
