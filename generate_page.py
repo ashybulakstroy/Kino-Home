@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,11 +21,13 @@ from project_io import atomic_write_json, atomic_write_text, file_lock
 from world_sources import (
     deduplicate_world_topics,
     filter_world_top,
+    is_verified_world_youtube_trailer,
     is_world_source,
     is_world_topic,
     merge_world_by_id,
     merge_world_duplicates,
     parse_world_page,
+    search_world_youtube_trailer,
     world_page_hash,
     world_topic_id,
 )
@@ -679,36 +682,48 @@ def _parse_imdb_result(item):
 
 def search_imdb_ids(topics):
     total = len(topics)
-    processed = 0
     imdb_cache = load_json(SEARCH_CACHE) or {}
-    for t in topics:
+    cache_lock = threading.Lock()
+    processed = 0
+    processed_lock = threading.Lock()
+
+    def _search_one(t):
+        nonlocal processed
         if t.get('imdb_id'):
-            continue
+            return
         title = t.get('orig_title') or t['movie_title']
         year = t['movie_year']
         raw_name = t['title']
         if not title:
-            continue
-        processed += 1
+            return
+        with processed_lock:
+            processed += 1
+            idx = processed
+
         cache_key = f"{title}|{year}".lower()
-        result = None
-        if cache_key in imdb_cache and imdb_cache[cache_key] is not None:
-            result = imdb_cache[cache_key]
+        with cache_lock:
+            result = imdb_cache.get(cache_key) if cache_key in imdb_cache else None
+        if result is not None:
+            pass
         else:
-            print(f"  [{processed}/{total}] {title}...", end=' ', flush=True)
+            print(f"  [{idx}/{total}] {title}...", end=' ', flush=True)
             result = search_imdb(title, year)
             if result is None:
                 deep_cache_key = f"deep:{raw_name.lower().strip()}"
-                if deep_cache_key in imdb_cache and imdb_cache[deep_cache_key] is not None:
-                    result = imdb_cache[deep_cache_key]
+                with cache_lock:
+                    cached_deep = imdb_cache.get(deep_cache_key) if deep_cache_key in imdb_cache else None
+                if cached_deep is not None:
+                    result = cached_deep
                 else:
                     result = search_imdb_deep(raw_name)
-                    if result is not None:
-                        imdb_cache[deep_cache_key] = result
-            if result is not None:
-                imdb_cache[cache_key] = result
+                    with cache_lock:
+                        if result is not None:
+                            imdb_cache[deep_cache_key] = result
+                        save_json(SEARCH_CACHE, imdb_cache)
+            with cache_lock:
+                if result is not None:
+                    imdb_cache[cache_key] = result
                 save_json(SEARCH_CACHE, imdb_cache)
-            time.sleep(0.1)
         if result:
             if isinstance(result, str):
                 imdb_id = result
@@ -727,6 +742,9 @@ def search_imdb_ids(topics):
         else:
             print("не найдено", end='')
         print()
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, total or 1)) as executor:
+        list(executor.map(_search_one, topics))
     return topics
 
 
@@ -861,22 +879,32 @@ def _extract_year_from_title(topic):
 def search_kinopoisk_ids(topics):
     total = len(topics)
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    for i, t in enumerate(topics, 1):
-        title, year = t['movie_title'], t['movie_year']
+    cache_lock = threading.Lock()
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def _search_one(t):
+        nonlocal counter
+        title, year = t.get('movie_title'), t.get('movie_year')
         if not title:
-            continue
+            return
         if not year:
             year = _extract_year_from_title(t)
         cache_key = f"{title}|{year}".lower()
-        if cache_key in kp_cache and kp_cache[cache_key] is not None:
-            result = kp_cache[cache_key]
+        with counter_lock:
+            counter += 1
+            idx = counter
+        with cache_lock:
+            result = kp_cache.get(cache_key) if cache_key in kp_cache else None
+        if result is not None:
+            pass
         else:
-            print(f"  [{i}/{total}] {title}...", end=' ', flush=True)
+            print(f"  [{idx}/{total}] {title}...", end=' ', flush=True)
             result = search_kinopoisk(title, year)
-            kp_cache[cache_key] = result
-            if result:
-                save_json(KP_SEARCH_CACHE, kp_cache)
-            time.sleep(0.3)
+            with cache_lock:
+                kp_cache[cache_key] = result
+                if result:
+                    save_json(KP_SEARCH_CACHE, kp_cache)
         if result:
             t['kp_id'] = result['kp_id']
             t['kp_rating'] = result['kp_rating']
@@ -885,6 +913,9 @@ def search_kinopoisk_ids(topics):
         else:
             print("не найдено", end='')
         print()
+
+    with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, total or 1)) as executor:
+        list(executor.map(_search_one, topics))
     return topics
 
 
@@ -1293,6 +1324,26 @@ def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
     if result and _validate_youtube_url(result, title, year):
         return result
     return None
+
+
+def resolve_topic_trailer_url(topic):
+    title = topic.get('orig_title') or topic.get('movie_title') or ''
+    year = topic.get('movie_year')
+    if not title:
+        return None
+    if is_world_topic(topic):
+        cache_key = f"{title}|{year}".lower()
+        yt_cache = load_json(YOUTUBE_CACHE) or {}
+        cached_url = yt_cache.get(cache_key)
+        if cached_url and is_verified_world_youtube_trailer(SESSION, cached_url, title, year):
+            return cached_url
+        yt_url = search_world_youtube_trailer(SESSION, title, year)
+        if yt_url and is_verified_world_youtube_trailer(SESSION, yt_url, title, year):
+            yt_cache[cache_key] = yt_url
+            save_json(YOUTUBE_CACHE, yt_cache)
+            return yt_url
+        return None
+    return resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
 
 
 def download_poster(imdb_id, url):
@@ -2032,6 +2083,14 @@ def recheck_trailers(topics):
             continue
         title = t.get('movie_title', '')
         year = t.get('movie_year', '')
+        if is_world_topic(t):
+            score = 100 if is_verified_world_youtube_trailer(SESSION, yt, title, year) else 0
+            t['yt_score'] = score
+            scored_topics.append((score, yt, t))
+            total += 1
+            if total % 50 == 0:
+                yield f'  оценено: {total}'
+            continue
         try:
             r = _req.get(f'https://www.youtube.com/oembed?url={yt}&format=json', timeout=5)
             if r.status_code == 200:
@@ -2092,10 +2151,20 @@ def recheck_trailers(topics):
             yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (imdb={im})'
         if not new_yt:
             try:
-                new_yt = resolve_trailer_url(title, year, kp, im)
+                new_yt = resolve_topic_trailer_url(t)
             except Exception:
                 new_yt = None
         if new_yt:
+            if is_world_topic(t):
+                if is_verified_world_youtube_trailer(SESSION, new_yt, title, year):
+                    t['youtube_url'] = new_yt
+                    t['yt_score'] = 100
+                    replaced_weak += 1
+                    yield f'  [{tid}] {title} ({year}) score {score} -> 100: {new_yt}'
+                    continue
+                kept_weak += 1
+                yield f'  [{tid}] {title} ({year}) score {score} — оставлено'
+                continue
             try:
                 r = _req.get(f'https://www.youtube.com/oembed?url={new_yt}&format=json', timeout=5)
                 if r.status_code == 200:
@@ -2283,9 +2352,24 @@ def enrich(topics, ratings, basics):
         if t.get('youtube_url'):
             pass
         elif yt_cache.get(cache_key):
-            t['youtube_url'] = yt_cache[cache_key]
+            cached_url = yt_cache[cache_key]
+            cached_ok = (
+                is_verified_world_youtube_trailer(SESSION, cached_url, eng_title, year)
+                if is_world_topic(t)
+                else True
+            )
+            if cached_ok:
+                t['youtube_url'] = cached_url
+            else:
+                yt_url = resolve_topic_trailer_url(t)
+                t['youtube_url'] = yt_url
+                yt_cache[cache_key] = yt_url
+                save_json(YOUTUBE_CACHE, yt_cache)
+                if yt_url:
+                    print(f", трейлер ✓", end='')
+                time.sleep(0.1)
         else:
-            yt_url = resolve_trailer_url(eng_title, year, t.get('kp_id'), t.get('imdb_id'))
+            yt_url = resolve_topic_trailer_url(t)
             t['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
@@ -2622,14 +2706,15 @@ r.forEach(function(r){{tb.appendChild(r)}});sd.i=c;sd.d=a;
 document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});document.querySelectorAll('th')[c].querySelector('.ar').textContent=a>0?'▲':'▼';sortTiles()}}
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
-function hm(el){{var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
-function htm(el){{var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
+function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value)}}
+function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
+function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}
 function fh(){{hideSaved('#tbl tbody tr')}}
 function fht(){{hideSaved('.tile-card')}}
 var sx=/(?:\\bhorror\\b|\\b(?:sex|porn|xxx|erotic|adult|nsfw|onlyfans)\\b)/i;
 function updateStats(){{var rows=Array.from(document.querySelectorAll('#tbl tbody tr')).filter(function(r){{return r.style.display!=='none'}}),total=document.getElementById('stat-total'),rated=document.getElementById('stat-rated');if(total)total.textContent=rows.length;if(rated)rated.textContent=rows.filter(function(r){{return r.getAttribute('data-rated')==='1'}}).length}}
-(function(){{var dv=localStorage.getItem('dv'),sv=localStorage.getItem('sv');if(dv)document.getElementById('ds').value=dv;if(sv)document.getElementById('ss').value=sv;af();sortTiles();
+(function(){{var dv=localStorage.getItem('dv'),cv=localStorage.getItem('cv'),sv=localStorage.getItem('sv'),cs=document.getElementById('cs');if(dv)document.getElementById('ds').value=dv;if(cv&&cs){{for(var oi=0;oi<cs.options.length;oi++){{if(cs.options[oi].value===cv){{cs.value=cv;break}}}}}}if(sv)document.getElementById('ss').value=sv;af();sortTiles();
 var isTile=localStorage.getItem('tv')==='tile';if(isTile){{document.body.classList.add('tile');document.getElementById('tvb').textContent='Вид: список';sortTiles();document.querySelectorAll('#tile-grid img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}})}}
 var isMob=localStorage.getItem('mb')==='1';if(isMob){{document.body.classList.add('mobile');document.getElementById('mdb').textContent='🖥'}}}})()
 function tv(){{var b=document.body;b.classList.toggle('tile');var isTile=b.classList.contains('tile');localStorage.setItem('tv',isTile?'tile':'list');document.getElementById('tvb').textContent=isTile?'Вид: список':'Вид: плитка';if(isTile){{sortTiles();document.querySelectorAll('#tile-grid img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}})}}}}
@@ -2658,7 +2743,7 @@ function pollPlayer(h){{var s=document.getElementById('player-status'),p=documen
 async function startWatchMagnet(m,statusText,asyncOnly){{var h=hashFromMagnet(m),s=document.getElementById('player-status'),e=document.getElementById('player-error');if(!m)return '';if(!h){{window.open(m);return ''}}currentHash=h;currentSession=newSession(h);currentWatchStartedAt=Date.now();s.textContent=statusText||'Запускаю поток...';pollPlayer(h);try{{var payload={{magnet:m}};if(asyncOnly)payload.async_only=true;var r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});var d=await r.json().catch(function(){{return {{}}}});if(!r.ok||!d.info_hash){{e.textContent=d.error||'Не удалось добавить kino';return ''}}if(d.info_hash.toLowerCase()!==h){{h=d.info_hash;currentHash=h;currentSession=newSession(h);pollPlayer(h)}}s.textContent=d.async_mode?'Получаю метаданные...':'Буферизация...';return h}}catch(_err){{e.textContent='Ошибка соединения с сервером';return ''}}}}
 async function watch(el){{var m=el.getAttribute('data-magnet'),container=(el.getAttribute('data-container')||'').toLowerCase(),replacement=findStreamReplacement(el);stopCurrentSession();var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';e.textContent='';if(replacement){{await startWatchMagnet(replacement.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false);return}}if(container==='avi'){{var originalHash=hashFromMagnet(m);var originalSid='';var started=await startWatchMagnet(m,'Запускаю подготовку файла, параллельно ищу быстрый способ онлайн-просмотра...',true);originalSid=currentSession;try{{var _sr=await fetch('/status/'+started);if(_sr.ok){{var _sd=await _sr.json();if(_sd.progress>=1.0){{s.textContent='Файл уже загружен, запускаю поток...';if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}startTranscode(p,started);return}}}}}}catch(_e){{}}findExternalStreamReplacement(el).then(async function(rep){{if(!rep){{if(currentHash===originalHash||currentHash===started)s.textContent='Быстрый онлайн-вариант не найден, продолжаю подготовку файла...';return}}if(currentHash!==originalHash&&currentHash!==started)return;var oldHash=currentHash,oldSid=currentSession||originalSid;s.textContent='Найден быстрый способ онлайн-просмотра, переключаю...';try{{await fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{sid:oldSid,hash:oldHash}})}})}}catch(_e){{}}currentHash='';currentSession='';await startWatchMagnet(rep.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false)}});return}}await startWatchMagnet(m,'Запускаю поток...',false)}}
 function ac(){{af()}}
-function af(){{var d=document.getElementById('ds').value,g=document.getElementById('gs').value,c=document.getElementById('cs').value,s=document.getElementById('ss').value,h=JSON.parse(localStorage.getItem('ph')||'[]');localStorage.setItem('dv',d);localStorage.setItem('sv',s);var n=Date.now()/1000,cut=d>0?n-d*86400:0;
+function af(){{var d=document.getElementById('ds').value,g=document.getElementById('gs').value,c=document.getElementById('cs').value,s=document.getElementById('ss').value,h=JSON.parse(localStorage.getItem('ph')||'[]');localStorage.setItem('dv',d);localStorage.setItem('cv',c);localStorage.setItem('sv',s);var n=Date.now()/1000,cut=d>0?n-d*86400:0;
 [].forEach.call(document.querySelectorAll('#tbl tbody tr,.tile-card'),function(r){{var show=true,dt=parseFloat(r.getAttribute('data-date')||'0'),rg=(r.getAttribute('data-genre')||'').toLowerCase(),t=r.getAttribute('data-title')||'';if(c&&r.getAttribute('data-collection')!==c)show=false;if(show&&cut&&dt<cut)show=false;if(show&&g&&rg.indexOf(g)===-1)show=false;if(show&&(sx.test(rg)||sx.test(t)))show=false;if(show&&h.indexOf(t)!==-1)show=false;r.style.display=show?'':'none'}});
 bgf();updateStats();if(s==='lo'){{sd.i=4;sd.d=1;sortTiles()}}else if(s==='na'){{sd.i=0;sd.d=1;sortTiles()}}else if(s==='nz'){{sd.i=0;sd.d=-1;sortTiles()}}else if(s==='rh'){{sd.i=3;sd.d=-1;sortTiles()}}else if(s==='rl'){{sd.i=3;sd.d=1;sortTiles()}}else if(s==='dh'||s==='s'){{sd.i=2;sd.d=-1;sortTiles()}}else if(s==='dl'){{sd.i=2;sd.d=1;sortTiles()}}}}
 ['pointerdown','mousedown','click'].forEach(function(n){{document.addEventListener(n,function(e){{if(e.target&&e.target.id==='sound-button')unmutePlayer(e)}},true)}});
@@ -2832,13 +2917,17 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if include_trailer and not topic.get('youtube_url'):
         yt_cache = load_json(YOUTUBE_CACHE) or {}
         cached_url = yt_cache.get(cache_key)
-        if cached_url and _validate_youtube_url(cached_url, title, year):
+        if cached_url and (
+            is_verified_world_youtube_trailer(SESSION, cached_url, title, year)
+            if is_world_topic(topic)
+            else _validate_youtube_url(cached_url, title, year)
+        ):
             topic['youtube_url'] = cached_url
         else:
             if cached_url:
                 yt_cache[cache_key] = None
                 save_json(YOUTUBE_CACHE, yt_cache)
-            yt_url = resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
+            yt_url = resolve_topic_trailer_url(topic)
             topic['youtube_url'] = yt_url
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)

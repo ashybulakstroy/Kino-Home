@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_NO_CHANGE_RETRY_DAYS
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_NO_CHANGE_RETRY_DAYS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -195,7 +195,8 @@ DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
 # HTML cache: stores (mtime, processed_html) for the index page
 _html_cache: tuple[float, str, str] | None = None  # (mtime, etag, html)
 _html_cache_lock = threading.Lock()
-DAILY_REFRESH_CHECK_SECONDS = 12 * 60 * 60
+DAILY_REFRESH_LIMIT = max(1, DAILY_REFRESH_MAX_PER_DAY)
+DAILY_REFRESH_CHECK_SECONDS = max(60 * 15, int(24 * 60 * 60 / DAILY_REFRESH_LIMIT))
 REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
 REFRESH_FILES = [
     'torrents_data.json',
@@ -212,19 +213,66 @@ REFRESH_FILES = [
 REFRESH_DIRS = ['posters', 'topic_cache', 'imdb']
 
 
+def load_display_topics():
+    path = DATA_DIR / 'torrents_data.json'
+    try:
+        topics = json.loads(path.read_text('utf-8'))
+        return gp.filter_world_top(topics)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def load_full_topics():
+    path = DATA_DIR / 'torrents_data.json'
+    try:
+        return json.loads(path.read_text('utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _generate_display_html(topics):
+    return gp.generate_html(gp.filter_world_top(topics))
+
+
 def _today_stamp() -> str:
     return date.today().isoformat()
 
 
-def _daily_refresh_due() -> bool:
+def _read_daily_refresh_state() -> dict:
     try:
-        return DAILY_REFRESH_STAMP.read_text('utf-8').strip() != _today_stamp()
+        raw = DAILY_REFRESH_STAMP.read_text('utf-8').strip()
     except FileNotFoundError:
-        return True
+        return {'date': '', 'count': 0}
+    if not raw:
+        return {'date': '', 'count': 0}
+    if raw.startswith('{'):
+        try:
+            data = json.loads(raw)
+            return {
+                'date': str(data.get('date') or ''),
+                'count': int(data.get('count') or 0),
+            }
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return {'date': '', 'count': 0}
+    return {'date': raw, 'count': 1}
+
+
+def _daily_refresh_count_today() -> int:
+    state = _read_daily_refresh_state()
+    return state['count'] if state.get('date') == _today_stamp() else 0
+
+
+def _daily_refresh_due() -> bool:
+    return _daily_refresh_count_today() < DAILY_REFRESH_LIMIT
 
 
 def _write_daily_refresh_stamp():
-    atomic_write_text(DAILY_REFRESH_STAMP, _today_stamp())
+    count = _daily_refresh_count_today() + 1
+    atomic_write_text(DAILY_REFRESH_STAMP, json.dumps({
+        'date': _today_stamp(),
+        'count': count,
+        'limit': DAILY_REFRESH_LIMIT,
+    }, ensure_ascii=False))
 
 
 def _copy_existing_refresh_data(staging_dir):
@@ -311,21 +359,21 @@ def _iter_all_collections_refresh_output():
 
 def _run_daily_refresh_if_due(reason: str = 'timer'):
     if not _daily_refresh_due():
-        print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+        print(f'Автообновление: дневной лимит исчерпан ({_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}, {DAILY_REFRESH_STAMP})')
         return
     if not _daily_refresh_lock.acquire(blocking=False):
         print('Автообновление: refresh уже выполняется')
         return
     try:
         if not _daily_refresh_due():
-            print(f'Автообновление: сегодня уже выполнено ({DAILY_REFRESH_STAMP})')
+            print(f'Автообновление: дневной лимит исчерпан ({_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}, {DAILY_REFRESH_STAMP})')
             return
-        print(f'Автообновление: запускаю refresh ({reason})')
+        print(f'Автообновление: запускаю refresh ({reason}, {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT})')
         code = _run_all_collections_refresh()
         if code == 0:
             _publish_staging_refresh(REFRESH_STAGING_DIR)
             _write_daily_refresh_stamp()
-            print(f'Автообновление: готово, метка {_today_stamp()}')
+            print(f'Автообновление: готово, сегодня {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}')
         else:
             print(f'Автообновление: ошибка refresh, код {code}; метка не обновлена')
     except Exception as e:
@@ -420,7 +468,7 @@ def cleanup_old_topics(max_age_days: int = TOPIC_MAX_AGE_DAYS):
             return {'removed_topics': 0, 'removed_cache': 0, 'removed_posters': 0, 'dated_topics': 0, 'skipped_topics': skipped_topics}
 
         atomic_write_json_unlocked(data_path, keep)
-        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', gp.generate_html(keep))
+        atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', _generate_display_html(keep))
 
     if removed:
         try:
@@ -511,7 +559,7 @@ def _enrich_worker():
                 gp.enrich_topic(topic, force_poster_retry=True)
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
-                html = gp.generate_html(topics)
+                html = _generate_display_html(topics)
                 atomic_write_text(gen_path, html)
             with _enrich_lock:
                 _enrich_status[topic_id] = 'done'
@@ -719,7 +767,7 @@ def _enrich_missing(force: bool = False):
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
-                atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
+                atomic_write_text_unlocked(gen_path, _generate_display_html(topics))
                 print(f'  [enrich] сохранено ({sum(1 for t in topics if not t.get("_enrich_retries"))}/{len(topics)} готово)')
     except Exception:
         return
@@ -752,7 +800,7 @@ def _sync_listing_order(cache_only: bool = False):
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
-                atomic_write_text_unlocked(gen_path, gp.generate_html(topics))
+                atomic_write_text_unlocked(gen_path, _generate_display_html(topics))
             print(f'  [listing_order] синхронизировано')
     except Exception as e:
         print(f'  [listing_order] ошибка: {e}')
@@ -1626,7 +1674,7 @@ def refresh():
                     yield '</pre><p>Обновлена выбранная коллекция. Общая дневная метка не изменялась.</p><p><a href="/">Готово</a></p></body></html>'
                 else:
                     _write_daily_refresh_stamp()
-                    yield f'</pre><p>Метка обновления: {_today_stamp()}</p><p><a href="/">Готово</a></p></body></html>'
+                    yield f'</pre><p>Метка обновления: {_today_stamp()}, сегодня {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}</p><p><a href="/">Готово</a></p></body></html>'
             else:
                 yield f'</pre><p>Ошибка refresh, код {code}. Метка не обновлена.</p><p><a href="/">Назад</a></p></body></html>'
         finally:
@@ -1699,7 +1747,7 @@ def recheck_trailers():
         for line in gp.recheck_trailers(topics):
             yield line + '\n'
         data_path.write_text(json.dumps(topics, ensure_ascii=False, indent=2), 'utf-8')
-        html = gp.generate_html(topics)
+        html = _generate_display_html(topics)
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
         yield '</pre><p><a href="/">Готово</a></p></body></html>'
 
@@ -1714,7 +1762,7 @@ def hide_topic(topic_id):
     gp.add_hidden_topic(topic_id)
     data_path = DATA_DIR / 'torrents_data.json'
     if data_path.exists():
-        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        html = _generate_display_html(json.loads(data_path.read_text('utf-8')))
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
     return jsonify(ok=True)
 
@@ -1727,7 +1775,7 @@ def unhide_topic(topic_id):
     gp.remove_hidden_topic(topic_id)
     data_path = DATA_DIR / 'torrents_data.json'
     if data_path.exists():
-        html = gp.generate_html(json.loads(data_path.read_text('utf-8')))
+        html = _generate_display_html(json.loads(data_path.read_text('utf-8')))
         atomic_write_text(DATA_DIR / 'index-kino.html', html)
     return jsonify(ok=True)
 
@@ -1758,10 +1806,7 @@ def add_cors_and_gzip(response):
 # Browse modes
 # ---------------------------------------------------------------------------
 def _get_movies():
-    p = DATA_DIR / 'torrents_data.json'
-    if not p.exists():
-        return []
-    data = json.loads(p.read_text('utf-8'))
+    data = load_display_topics()
     hidden = gp.load_hidden_topic_ids()
     return [m for m in data if not m.get('_sanitized') and m.get('magnet') != '0' and str(m.get('topic_id', '')) not in hidden]
 
