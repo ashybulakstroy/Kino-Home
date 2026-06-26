@@ -1,4 +1,4 @@
-# LocaL-Kino
+# Kino Gallery
 
 Домашний кинотеатр: каталог фильмов с rutracker.net и локальный стриминг через libtorrent.
 

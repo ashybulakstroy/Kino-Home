@@ -1,4 +1,4 @@
-# Session Context — LocaL-Kino
+# Session Context — Kino Gallery
 
 ## Current Task
 Redesign `/browse/shuffle` as a filmstrip: frames slide right-to-left through center poster, old poster slides left into strip, new frame from right becomes main poster.

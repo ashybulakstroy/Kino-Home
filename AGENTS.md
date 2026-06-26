@@ -1,4 +1,4 @@
-# AGENTS.md — LocaL-Kino
+# AGENTS.md — Kino Gallery
 
 Домашний кинотеатр: каталог фильмов с rutracker.net + локальный стриминг через libtorrent. Источник данных — rutracker, данные проекта хранятся в `data/`.
 

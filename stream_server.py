@@ -10,12 +10,13 @@ import threading
 import subprocess
 import shutil
 import atexit
+from pathlib import Path
 from typing import TextIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_RETRY_COOLDOWN_MINUTES, ENRICH_NO_CHANGE_RETRY_DAYS
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES, LIGHT_REFRESH_COOLDOWN_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_RETRY_COOLDOWN_MINUTES, ENRICH_NO_CHANGE_RETRY_DAYS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -76,6 +77,17 @@ def _close_log_file():
         _LOG_FILE.flush()
         _LOG_FILE.close()
         _LOG_FILE = None
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f'{seconds} сек'
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f'{minutes} мин {seconds} сек'
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours} ч {minutes} мин'
 
 
 class _LazyEngine:
@@ -190,7 +202,12 @@ _enrich_status: dict[str, str] = {}
 _enrich_lock = threading.Lock()
 _daily_refresh_lock = threading.Lock()
 _daily_refresh_started = False
+_world_trailer_recheck_started = False
+_world_trailer_recheck_lock = threading.Lock()
+_light_refresh_status: dict[str, dict] = {}
+_light_refresh_status_lock = threading.Lock()
 DAILY_REFRESH_STAMP = DATA_DIR / 'last_refresh_date.txt'
+WORLD_TRAILER_RECHECK_STAMP = DATA_DIR / 'last_world_trailer_recheck_date.txt'
 
 # HTML cache: stores (mtime, processed_html) for the index page
 _html_cache: tuple[float, str, str] | None = None  # (mtime, etag, html)
@@ -198,6 +215,7 @@ _html_cache_lock = threading.Lock()
 DAILY_REFRESH_LIMIT = max(1, DAILY_REFRESH_MAX_PER_DAY)
 DAILY_REFRESH_CHECK_SECONDS = max(60 * 15, int(24 * 60 * 60 / DAILY_REFRESH_LIMIT))
 DAILY_REFRESH_STARTUP_COOLDOWN_SECONDS = max(0, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES * 60)
+LIGHT_REFRESH_COOLDOWN_SECONDS = max(0, LIGHT_REFRESH_COOLDOWN_MINUTES * 60)
 REFRESH_STAGING_DIR = DATA_DIR / 'staging_refresh'
 REFRESH_FILES = [
     'torrents_data.json',
@@ -209,9 +227,11 @@ REFRESH_FILES = [
     'kinopoisk_trailer_cache.json',
     'imdb_trailer_cache.json',
     'hidden_topics.json',
+    'forbidden_topics_cache.json',
+    'last_world_trailer_recheck_date.txt',
     'index-kino.html',
 ]
-REFRESH_DIRS = ['posters', 'topic_cache', 'imdb']
+REFRESH_DIRS = ['posters', 'topic_cache', 'imdb', 'world_listing_snapshot']
 
 
 def load_display_topics():
@@ -344,6 +364,7 @@ def _run_refresh_process(collection=None, fast=False):
 
 
 def _run_all_collections_refresh():
+    started_at = time.monotonic()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
     for collection in gp.COLLECTIONS:
         print(f'Автообновление: коллекция {collection}')
@@ -353,13 +374,16 @@ def _run_all_collections_refresh():
             print(line, end='')
         code = proc.wait()
         if code != 0:
+            print(f'Автообновление: refresh завершился с ошибкой за {_format_duration(time.monotonic() - started_at)}')
             return code
+    print(f'Автообновление: refresh-процедура заняла {_format_duration(time.monotonic() - started_at)}')
     return 0
 
 
 def _iter_collections_refresh_output(collections=None, fast=False):
     if collections is None:
         collections = gp.COLLECTIONS.keys()
+    started_at = time.monotonic()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
     for collection in collections:
         yield f'Автообновление: коллекция {collection}\n'
@@ -369,12 +393,120 @@ def _iter_collections_refresh_output(collections=None, fast=False):
             yield line
         code = proc.wait()
         if code != 0:
+            yield f'Автообновление: refresh завершился с ошибкой за {_format_duration(time.monotonic() - started_at)}\n'
             return code
+    yield f'Автообновление: refresh-процедура заняла {_format_duration(time.monotonic() - started_at)}\n'
     return 0
 
 
 def _iter_all_collections_refresh_output():
     return _iter_collections_refresh_output()
+
+
+def _light_refresh_snapshot(collection: str) -> dict:
+    with _light_refresh_status_lock:
+        status = dict(_light_refresh_status.get(collection) or {})
+    if not status:
+        return {'status': 'running' if _daily_refresh_lock.locked() else 'idle', 'collection': collection}
+    if status.get('status') == 'running':
+        return status
+    last_success_monotonic = status.get('last_success_monotonic')
+    if (
+        status.get('status') == 'done'
+        and last_success_monotonic
+        and LIGHT_REFRESH_COOLDOWN_SECONDS > 0
+    ):
+        remaining = int(LIGHT_REFRESH_COOLDOWN_SECONDS - (time.monotonic() - float(last_success_monotonic)))
+        if remaining > 0:
+            status['cooldown_remaining_seconds'] = remaining
+    return status
+
+
+def _run_light_refresh_collection(collection: str):
+    started_at = time.monotonic()
+    label = gp.COLLECTIONS.get(collection, {}).get('name', collection)
+    with _light_refresh_status_lock:
+        _light_refresh_status[collection] = {
+            'status': 'running',
+            'collection': collection,
+            'label': label,
+            'started_at': datetime.now().isoformat(timespec='seconds'),
+        }
+    try:
+        print(f'Light refresh: запускаю {collection} ({label})')
+        _copy_existing_refresh_data(REFRESH_STAGING_DIR)
+        proc = _run_refresh_process(collection, fast=True)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end='')
+        code = proc.wait()
+        elapsed = _format_duration(time.monotonic() - started_at)
+        if code == 0:
+            _publish_staging_refresh(REFRESH_STAGING_DIR)
+            with _light_refresh_status_lock:
+                _light_refresh_status[collection] = {
+                    'status': 'done',
+                    'collection': collection,
+                    'label': label,
+                    'duration': elapsed,
+                    'finished_at': datetime.now().isoformat(timespec='seconds'),
+                    'last_success_monotonic': time.monotonic(),
+                }
+            print(f'Light refresh: {collection} готово за {elapsed}')
+        else:
+            with _light_refresh_status_lock:
+                _light_refresh_status[collection] = {
+                    'status': 'error',
+                    'collection': collection,
+                    'label': label,
+                    'duration': elapsed,
+                    'error': f'код {code}',
+                    'finished_at': datetime.now().isoformat(timespec='seconds'),
+                }
+            print(f'Light refresh: {collection} ошибка за {elapsed}, код {code}')
+    except Exception as e:
+        elapsed = _format_duration(time.monotonic() - started_at)
+        with _light_refresh_status_lock:
+            _light_refresh_status[collection] = {
+                'status': 'error',
+                'collection': collection,
+                'label': label,
+                'duration': elapsed,
+                'error': str(e),
+                'finished_at': datetime.now().isoformat(timespec='seconds'),
+            }
+        print(f'Light refresh: {collection} ошибка за {elapsed}: {e}')
+    finally:
+        _daily_refresh_lock.release()
+
+
+def _start_light_refresh(collection: str) -> dict:
+    if collection not in gp.COLLECTIONS:
+        return {'status': 'invalid', 'collection': collection, 'error': 'unknown collection'}
+    with _light_refresh_status_lock:
+        current = dict(_light_refresh_status.get(collection) or {})
+    if current.get('status') == 'running':
+        return current
+    last_success_monotonic = current.get('last_success_monotonic')
+    if (
+        current.get('status') == 'done'
+        and last_success_monotonic
+        and LIGHT_REFRESH_COOLDOWN_SECONDS > 0
+    ):
+        remaining = int(LIGHT_REFRESH_COOLDOWN_SECONDS - (time.monotonic() - float(last_success_monotonic)))
+        if remaining > 0:
+            current['status'] = 'cooldown'
+            current['cooldown_remaining_seconds'] = remaining
+            return current
+    if not _daily_refresh_lock.acquire(blocking=False):
+        return {'status': 'running', 'collection': collection, 'reason': 'refresh already running'}
+    try:
+        thread = threading.Thread(target=_run_light_refresh_collection, args=(collection,), daemon=True)
+        thread.start()
+    except Exception:
+        _daily_refresh_lock.release()
+        raise
+    return _light_refresh_snapshot(collection)
 
 
 def _run_daily_refresh_if_due(reason: str = 'timer'):
@@ -387,6 +519,7 @@ def _run_daily_refresh_if_due(reason: str = 'timer'):
     if not _daily_refresh_lock.acquire(blocking=False):
         print('Автообновление: refresh уже выполняется')
         return
+    started_at = None
     try:
         if reason == 'startup' and _daily_refresh_startup_cooldown_active():
             print(f'Автообновление: startup пропущен, последний refresh был недавно ({DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES} мин cooldown, {DAILY_REFRESH_STAMP})')
@@ -394,16 +527,18 @@ def _run_daily_refresh_if_due(reason: str = 'timer'):
         if not _daily_refresh_due():
             print(f'Автообновление: дневной лимит исчерпан ({_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}, {DAILY_REFRESH_STAMP})')
             return
+        started_at = time.monotonic()
         print(f'Автообновление: запускаю refresh ({reason}, {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT})')
         code = _run_all_collections_refresh()
         if code == 0:
             _publish_staging_refresh(REFRESH_STAGING_DIR)
             _write_daily_refresh_stamp()
-            print(f'Автообновление: готово, сегодня {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}')
+            print(f'Автообновление: готово за {_format_duration(time.monotonic() - started_at)}, сегодня {_daily_refresh_count_today()}/{DAILY_REFRESH_LIMIT}')
         else:
-            print(f'Автообновление: ошибка refresh, код {code}; метка не обновлена')
+            print(f'Автообновление: ошибка refresh за {_format_duration(time.monotonic() - started_at)}, код {code}; метка не обновлена')
     except Exception as e:
-        print(f'Автообновление: ошибка {e}; метка не обновлена')
+        elapsed = f' за {_format_duration(time.monotonic() - started_at)}' if started_at is not None else ''
+        print(f'Автообновление: ошибка{elapsed}: {e}; метка не обновлена')
     finally:
         _daily_refresh_lock.release()
 
@@ -735,6 +870,7 @@ def _enrich_missing(force: bool = False):
     if _daily_refresh_lock.locked():
         print('  [enrich] пропуск: refresh выполняется')
         return
+    started_at = time.monotonic()
     data_path = DATA_DIR / 'torrents_data.json'
     if not data_path.exists():
         return
@@ -749,7 +885,13 @@ def _enrich_missing(force: bool = False):
             changed = True
 
         tasks = []
+        hidden_ids = gp.load_hidden_topic_ids()
         for idx, topic in enumerate(topics):
+            if topic.get('_sanitized') or str(topic.get('topic_id', '')) in hidden_ids:
+                if topic.get('_enrich_retries'):
+                    topic.pop('_enrich_retries', None)
+                    changed = True
+                continue
             needs = _topic_enrich_needs(topic)
             if not needs['any']:
                 if topic.get('_enrich_retries'):
@@ -769,10 +911,14 @@ def _enrich_missing(force: bool = False):
         if tasks:
             print(f'  [enrich] задач: {len(tasks)}, воркеров: {WORKER_COUNT}')
 
+        def topic_log_title(topic):
+            title = topic.get('movie_title') or topic.get('title') or '?'
+            return str(title).strip() or '?'
+
         def process_task(item):
             _priority, idx, needs, retries = item
             topic = topics[idx]
-            title = topic.get('movie_title') or topic.get('title', '?')
+            title = topic_log_title(topic)
             include_trailer = bool(needs['trailer'])
             print(f'  [enrich] #{topic["topic_id"]} {title} (retry {retries})')
             before = _snapshot_enrich_fields(topic)
@@ -791,8 +937,8 @@ def _enrich_missing(force: bool = False):
                 topic.pop('_enrich_retries', None)
                 topic.pop('_enrich_no_change_at', None)
                 topic.pop('_enrich_attempt_at', None)
-                return topic.get('topic_id'), f'OK ({changes})'
-            return topic.get('topic_id'), f'ещё не все данные ({changes})'
+                return topic.get('topic_id'), title, f'OK ({changes})'
+            return topic.get('topic_id'), title, f'ещё не все данные ({changes})'
 
         if tasks:
             with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(tasks))) as executor:
@@ -800,11 +946,13 @@ def _enrich_missing(force: bool = False):
                 for future in as_completed(future_map):
                     changed = True
                     try:
-                        topic_id, result = future.result()
+                        topic_id, title, result = future.result()
                     except Exception as e:
-                        topic_id = topics[future_map[future][1]].get('topic_id')
+                        failed_topic = topics[future_map[future][1]]
+                        topic_id = failed_topic.get('topic_id')
+                        title = topic_log_title(failed_topic)
                         result = f'ошибка: {e}'
-                    print(f'    [enrich] #{topic_id} -> {result}')
+                    print(f'    [enrich] #{topic_id} {title} -> {result}')
 
         if changed:
             with file_lock(data_path):
@@ -812,7 +960,9 @@ def _enrich_missing(force: bool = False):
                 gen_path = DATA_DIR / 'index-kino.html'
                 atomic_write_text_unlocked(gen_path, _generate_display_html(topics))
                 print(f'  [enrich] сохранено ({sum(1 for t in topics if not t.get("_enrich_retries"))}/{len(topics)} готово)')
-    except Exception:
+        print(f'  [enrich] завершено за {_format_duration(time.monotonic() - started_at)}')
+    except Exception as e:
+        print(f'  [enrich] ошибка за {_format_duration(time.monotonic() - started_at)}: {e}')
         return
 
 
@@ -863,6 +1013,85 @@ def _periodic_enrich():
 def _ensure_periodic_enrich():
     t = threading.Thread(target=_periodic_enrich, daemon=True)
     t.start()
+
+
+def _read_stamp_date(path: Path) -> str:
+    try:
+        raw = path.read_text('utf-8').strip()
+    except FileNotFoundError:
+        return ''
+    if raw.startswith('{'):
+        try:
+            return str(json.loads(raw).get('date') or '')
+        except json.JSONDecodeError:
+            return ''
+    return raw.splitlines()[0].strip() if raw else ''
+
+
+def _write_stamp_date(path: Path):
+    atomic_write_text(path, _today_stamp())
+
+
+def _run_daily_world_trailer_recheck_if_due(reason: str = 'timer'):
+    if _read_stamp_date(WORLD_TRAILER_RECHECK_STAMP) == _today_stamp():
+        return
+    if _daily_refresh_lock.locked():
+        print('World трейлеры: пропуск, refresh выполняется')
+        return
+    if not _world_trailer_recheck_lock.acquire(blocking=False):
+        print('World трейлеры: проверка уже выполняется')
+        return
+    started_at = time.monotonic()
+    data_path = DATA_DIR / 'torrents_data.json'
+    try:
+        if not data_path.exists():
+            return
+        with file_lock(data_path):
+            topics = json.loads(data_path.read_text('utf-8'))
+        hidden = gp.load_hidden_topic_ids()
+        world_ids = {
+            str(t.get('topic_id'))
+            for t in topics
+            if gp.is_world_topic(t)
+            and not t.get('_sanitized')
+            and str(t.get('topic_id', '')) not in hidden
+        }
+        if not world_ids:
+            _write_stamp_date(WORLD_TRAILER_RECHECK_STAMP)
+            print('World трейлеры: нет видимых тем для проверки')
+            return
+        world_topics = [t for t in topics if str(t.get('topic_id')) in world_ids]
+        print(f'World трейлеры: ежедневная проверка ({reason}), тем: {len(world_topics)}')
+        changed = False
+        before = {str(t.get('topic_id')): t.get('youtube_url') for t in world_topics}
+        for line in gp.recheck_trailers(world_topics):
+            print(f'  [trailers] {line}')
+        after = {str(t.get('topic_id')): t.get('youtube_url') for t in world_topics}
+        changed = before != after
+        if changed:
+            with file_lock(data_path):
+                atomic_write_json_unlocked(data_path, topics)
+                atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', _generate_display_html(topics))
+        _write_stamp_date(WORLD_TRAILER_RECHECK_STAMP)
+        print(f'World трейлеры: готово за {_format_duration(time.monotonic() - started_at)}, изменено: {sum(1 for k in before if before.get(k) != after.get(k))}')
+    except Exception as e:
+        print(f'World трейлеры: ошибка за {_format_duration(time.monotonic() - started_at)}: {e}')
+    finally:
+        _world_trailer_recheck_lock.release()
+
+
+def _world_trailer_recheck_loop():
+    while True:
+        time.sleep(60 * 60)
+        _run_daily_world_trailer_recheck_if_due('timer')
+
+
+def _ensure_world_trailer_recheck_loop():
+    global _world_trailer_recheck_started
+    if _world_trailer_recheck_started:
+        return
+    _world_trailer_recheck_started = True
+    threading.Thread(target=_world_trailer_recheck_loop, daemon=True).start()
 
 
 def _rate_limit(key: str, seconds: float = RATE_LIMIT_SECONDS) -> bool:
@@ -1647,10 +1876,10 @@ def index():
     index_path = DATA_DIR / 'index-kino.html'
 
     if not index_path.exists():
-        return '<h1>LocaL-Kino</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
+        return '<h1>Kino Gallery</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
 
     stat = index_path.stat()
-    INJECT_VER = 'v8'
+    INJECT_VER = 'v10'
     etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
 
     if request.if_none_match.contains(etag_val):
@@ -1662,6 +1891,41 @@ def index():
             return Response(_html_cache[2], content_type='text/html; charset=utf-8')
 
     html = index_path.read_text('utf-8')
+    old_collection_reload = "function rc(){sf();localStorage.removeItem('gv');window.location.href='/?r='+Date.now()}"
+    old_blocking_light_reload = (
+        "function rc(){sf();localStorage.removeItem('gv');"
+        "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
+        "var c=document.getElementById('cs'),v=c?c.value:'';"
+        "if(!v){window.location.href='/?r='+Date.now();return}"
+        "function done(){window.location.href='/?r='+Date.now()}"
+        "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='running'&&n<120)setTimeout(function(){poll(n+1)},2000);"
+        "else done()}).catch(done)}"
+        "fetch('/refresh_light?collection='+encodeURIComponent(v),{method:'POST'})"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='running')poll(0);else done()}).catch(done)}"
+    )
+    light_collection_reload = (
+        "function rc(){sf();localStorage.removeItem('gv');"
+        "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
+        "var c=document.getElementById('cs'),v=c?c.value:'';"
+        "if(!v){window.location.href='/?r='+Date.now();return}"
+        "function reloadFresh(){window.location.href='/?r='+Date.now()}"
+        "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='done')reloadFresh();"
+        "else if(d.status==='running'&&n<3)setTimeout(function(){poll(n+1)},1500)"
+        "}).catch(function(){})}"
+        "fetch('/refresh_light?collection='+encodeURIComponent(v),{method:'POST'})"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)"
+        "}).catch(function(){})}"
+    )
+    if old_blocking_light_reload in html:
+        html = html.replace(old_blocking_light_reload, light_collection_reload, 1)
+    else:
+        html = html.replace(old_collection_reload, light_collection_reload, 1)
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
     browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
@@ -1723,6 +1987,33 @@ def refresh():
         finally:
             _daily_refresh_lock.release()
     return Response(generate(), content_type='text/html; charset=utf-8')
+
+
+@app.route('/refresh_light', methods=['POST'])
+def refresh_light():
+    _reject_public_admin()
+    collection = (request.args.get('collection') or '').strip()
+    if not collection and request.is_json:
+        payload = request.get_json(silent=True) or {}
+        collection = str(payload.get('collection') or '').strip()
+    if not collection:
+        return jsonify(status='skipped', reason='no collection selected')
+    if not _rate_limit(f'refresh_light:{request.remote_addr}:{collection}', seconds=2):
+        return jsonify(_light_refresh_snapshot(collection))
+    result = _start_light_refresh(collection)
+    status_code = 400 if result.get('status') == 'invalid' else 200
+    return jsonify(result), status_code
+
+
+@app.route('/refresh_light/status')
+def refresh_light_status():
+    _reject_public_admin()
+    collection = (request.args.get('collection') or '').strip()
+    if not collection:
+        return jsonify(status='idle')
+    if collection not in gp.COLLECTIONS:
+        return jsonify(status='invalid', collection=collection, error='unknown collection'), 400
+    return jsonify(_light_refresh_snapshot(collection))
 
 
 @app.route('/cleanup')
@@ -1795,6 +2086,13 @@ def recheck_trailers():
         yield '</pre><p><a href="/">Готово</a></p></body></html>'
 
     return Response(stream_with_context(generate()), content_type='text/html; charset=utf-8')
+
+
+@app.route('/recheck_trailers/world')
+def recheck_world_trailers():
+    _reject_public_admin()
+    threading.Thread(target=_run_daily_world_trailer_recheck_if_due, args=('manual',), daemon=True).start()
+    return jsonify(ok=True, message='world trailer recheck queued')
 
 
 @app.route('/hide/<topic_id>', methods=['POST'])
@@ -1876,7 +2174,7 @@ def browse_test():
     years = sorted({m['movie_year'] for m in movies if m.get('movie_year')}, reverse=True)
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>LocaL-Kino — Тест режимов</title>
+<title>Kino Gallery — Тест режимов</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#141414;color:#fff;padding:30px;min-height:100vh}}
@@ -2679,7 +2977,7 @@ if __name__ == '__main__':
     _install_timestamped_logs(log_file=log_path)
     print(f'Лог-файл: {os.path.realpath(log_path)}')
     port = int(sys.argv[1]) if len(sys.argv) > 1 else SERVER_PORT
-    print(f'LocaL-Kino server: http://localhost:{port}')
+    print(f'Kino Gallery server: http://localhost:{port}')
     print(f'Test with: http://localhost:{port}/player.html')
 
     def _deferred_cleanup():
@@ -2704,6 +3002,7 @@ if __name__ == '__main__':
         _run_daily_refresh_if_due('startup')
         _sync_listing_order(cache_only=True)
         _ensure_periodic_enrich()
+        threading.Thread(target=_run_daily_world_trailer_recheck_if_due, args=('startup',), daemon=True).start()
 
     threading.Thread(target=_deferred_cleanup, daemon=True).start()
 
@@ -2712,6 +3011,7 @@ if __name__ == '__main__':
     _ensure_session_monitor()
     _ensure_enrich_worker()
     _ensure_daily_refresh_loop()
+    _ensure_world_trailer_recheck_loop()
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)

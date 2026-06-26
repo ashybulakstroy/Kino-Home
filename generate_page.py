@@ -70,6 +70,87 @@ def is_forbidden_topic(topic):
     return False
 
 
+def _normalize_forbidden_title(value):
+    text = str(value or '').lower()
+    text = re.sub(r'\b(19\d{2}|20\d{2})\b', ' ', text)
+    text = re.sub(r'[^0-9a-zа-яё]+', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def forbidden_topic_keys(topic):
+    keys = set()
+    topic_id = str(topic.get('topic_id') or '').strip()
+    if topic_id:
+        keys.add(f'id:{topic_id}')
+        if topic_id.startswith(('pb_', 'tpb_')):
+            keys.add(f'world_hash:{topic_id.split("_", 1)[1].lower()}')
+
+    imdb_id = str(topic.get('imdb_id') or '').strip()
+    if imdb_id and imdb_id != '0':
+        keys.add(f'imdb:{imdb_id}')
+    kp_id = str(topic.get('kp_id') or '').strip()
+    if kp_id and kp_id != '0':
+        keys.add(f'kp:{kp_id}')
+
+    year = str(topic.get('movie_year') or '').strip()
+    if not year:
+        raw = f"{topic.get('movie_title', '')} {topic.get('title', '')}"
+        m = re.search(r'\b(19\d{2}|20\d{2})\b', raw)
+        year = m.group(1) if m else ''
+    for field in ('movie_title', 'orig_title', 'title'):
+        title = _normalize_forbidden_title(topic.get(field))
+        if title and year:
+            keys.add(f'title:{title}|{year}')
+    return sorted(keys)
+
+
+def load_forbidden_topic_keys():
+    try:
+        data = json.loads(open(FORBIDDEN_TOPICS_CACHE, encoding='utf-8').read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+    if isinstance(data, dict):
+        data = data.get('keys', [])
+    if not isinstance(data, list):
+        return set()
+    return set(str(k) for k in data if k)
+
+
+def save_forbidden_topic_keys(keys):
+    atomic_write_json(FORBIDDEN_TOPICS_CACHE, {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'keys': sorted(keys),
+    })
+
+
+def add_forbidden_topic(topic):
+    keys = load_forbidden_topic_keys()
+    before = len(keys)
+    keys.update(forbidden_topic_keys(topic))
+    if len(keys) != before:
+        save_forbidden_topic_keys(keys)
+
+
+def matches_forbidden_topic_cache(topic, keys=None):
+    if keys is None:
+        keys = load_forbidden_topic_keys()
+    if not keys:
+        return False
+    return bool(set(forbidden_topic_keys(topic)) & keys)
+
+
+def sync_forbidden_topic_cache(topics):
+    keys = load_forbidden_topic_keys()
+    before = len(keys)
+    for topic in topics:
+        if topic.get('_sanitized') or is_forbidden_topic(topic):
+            keys.update(forbidden_topic_keys(topic))
+    if len(keys) != before:
+        save_forbidden_topic_keys(keys)
+        print(f"  Кеш запрещённых тем обновлён: +{len(keys) - before} ключей")
+    return keys
+
+
 def sanitize_topic(topic):
     topic['poster_url'] = 'data/posters/placeholder.png'
     topic['kp_rating'] = '0'
@@ -82,6 +163,7 @@ def sanitize_topic(topic):
     topic['magnet'] = '0'
     topic['_sanitized'] = True
     add_hidden_topic(topic['topic_id'])
+    add_forbidden_topic(topic)
     return topic
 SEARCH_CACHE = os.path.join(DATA_DIR, "imdb_search_cache.json")
 KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
@@ -91,12 +173,14 @@ IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
 HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
+FORBIDDEN_TOPICS_CACHE = os.path.join(DATA_DIR, "forbidden_topics_cache.json")
 POSTERS_DIR = os.path.join(DATA_DIR, "posters")
 POSTERS_URL = "data/posters"
 POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.png"
 POSTER_RETRY_DAYS = 7
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
 WORLD_HASH_CACHE_DIR = os.path.join(DATA_DIR, "world_hash")
+WORLD_LISTING_SNAPSHOT_DIR = os.path.join(DATA_DIR, "world_listing_snapshot")
 WORLD_LEGACY_SOURCE_CACHE = {
     'piratebay': {
         'page_cache': os.path.join(DATA_DIR, 'piratebay_page.html'),
@@ -124,6 +208,64 @@ def now_text():
 
 def today_text():
     return datetime.now().date().isoformat()
+
+
+def world_listing_snapshot_path(collection):
+    return os.path.join(WORLD_LISTING_SNAPSHOT_DIR, f'{collection}.json')
+
+
+def world_listing_movie_key(topic):
+    title = _normalize_forbidden_title(topic.get('movie_title') or topic.get('title') or '')
+    year = str(topic.get('movie_year') or '').strip()
+    if not year:
+        m = re.search(r'\b(19\d{2}|20\d{2})\b', str(topic.get('title') or ''))
+        year = m.group(1) if m else ''
+    if title and year:
+        return f'title:{title}|{year}'
+    topic_id = str(topic.get('topic_id') or '').strip()
+    if topic_id.startswith(('pb_', 'tpb_')):
+        return f'world_hash:{topic_id.split("_", 1)[1].lower()}'
+    return f'id:{topic_id}' if topic_id else ''
+
+
+def load_world_listing_snapshot(collection):
+    path = world_listing_snapshot_path(collection)
+    try:
+        data = json.loads(open(path, encoding='utf-8').read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_world_listing_snapshot(collection, topics):
+    os.makedirs(WORLD_LISTING_SNAPSHOT_DIR, exist_ok=True)
+    items = []
+    for topic in topics:
+        key = world_listing_movie_key(topic)
+        if not key:
+            continue
+        items.append({
+            'key': key,
+            'topic_id': topic.get('topic_id'),
+            'title': topic.get('movie_title') or topic.get('title') or '',
+            'year': topic.get('movie_year') or '',
+            'hash': topic.get('topic_id', '').split('_', 1)[1].lower()
+                if str(topic.get('topic_id', '')).startswith(('pb_', 'tpb_')) else '',
+        })
+    atomic_write_json(world_listing_snapshot_path(collection), {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'items': items,
+    })
+
+
+def world_listing_snapshot_keys(collection):
+    data = load_world_listing_snapshot(collection)
+    items = data.get('items') if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return set()
+    return {str(item.get('key') or '') for item in items if isinstance(item, dict) and item.get('key')}
 
 
 def listing_cache_is_valid(path):
@@ -2128,6 +2270,15 @@ def repair_world_titles(topics):
             continue
         movie_title = t.get('movie_title', '') or ''
         raw_title = t.get('title', '') or ''
+        movie_year = str(t.get('movie_year') or '').strip()
+        if movie_year:
+            without_year = re.sub(rf'\s*\(?{re.escape(movie_year)}\)?\s*$', '', movie_title).strip()
+            if without_year and without_year != movie_title:
+                old_title = movie_title[:50]
+                t['movie_title'] = without_year
+                movie_title = without_year
+                count += 1
+                print(f"  title: {old_title} -> {without_year} ({movie_year})")
         if not raw_title or not tech.search(movie_title):
             continue
         new_title, year = clean_world_title(raw_title)
@@ -2506,6 +2657,85 @@ def enrich(topics, ratings, basics):
     return topics
 
 
+def fast_enrich_posters(topics):
+    """Lightweight poster-only enrich for fast refresh."""
+    targets = [t for t in topics if not has_real_poster(t)]
+    total = len(targets)
+    if not total:
+        print("  Постеры: всё уже есть")
+        return topics
+
+    found = 0
+    for i, topic in enumerate(targets, 1):
+        title = topic.get('orig_title') or topic.get('movie_title') or topic.get('title') or ''
+        year = topic.get('movie_year') or ''
+        print(f"  [{i}/{total}] poster {topic.get('topic_id')} {topic.get('movie_title') or title}...", end=' ', flush=True)
+
+        resolve_existing_local_poster(topic)
+        if has_real_poster(topic):
+            found += 1
+            print("local ✓")
+            continue
+
+        localize_existing_poster(topic)
+        if has_real_poster(topic):
+            found += 1
+            print("local duplicate ✓")
+            continue
+
+        imdb_id = topic.get('imdb_id')
+        if not imdb_id and title:
+            result = search_imdb(title, year)
+            if result is None:
+                result = search_imdb_deep(topic.get('title') or title)
+            if result:
+                if isinstance(result, str):
+                    imdb_id = result
+                else:
+                    imdb_id = result.get('id')
+                    if result.get('poster'):
+                        local_url = download_poster(imdb_id, result['poster'])
+                        if local_url:
+                            topic['poster_url'] = local_url
+                if imdb_id:
+                    topic['imdb_id'] = imdb_id
+
+        if not has_real_poster(topic) and imdb_id:
+            rating_data = fetch_imdb_rating(imdb_id)
+            if rating_data.get('poster'):
+                local_url = download_poster(imdb_id, rating_data['poster'])
+                if local_url:
+                    topic['poster_url'] = local_url
+
+        if not has_real_poster(topic) and not topic.get('kp_id') and title:
+            result = search_kinopoisk(topic.get('movie_title') or title, year)
+            if result:
+                topic['kp_id'] = result['kp_id']
+                topic['kp_rating'] = result['kp_rating']
+                topic['kp_votes'] = result['kp_votes']
+
+        if not has_real_poster(topic) and topic.get('kp_id'):
+            local_url = download_kinopoisk_poster(topic['kp_id'])
+            if local_url:
+                topic['poster_url'] = local_url
+
+        if is_world_topic(topic) and not has_real_poster(topic):
+            local_url = download_impawards_poster(topic)
+            if local_url:
+                topic['poster_url'] = local_url
+
+        if has_real_poster(topic):
+            clear_poster_failed(topic)
+            found += 1
+            print("poster ✓")
+        else:
+            mark_poster_failed(topic)
+            print("нет")
+
+    print(f"  Постеры: найдено {found}/{total}")
+    return topics
+
+
 def sync_listing_order_for_collection(collection: str, cache_only: bool = False) -> dict[str, int]:
     """Return {topic_id: listing_order} for page 1. If cache_only, skip network."""
     coll_info = COLLECTIONS.get(collection)
@@ -2688,7 +2918,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>LocaL-Kino</title>
+<title>Kino Gallery</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#fff;color:#1a1a1a;padding:20px}}
@@ -2833,7 +3063,7 @@ document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});doc
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
 function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value)}}
-function rc(){{sf();localStorage.removeItem('gv');window.location.href='/?r='+Date.now()}}
+function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r='+Date.now();return}}function reloadFresh(){{window.location.href='/?r='+Date.now()}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running'&&n<3)setTimeout(function(){{poll(n+1)}},1500)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
 function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}
@@ -3107,6 +3337,25 @@ def load_collection_listing(collection, coll_info, topics_limit):
         page_topics = []
         world_label = coll_info.get('name', collection)
         print(f"  Страница 1 ({world_label})...", end=' ', flush=True)
+        def mark_world_listing_delta(page_topics, save_snapshot=False):
+            previous_keys = world_listing_snapshot_keys(collection)
+            current_keys = {
+                world_listing_movie_key(t)
+                for t in page_topics
+                if world_listing_movie_key(t)
+            }
+            new_keys = current_keys - previous_keys if previous_keys else current_keys
+            for t in page_topics:
+                key = world_listing_movie_key(t)
+                t['_world_listing_key'] = key
+                t['_world_listing_new_movie'] = bool(key and key in new_keys)
+            if previous_keys:
+                print(f"новых фильмов: {len(new_keys)}", end=' ', flush=True)
+            else:
+                print("snapshot новый", end=' ', flush=True)
+            if save_snapshot:
+                save_world_listing_snapshot(collection, page_topics)
+
         last_error = None
         for attempt in range(1, MAX_RETRY + 1):
             try:
@@ -3126,6 +3375,7 @@ def load_collection_listing(collection, coll_info, topics_limit):
                 )
                 page_topics = deduplicate_world_topics(page_topics)
                 if page_topics:
+                    mark_world_listing_delta(page_topics, save_snapshot=True)
                     page1_ok = True
                     os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
                     with open(listing_cache_path, 'wb') as f:
@@ -3149,6 +3399,7 @@ def load_collection_listing(collection, coll_info, topics_limit):
                 )
                 page_topics = deduplicate_world_topics(page_topics)
                 if page_topics:
+                    mark_world_listing_delta(page_topics, save_snapshot=False)
                     page1_ok = True
                     page1_used_cache = True
                 print(f"ошибка: {last_error}; используем кеш", end=' ', flush=True)
@@ -3270,6 +3521,7 @@ def main():
         for i, t in enumerate(topics):
             if t.get('listing_order') is None:
                 t['listing_order'] = i
+        sync_forbidden_topic_cache(topics)
         cleaned_topics = clean_catalog_topics(topics)
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
@@ -3299,6 +3551,7 @@ def main():
         for i, t in enumerate(topics):
             if t.get('listing_order') is None:
                 t['listing_order'] = i
+        sync_forbidden_topic_cache(topics)
         original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
 
@@ -3351,6 +3604,7 @@ def main():
                 if t.get('collection', 'nashe_kino') == collection and t['topic_id'] not in _skip_ids
             ]
             existing_ids = {t['topic_id'] for t in existing_current}
+            source = coll_info.get('source', 'rutracker')
 
             # Update listing_order for topics still on the current page
             fresh_by_id = {t['topic_id']: t for t in all_topics}
@@ -3370,16 +3624,26 @@ def main():
 
             # Add only genuinely new topics (not already in cache)
             new_current: list[dict] = []
+            forbidden_keys = load_forbidden_topic_keys()
             for t in all_topics:
                 if t['topic_id'] not in existing_ids:
+                    if matches_forbidden_topic_cache(t, forbidden_keys):
+                        sanitize_topic(t)
+                        print(f"  {t.get('movie_title','')}: скрыто по кешу запрещённых")
                     new_current.append(t)
+            new_enrich_current = [
+                t for t in new_current
+                if not (is_world_source(source) and not t.get('_world_listing_new_movie'))
+            ]
+            skipped_same_movie = len(new_current) - len(new_enrich_current)
 
             merged = other + existing_current + new_current
             print(f"  В кеше: {len(cache_by_id)}, свежих (всего): {len(all_topics)}, "
                   f"новых: {len(new_current)}, "
                   f"из других коллекций: {len(other)}, всего: {len(merged)}")
+            if skipped_same_movie:
+                print(f"  World snapshot: {skipped_same_movie} новых torrent/hash уже известны как фильмы, enrich пропущен")
 
-            source = coll_info.get('source', 'rutracker')
             if is_world_source(source):
                 need_fetch = []
             else:
@@ -3396,7 +3660,7 @@ def main():
 
             topics = clean_catalog_topics(merged)
             topic_ids = {t.get('topic_id') for t in topics}
-            all_new_topics.extend(t for t in new_current if t.get('topic_id') in topic_ids)
+            all_new_topics.extend(t for t in new_enrich_current if t.get('topic_id') in topic_ids)
             save_json(TORRENTS_CACHE, topics)
             if critical_collection_error:
                 refresh_failed = True
@@ -3418,8 +3682,32 @@ def main():
             fetch_piratebay_imdb_ids(world_new)
 
         # Enrich all new topics across all collections in one batch
-        if fast and all_new_topics:
-            print(f"\nБыстрый refresh: обогащение {len(all_new_topics)} новых тем пропущено")
+        if fast:
+            if all_new_topics:
+                print(f"\nБыстрый refresh: обогащение {len(all_new_topics)} новых тем пропущено")
+            else:
+                print("\nНовых тем нет, тяжёлое обогащение пропущено")
+            fast_poster_topics = []
+            seen_poster_topics = set()
+            for candidate in all_new_topics:
+                tid = candidate.get('topic_id')
+                if tid and tid not in seen_poster_topics:
+                    fast_poster_topics.append(candidate)
+                    seen_poster_topics.add(tid)
+            for candidate in topics:
+                tid = candidate.get('topic_id')
+                if (
+                    tid
+                    and tid not in seen_poster_topics
+                    and candidate.get('collection') in collections_to_process
+                    and not has_real_poster(candidate)
+                ):
+                    if is_world_topic(candidate) and candidate.get('_world_listing_new_movie') is False:
+                        continue
+                    fast_poster_topics.append(candidate)
+                    seen_poster_topics.add(tid)
+            print(f"\n8. Быстрый refresh: лёгкий поиск постеров для {len(fast_poster_topics)} тем...")
+            fast_enrich_posters(fast_poster_topics)
         elif all_new_topics:
             print(f"\n{'='*60}")
             print("Обогащение новых тем за все коллекции")
