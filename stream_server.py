@@ -759,7 +759,7 @@ def _enrich_missing(force: bool = False):
             retries = topic.get('_enrich_retries', 0)
             if not force and retries >= MAX_ENRICH_RETRIES and needs['core']:
                 continue
-            if not force and _enrich_no_change_cooldown_active(topic):
+            if not force and not needs.get('poster') and _enrich_no_change_cooldown_active(topic):
                 continue
             if not force and _enrich_retry_cooldown_active(topic):
                 continue

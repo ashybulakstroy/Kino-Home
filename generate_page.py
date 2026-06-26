@@ -2559,7 +2559,7 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 
     coll_opts = ''.join(f'<option value="{k}">{v["name"]}</option>' for k, v in COLLECTIONS.items())
     sort_opts = '''<option value="lo">Серверная</option><option value="dh">Сначала новые</option><option value="dl">Сначала старые</option><option value="na">Название А-Я</option><option value="nz">Название Я-А</option><option value="rh">Рейтинг (выс.)</option><option value="rl">Рейтинг (низ.)</option>'''
-    filter_bar = '''<div class="gf"><span class="gl">Коллекция:</span><select class="gs" onchange="af()" id="cs"><option value="">Все</option>''' + coll_opts + '''</select>
+    filter_bar = '''<div class="gf"><span class="gl">Коллекция:</span><select class="gs" onchange="rc()" id="cs"><option value="">Все</option>''' + coll_opts + '''</select>
 <span class="gl">Жанр:</span><select class="gs" onchange="af()" id="gs"><option value="">Все</option></select>
 <span class="gl">Дата:</span><select class="gs" onchange="af()" id="ds"><option value="0">Все</option><option value="7">Неделя</option><option value="14">2 недели</option><option value="30">Месяц</option><option value="60">2 месяца</option><option value="180">Полгода</option></select>
 <span class="gl">Сорт:</span><select class="gs" onchange="af()" id="ss">''' + sort_opts + '''</select></div>'''
@@ -2833,6 +2833,7 @@ document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});doc
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
 function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value)}}
+function rc(){{sf();localStorage.removeItem('gv');window.location.href='/?r='+Date.now()}}
 function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}
