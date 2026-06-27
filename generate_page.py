@@ -2763,6 +2763,37 @@ def fast_enrich_posters(topics):
     return topics
 
 
+def repair_fast_visible_missing_posters(topics, display_topics, hidden_ids, collections_to_process):
+    """Final fast-refresh guard: visible cards should not keep missing posters if recoverable."""
+    selected = set(collections_to_process or [])
+    include_all = not selected
+    include_all_world = any(is_world_source(COLLECTIONS.get(c, {}).get('source', '')) for c in selected)
+    candidates = []
+    seen = set()
+    for topic in display_topics:
+        tid = str(topic.get('topic_id') or '')
+        if not tid or tid in seen:
+            continue
+        if topic.get('_sanitized') or tid in hidden_ids:
+            continue
+        if not include_all:
+            if include_all_world:
+                if not is_world_topic(topic):
+                    continue
+            elif topic.get('collection') not in selected:
+                continue
+        if has_real_poster(topic):
+            continue
+        candidates.append(topic)
+        seen.add(tid)
+    print(f"\n11. Быстрый refresh: финальная проверка постеров для {len(candidates)} видимых тем...")
+    if candidates:
+        fast_enrich_posters(candidates)
+    else:
+        print("  Постеры: всё уже есть")
+    return candidates
+
+
 def sync_listing_order_for_collection(collection: str, cache_only: bool = False) -> dict[str, int]:
     """Return {topic_id: listing_order} for page 1. If cache_only, skip network."""
     coll_info = COLLECTIONS.get(collection)
@@ -3836,6 +3867,17 @@ def main():
 
     hidden_ids = load_hidden_topic_ids()
     display_topics = filter_world_top(topics)
+    if fast:
+        repaired = repair_fast_visible_missing_posters(
+            topics,
+            display_topics,
+            hidden_ids,
+            collections_to_process,
+        )
+        if repaired:
+            topics = clean_catalog_topics(topics)
+            save_json(TORRENTS_CACHE, topics)
+            display_topics = filter_world_top(topics)
     print(f"\n{'='*60}")
     print(f"Генерация HTML ({len(display_topics)}/{len(topics)} фильмов, скрыто: {len(hidden_ids)})...")
     output = generate_html(display_topics, hidden_ids=hidden_ids)

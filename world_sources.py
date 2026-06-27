@@ -498,6 +498,26 @@ def filter_world_top(topics, max_display=WORLD_MAX_DISPLAY):
             world.append(t)
         else:
             other.append(t)
+    by_movie = {}
+    no_key = []
+    for t in world:
+        if t.get("_sanitized"):
+            no_key.append(t)
+            continue
+        title, year = _world_movie_key(t)
+        if title and year:
+            by_movie.setdefault((title, year), []).append(t)
+        else:
+            no_key.append(t)
+    deduped_world = no_key[:]
+    removed_cross = 0
+    for group in by_movie.values():
+        if len(group) > 1:
+            removed_cross += len(group) - 1
+        deduped_world.append(_merge_duplicates_in_group(group))
+    if removed_cross:
+        print(f"  World: скрыто {removed_cross} дублей между источниками")
+    world = deduped_world
     by_collection = {}
     for t in world:
         by_collection.setdefault(t.get("collection", ""), []).append(t)
