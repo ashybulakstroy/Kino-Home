@@ -200,6 +200,7 @@ RATE_LIMIT_SECONDS = 1.0
 
 _enrich_status: dict[str, str] = {}
 _enrich_lock = threading.Lock()
+_background_enrich_lock = threading.Lock()
 _daily_refresh_lock = threading.Lock()
 _daily_refresh_started = False
 _world_trailer_recheck_started = False
@@ -483,6 +484,13 @@ def _run_light_refresh_collection(collection: str):
 def _start_light_refresh(collection: str) -> dict:
     if collection not in gp.COLLECTIONS:
         return {'status': 'invalid', 'collection': collection, 'error': 'unknown collection'}
+    if _background_enrich_lock.locked():
+        return {
+            'status': 'skipped',
+            'collection': collection,
+            'reason': 'background enrich running',
+            'message': 'Фоновое обогащение выполняется, light-refresh пропущен',
+        }
     with _light_refresh_status_lock:
         current = dict(_light_refresh_status.get(collection) or {})
     if current.get('status') == 'running':
@@ -736,6 +744,7 @@ def _ensure_enrich_worker():
 
 
 def _topic_enrich_needs(topic):
+    is_world = gp.is_world_topic(topic)
     poster_due = (
         not gp.has_real_poster(topic)
         and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
@@ -763,7 +772,7 @@ def _topic_enrich_needs(topic):
         or rating_due
         or genre_due
         or kp_due
-        or not topic.get('format')
+        or (not is_world and not topic.get('format'))
     )
     return {
         'poster': poster_due,
@@ -870,11 +879,14 @@ def _enrich_missing(force: bool = False):
     if _daily_refresh_lock.locked():
         print('  [enrich] пропуск: refresh выполняется')
         return
-    started_at = time.monotonic()
-    data_path = DATA_DIR / 'torrents_data.json'
-    if not data_path.exists():
+    if not _background_enrich_lock.acquire(blocking=False):
+        print('  [enrich] пропуск: enrich уже выполняется')
         return
+    started_at = time.monotonic()
     try:
+        data_path = DATA_DIR / 'torrents_data.json'
+        if not data_path.exists():
+            return
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
 
@@ -964,6 +976,8 @@ def _enrich_missing(force: bool = False):
     except Exception as e:
         print(f'  [enrich] ошибка за {_format_duration(time.monotonic() - started_at)}: {e}')
         return
+    finally:
+        _background_enrich_lock.release()
 
 
 def _sync_listing_order(cache_only: bool = False):

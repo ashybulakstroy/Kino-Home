@@ -277,6 +277,29 @@ def _levenshtein(a, b):
     return prev[n]
 
 
+def _world_movie_key(topic):
+    title = str(topic.get("movie_title") or topic.get("title") or "").lower()
+    year = str(topic.get("movie_year") or "")
+    if not year:
+        match = re.search(r"\b(19\d{2}|20\d{2})\b", title)
+        year = match.group(1) if match else ""
+    title = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", title)
+    title = re.sub(
+        r"\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|bluray|brrip|hdrip|dvdrip|"
+        r"dcprip|hdtv|hdscr|cam|ts|tc|telesync|line|bone|vostfr|multi|dual|imax|"
+        r"x264|x265|h264|h265|hevc|avc|aac|aac5|ac3|ddp|ddp5|dts|atmos|"
+        r"mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\s*1|2\s*0|"
+        r"yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks)\b",
+        " ",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r"\bx26\b", " ", title, flags=re.I)
+    title = re.sub(r"[^0-9a-zа-яё]+", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return (title, year)
+
+
 def _enrich_field_empty(t, field):
     val = t.get(field)
     if val is None:
@@ -293,8 +316,7 @@ def deduplicate_world_topics(topics):
     seen_fuzzy = []
     result = []
     for topic in topics:
-        title = str(topic.get("movie_title") or "").lower().strip()
-        year = str(topic.get("movie_year") or "")
+        title, year = _world_movie_key(topic)
         if not title:
             continue
         key = (title, year)
@@ -355,8 +377,7 @@ def _dedup_one_collection(topics_list, collection_name):
     for i, t in enumerate(topics_list):
         if i in used:
             continue
-        title = str(t.get("movie_title") or "").lower().strip()
-        year = str(t.get("movie_year") or "")
+        title, year = _world_movie_key(t)
         if not title:
             groups.append([t])
             continue
@@ -365,8 +386,7 @@ def _dedup_one_collection(topics_list, collection_name):
         for j, u in enumerate(topics_list):
             if j in used:
                 continue
-            u_title = str(u.get("movie_title") or "").lower().strip()
-            u_year = str(u.get("movie_year") or "")
+            u_title, u_year = _world_movie_key(u)
             if u_title and u_year == year and _levenshtein(title, u_title) <= 2:
                 group.append(u)
                 used.add(j)

@@ -77,6 +77,24 @@ def _normalize_forbidden_title(value):
     return re.sub(r'\s+', ' ', text).strip()
 
 
+def _normalize_world_movie_title(value):
+    text = str(value or '').lower()
+    text = re.sub(r'\b(19\d{2}|20\d{2})\b', ' ', text)
+    text = re.sub(
+        r'\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|bluray|brrip|hdrip|dvdrip|'
+        r'dcprip|hdtv|hdscr|cam|ts|tc|telesync|line|bone|vostfr|multi|dual|imax|'
+        r'x264|x265|h264|h265|hevc|avc|aac|aac5|ac3|ddp|ddp5|dts|atmos|'
+        r'mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\s*1|2\s*0|'
+        r'yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks)\b',
+        ' ',
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r'\bx26\b', ' ', text, flags=re.I)
+    text = re.sub(r'[^0-9a-zа-яё]+', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def forbidden_topic_keys(topic):
     keys = set()
     topic_id = str(topic.get('topic_id') or '').strip()
@@ -215,7 +233,7 @@ def world_listing_snapshot_path(collection):
 
 
 def world_listing_movie_key(topic):
-    title = _normalize_forbidden_title(topic.get('movie_title') or topic.get('title') or '')
+    title = _normalize_world_movie_title(topic.get('movie_title') or topic.get('title') or '')
     year = str(topic.get('movie_year') or '').strip()
     if not year:
         m = re.search(r'\b(19\d{2}|20\d{2})\b', str(topic.get('title') or ''))
@@ -2541,17 +2559,26 @@ def world_duplicate_hash(topic):
 
 def sync_world_duplicate_posters(topics):
     by_hash = {}
+    by_movie = {}
     for topic in topics:
         if not is_world_topic(topic):
             continue
         key = world_duplicate_hash(topic)
         if key:
             by_hash.setdefault(key, []).append(topic)
+        movie_key = world_listing_movie_key(topic)
+        if movie_key:
+            by_movie.setdefault(movie_key, []).append(topic)
 
     updated = 0
-    for group in by_hash.values():
+    seen_groups = set()
+    for group in list(by_hash.values()) + list(by_movie.values()):
         if len(group) < 2:
             continue
+        group_key = tuple(sorted(str(t.get('topic_id') or '') for t in group))
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
         source = next((t for t in group if has_real_poster(t)), None)
         if not source:
             continue
@@ -3702,7 +3729,7 @@ def main():
                     and candidate.get('collection') in collections_to_process
                     and not has_real_poster(candidate)
                 ):
-                    if is_world_topic(candidate) and candidate.get('_world_listing_new_movie') is False:
+                    if is_world_topic(candidate):
                         continue
                     fast_poster_topics.append(candidate)
                     seen_poster_topics.add(tid)
