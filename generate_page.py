@@ -186,6 +186,8 @@ def sanitize_topic(topic):
     return topic
 SEARCH_CACHE = os.path.join(DATA_DIR, "imdb_search_cache.json")
 KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
+KP_DETAILS_CACHE = os.path.join(DATA_DIR, "kp_details_cache.json")
+KP_MANUAL_IDS = os.path.join(DATA_DIR, "kp_manual_ids.json")
 YOUTUBE_CACHE = os.path.join(DATA_DIR, "youtube_cache.json")
 KP_TRAILER_CACHE = os.path.join(DATA_DIR, "kinopoisk_trailer_cache.json")
 IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
@@ -1080,12 +1082,113 @@ def search_kinopoisk(title, year):
         return None
 
 
+def fetch_kinopoisk_by_id(kp_id, title=None, year=None, verify=False):
+    kp_id = str(kp_id or '').strip()
+    if not kp_id or kp_id == '0':
+        return None
+
+    details_cache = load_json(KP_DETAILS_CACHE) or {}
+    cached = details_cache.get(kp_id)
+    if isinstance(cached, dict):
+        return cached
+
+    page_url = f"https://www.kinopoisk.ru/film/{kp_id}/"
+    try:
+        r = SESSION.get(page_url, timeout=10)
+        if r.status_code != 200:
+            return {'kp_id': kp_id, 'kp_rating': '', 'kp_votes': ''}
+        rating_html = r.text
+        if verify and title and not _kp_verify_result(_clean_kp_search_title(title), year, rating_html):
+            return None
+
+        rating = ''
+        votes = ''
+        rm = re.search(r'ratingValue["\']?\s*:\s*["\']?([\d.]+)', rating_html)
+        if rm:
+            rating = rm.group(1)
+        vm = re.search(r'ratingCount["\']?\s*:\s*["\']?(\d[\d\s]*)', rating_html)
+        if vm:
+            votes = re.sub(r'[\s,]', '', vm.group(1))
+        if not rating:
+            rm = re.search(r'<span[^>]*class="[^"]*rating[^"]*"[^>]*>([\d.]+)</span>', rating_html)
+            if rm:
+                rating = rm.group(1)
+        result = {'kp_id': kp_id, 'kp_rating': rating, 'kp_votes': votes}
+        details_cache[kp_id] = result
+        save_json(KP_DETAILS_CACHE, details_cache)
+        return result
+    except Exception:
+        return {'kp_id': kp_id, 'kp_rating': '', 'kp_votes': ''}
+
+
 def _extract_year_from_title(topic):
     raw = topic.get('title', '') or topic.get('movie_title', '')
     if not raw:
         return ''
     m = re.search(r'\b(19\d{2}|20\d{2})\b', raw)
     return m.group(1) if m else ''
+
+
+def kinopoisk_cache_key(title, year):
+    cache_title = _clean_kp_search_title(title or '')
+    return f"{cache_title}|{year or ''}".lower()
+
+
+def _manual_kp_entry_to_result(entry, title=None, year=None):
+    if isinstance(entry, str):
+        entry = {'kp_id': entry}
+    if not isinstance(entry, dict):
+        return None
+    kp_id = str(entry.get('kp_id') or '').strip()
+    if not kp_id or kp_id == '0':
+        return None
+    result = fetch_kinopoisk_by_id(kp_id, title, year, verify=False) or {'kp_id': kp_id}
+    result = dict(result)
+    result.setdefault('kp_id', kp_id)
+    if entry.get('kp_rating'):
+        result['kp_rating'] = entry['kp_rating']
+    if entry.get('kp_votes'):
+        result['kp_votes'] = entry['kp_votes']
+    result['_manual'] = True
+    return result
+
+
+def lookup_manual_kinopoisk(topic, title, year):
+    manual = load_json(KP_MANUAL_IDS) or {}
+    topic_id = str((topic or {}).get('topic_id') or '').strip()
+    if topic_id:
+        entry = (manual.get('topics') or {}).get(topic_id)
+        result = _manual_kp_entry_to_result(entry, title, year)
+        if result:
+            return result
+    key = kinopoisk_cache_key(title, year)
+    entry = (manual.get('titles') or {}).get(key)
+    result = _manual_kp_entry_to_result(entry, title, year)
+    if result:
+        return result
+    title_key = kinopoisk_cache_key(title, '')
+    entry = (manual.get('titles') or {}).get(title_key)
+    return _manual_kp_entry_to_result(entry, title, year)
+
+
+def find_kinopoisk_for_topic(topic, title, year, kp_cache=None):
+    manual_result = lookup_manual_kinopoisk(topic, title, year)
+    cache_key = kinopoisk_cache_key(title, year)
+    if manual_result:
+        if kp_cache is not None:
+            kp_cache[cache_key] = manual_result
+            save_json(KP_SEARCH_CACHE, kp_cache)
+        return manual_result
+
+    if kp_cache is None:
+        kp_cache = load_json(KP_SEARCH_CACHE) or {}
+    if cache_key in kp_cache:
+        return kp_cache[cache_key]
+
+    result = search_kinopoisk(title, year)
+    kp_cache[cache_key] = result
+    save_json(KP_SEARCH_CACHE, kp_cache)
+    return result
 
 
 def search_kinopoisk_ids(topics):
@@ -1102,27 +1205,30 @@ def search_kinopoisk_ids(topics):
             return
         if not year:
             year = _extract_year_from_title(t)
-        cache_title = _clean_kp_search_title(title)
-        cache_key = f"{cache_title}|{year}".lower()
+        cache_key = kinopoisk_cache_key(title, year)
         with counter_lock:
             counter += 1
             idx = counter
         with cache_lock:
-            result = kp_cache.get(cache_key) if cache_key in kp_cache else None
-        if result is not None:
-            pass
-        else:
+            manual_result = lookup_manual_kinopoisk(t, title, year)
+            if manual_result:
+                kp_cache[cache_key] = manual_result
+                save_json(KP_SEARCH_CACHE, kp_cache)
+                result = manual_result
+            else:
+                result = kp_cache.get(cache_key) if cache_key in kp_cache else None
+        if result is None and cache_key not in kp_cache:
             print(f"  [{idx}/{total}] {title}...", end=' ', flush=True)
             result = search_kinopoisk(title, year)
             with cache_lock:
                 kp_cache[cache_key] = result
-                if result:
-                    save_json(KP_SEARCH_CACHE, kp_cache)
+                save_json(KP_SEARCH_CACHE, kp_cache)
         if result:
             t['kp_id'] = result['kp_id']
-            t['kp_rating'] = result['kp_rating']
-            t['kp_votes'] = result['kp_votes']
-            print(f"КП {result['kp_rating'] or '—'}", end='')
+            t['kp_rating'] = result.get('kp_rating', '')
+            t['kp_votes'] = result.get('kp_votes', '')
+            label = "КП manual" if result.get('_manual') else "КП"
+            print(f"{label} {result.get('kp_rating') or '—'}", end='')
         else:
             print("не найдено", end='')
         print()
@@ -2192,23 +2298,43 @@ def has_real_poster(topic):
     return True
 
 
+def primary_id_source(topic):
+    return 'imdb' if is_world_topic(topic) else 'kp'
+
+
+def movie_id_fields_by_priority(topic):
+    if primary_id_source(topic) == 'imdb':
+        return (('imdb', 'imdb_id'), ('kp', 'kp_id'))
+    return (('kp', 'kp_id'), ('imdb', 'imdb_id'))
+
+
+def poster_sources_by_priority(topic):
+    if primary_id_source(topic) == 'imdb':
+        return ('imdb', 'kp', 'impawards')
+    return ('kp', 'imdb')
+
+
 def resolve_existing_local_poster(topic):
-    imdb_id = topic.get('imdb_id')
-    if imdb_id:
-        filename = f"{imdb_id}.jpg"
-        local_path = os.path.join(POSTERS_DIR, filename)
-        if os.path.exists(local_path):
-            topic['poster_url'] = f"{POSTERS_URL}/{filename}"
-            clear_poster_failed(topic)
-            return True
-    kp_id = topic.get('kp_id')
-    if kp_id:
-        filename = f"kp_{kp_id}.jpg"
-        local_path = os.path.join(POSTERS_DIR, filename)
-        if os.path.exists(local_path):
-            topic['poster_url'] = f"{POSTERS_URL}/{filename}"
-            clear_poster_failed(topic)
-            return True
+    for source in poster_sources_by_priority(topic):
+        if source == 'imdb':
+            imdb_id = topic.get('imdb_id')
+            if imdb_id:
+                filename = f"{imdb_id}.jpg"
+                local_path = os.path.join(POSTERS_DIR, filename)
+                if os.path.exists(local_path):
+                    topic['poster_url'] = f"{POSTERS_URL}/{filename}"
+                    clear_poster_failed(topic)
+                    return True
+        elif source == 'kp':
+            kp_id = topic.get('kp_id')
+            if kp_id:
+                for ext in ('jpg', 'jpeg', 'png', 'webp'):
+                    filename = f"kp_{kp_id}.{ext}"
+                    local_path = os.path.join(POSTERS_DIR, filename)
+                    if os.path.exists(local_path):
+                        topic['poster_url'] = f"{POSTERS_URL}/{filename}"
+                        clear_poster_failed(topic)
+                        return True
     return False
 
 
@@ -2711,7 +2837,7 @@ def sync_cached_posters_by_movie_id(topics):
     for topic in topics:
         if topic.get('_sanitized') or not has_real_poster(topic):
             continue
-        for prefix, field in (('imdb', 'imdb_id'), ('kp', 'kp_id')):
+        for prefix, field in movie_id_fields_by_priority(topic):
             value = str(topic.get(field) or '').strip()
             if value and value != '0':
                 by_id.setdefault(f'{prefix}:{value}', topic)
@@ -2723,7 +2849,7 @@ def sync_cached_posters_by_movie_id(topics):
         if resolve_existing_local_poster(topic):
             updated += 1
             continue
-        for prefix, field in (('imdb', 'imdb_id'), ('kp', 'kp_id')):
+        for prefix, field in movie_id_fields_by_priority(topic):
             value = str(topic.get(field) or '').strip()
             if not value or value == '0':
                 continue
@@ -2770,6 +2896,11 @@ def enrich(topics, ratings, basics):
         print(f"  [{i}/{total}] {t['movie_title']}...", end=' ', flush=True)
         if not has_real_poster(t):
             resolve_existing_local_poster(t)
+        if primary_id_source(t) == 'kp' and not has_real_poster(t) and t.get('kp_id'):
+            kp_local = download_kinopoisk_poster(t['kp_id'])
+            if kp_local:
+                t['poster_url'] = kp_local
+                print(f"KP постер ✓", end='')
         if imdb_id:
             bdata = basics.get(imdb_id)
             genre = bdata.get('genres', '') if isinstance(bdata, dict) else ''
@@ -2855,8 +2986,16 @@ def fast_enrich_posters(topics):
             print("local duplicate ✓")
             continue
 
+        if primary_id_source(topic) == 'kp' and not topic.get('kp_id') and title:
+            search_topic_kinopoisk(topic, topic.get('movie_title') or title, year)
+
+        if primary_id_source(topic) == 'kp' and not has_real_poster(topic) and topic.get('kp_id'):
+            local_url = download_kinopoisk_poster(topic['kp_id'])
+            if local_url:
+                topic['poster_url'] = local_url
+
         imdb_id = topic.get('imdb_id')
-        if not imdb_id and title:
+        if not has_real_poster(topic) and not imdb_id and title:
             result = search_imdb(title, year)
             if result is None:
                 result = search_imdb_deep(topic.get('title') or title)
@@ -2880,11 +3019,7 @@ def fast_enrich_posters(topics):
                     topic['poster_url'] = local_url
 
         if not has_real_poster(topic) and not topic.get('kp_id') and title:
-            result = search_kinopoisk(topic.get('movie_title') or title, year)
-            if result:
-                topic['kp_id'] = result['kp_id']
-                topic['kp_rating'] = result['kp_rating']
-                topic['kp_votes'] = result['kp_votes']
+            search_topic_kinopoisk(topic, topic.get('movie_title') or title, year)
 
         if not has_real_poster(topic) and topic.get('kp_id'):
             local_url = download_kinopoisk_poster(topic['kp_id'])
@@ -2906,6 +3041,49 @@ def fast_enrich_posters(topics):
 
     print(f"  Постеры: найдено {found}/{total}")
     return topics
+
+
+def search_topic_kinopoisk(topic, title, year, kp_cache=None):
+    is_world = is_world_topic(topic)
+    if kp_cache is None:
+        kp_cache = load_json(KP_SEARCH_CACHE) or {}
+
+    if is_world:
+        if topic.get('kp_id'):
+            needs_kp = not topic.get('_kp_validated') or not topic.get('kp_rating')
+        else:
+            needs_kp = not topic.get('_kp_retried')
+    else:
+        needs_kp = not topic.get('kp_id') or not topic.get('kp_rating')
+    if not (needs_kp and title):
+        return False
+
+    result = find_kinopoisk_for_topic(topic, title, year, kp_cache)
+
+    if result:
+        old_kp_id = topic.get('kp_id')
+        topic['kp_id'] = result['kp_id']
+        topic['kp_rating'] = result.get('kp_rating', '')
+        topic['kp_votes'] = result.get('kp_votes', '')
+        if old_kp_id != result['kp_id']:
+            topic.pop('_poster_failed_at', None)
+            if str(topic.get('poster_url', '')).startswith('data/posters/kp_'):
+                topic['poster_url'] = ''
+        if is_world:
+            topic['_kp_validated'] = True
+            topic.pop('_kp_retried', None)
+        return True
+
+    if is_world:
+        topic.pop('kp_id', None)
+        topic.pop('kp_rating', None)
+        topic.pop('kp_votes', None)
+        if str(topic.get('poster_url', '')).startswith('data/posters/kp_'):
+            topic['poster_url'] = ''
+        topic['_kp_validated'] = True
+        topic['_kp_retried'] = True
+        topic.pop('_poster_failed_at', None)
+    return False
 
 
 def repair_fast_visible_missing_posters(topics, display_topics, hidden_ids, collections_to_process):
@@ -3330,6 +3508,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if not title:
         return topic
     kp_cache = load_json(KP_SEARCH_CACHE) or {}
+    is_world = is_world_topic(topic)
     retry_poster = (
         force_poster_retry
         or should_retry_poster(topic)
@@ -3371,7 +3550,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
         except Exception:
             pass
 
-    if is_world_topic(topic):
+    if is_world:
         try:
             html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
             if html:
@@ -3388,6 +3567,14 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                         topic['format'] = fmt
         except Exception:
             pass
+
+    if not is_world:
+        search_topic_kinopoisk(topic, russian_title, year, kp_cache)
+        if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
+            local_url = download_kinopoisk_poster(topic['kp_id'])
+            if local_url:
+                topic['poster_url'] = local_url
+                clear_poster_failed(topic)
 
     if not topic.get('imdb_id'):
         result = search_imdb(title, year)
@@ -3432,43 +3619,8 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                     clear_poster_failed(topic)
 
     cache_key = f"{title}|{year}".lower()
-    kp_title = _clean_kp_search_title(russian_title)
-    kp_key = f"{kp_title}|{year}".lower()
-    is_world = is_world_topic(topic)
     if is_world:
-        if topic.get('kp_id'):
-            needs_kp = not topic.get('_kp_validated') or not topic.get('kp_rating')
-        else:
-            needs_kp = not topic.get('_kp_retried')
-    else:
-        needs_kp = not topic.get('kp_rating')
-    if needs_kp and russian_title:
-        if kp_key in kp_cache and kp_cache[kp_key] is not None:
-            result = kp_cache[kp_key]
-        else:
-            result = search_kinopoisk(russian_title, year)
-            kp_cache[kp_key] = result
-            save_json(KP_SEARCH_CACHE, kp_cache)
-        if result:
-            old_kp_id = topic.get('kp_id')
-            topic['kp_id'] = result['kp_id']
-            topic['kp_rating'] = result['kp_rating']
-            topic['kp_votes'] = result['kp_votes']
-            if old_kp_id != result['kp_id']:
-                topic.pop('_poster_failed_at', None)
-                if topic.get('poster_url', '').startswith('data/posters/kp_'):
-                    topic['poster_url'] = ''
-        elif is_world:
-            topic.pop('kp_id', None)
-            topic.pop('kp_rating', None)
-            topic.pop('kp_votes', None)
-            if topic.get('poster_url', '').startswith('data/posters/kp_'):
-                topic['poster_url'] = ''
-        if is_world:
-            topic['_kp_validated'] = True
-            if not topic.get('kp_id'):
-                topic.pop('_poster_failed_at', None)
-                topic['_kp_retried'] = True
+        search_topic_kinopoisk(topic, russian_title, year, kp_cache)
 
     if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
         local_url = download_kinopoisk_poster(topic['kp_id'])
@@ -3935,11 +4087,24 @@ def main():
             print("Обогащение новых тем за все коллекции")
             print(f"{'='*60}")
 
-            print("\n4. Поиск IMDB ID...")
-            search_imdb_ids(all_new_topics)
+            kp_primary_topics = [t for t in all_new_topics if primary_id_source(t) == 'kp']
+            imdb_primary_topics = [t for t in all_new_topics if primary_id_source(t) == 'imdb']
 
-            print("\n5. Поиск Кинопоиск рейтинга...")
-            search_kinopoisk_ids(all_new_topics)
+            if kp_primary_topics:
+                print("\n4. Поиск Кинопоиск ID для RU/SNG коллекций...")
+                search_kinopoisk_ids(kp_primary_topics)
+
+            if imdb_primary_topics:
+                print("\n5. Поиск IMDB ID для World коллекций...")
+                search_imdb_ids(imdb_primary_topics)
+
+            if kp_primary_topics:
+                print("\n6. Дополнительный поиск IMDB ID для RU/SNG коллекций...")
+                search_imdb_ids(kp_primary_topics)
+
+            if imdb_primary_topics:
+                print("\n7. Дополнительный поиск Кинопоиск рейтинга для World коллекций...")
+                search_kinopoisk_ids(imdb_primary_topics)
 
             needed_ids = set()
             for t in all_new_topics:
@@ -3947,21 +4112,21 @@ def main():
                     needed_ids.add(t['imdb_id'])
 
             if needed_ids:
-                print(f"\n6. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
+                print(f"\n8. Загрузка IMDB ratings для {len(needed_ids)} фильмов...")
                 ratings = load_ratings(needed_ids)
                 print(f"   Получено рейтингов: {sum(1 for k in needed_ids if k in ratings)}/{len(needed_ids)}")
 
-                print(f"\n7. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
+                print(f"\n9. Загрузка IMDB basics (жанры) для {len(needed_ids)} фильмов...")
                 basics = load_basics(needed_ids)
                 print(f"   Получено жанров: {sum(1 for k in needed_ids if k in basics)}/{len(needed_ids)}")
             else:
                 ratings = {}
                 basics = {}
 
-            print(f"\n8. Обогащение данных...")
+            print(f"\n10. Обогащение данных...")
             enrich(all_new_topics, ratings, basics)
 
-            print(f"\n9. Проверка запрещённых тем...")
+            print(f"\n11. Проверка запрещённых тем...")
             for t in all_new_topics:
                 if t.get('_sanitized'):
                     continue

@@ -481,19 +481,39 @@ def _run_light_refresh_collection(collection: str):
         _daily_refresh_lock.release()
 
 
+def _log_light_refresh_skip(collection: str, status: dict):
+    label = gp.COLLECTIONS.get(collection, {}).get('name', collection)
+    state = status.get('status') or 'skipped'
+    reason = status.get('reason') or status.get('error') or ''
+    if state == 'cooldown':
+        remaining = status.get('cooldown_remaining_seconds')
+        reason = f'cooldown {remaining} сек' if remaining is not None else 'cooldown'
+    elif state == 'running' and not reason:
+        reason = 'already running'
+    elif state == 'skipped' and not reason:
+        reason = status.get('message') or 'skipped'
+    suffix = f': {reason}' if reason else ''
+    print(f'Light refresh: {collection} ({label}) не запущен, {state}{suffix}')
+
+
 def _start_light_refresh(collection: str) -> dict:
     if collection not in gp.COLLECTIONS:
-        return {'status': 'invalid', 'collection': collection, 'error': 'unknown collection'}
+        result = {'status': 'invalid', 'collection': collection, 'error': 'unknown collection'}
+        _log_light_refresh_skip(collection, result)
+        return result
     if _background_enrich_lock.locked():
-        return {
+        result = {
             'status': 'skipped',
             'collection': collection,
             'reason': 'background enrich running',
             'message': 'Фоновое обогащение выполняется, light-refresh пропущен',
         }
+        _log_light_refresh_skip(collection, result)
+        return result
     with _light_refresh_status_lock:
         current = dict(_light_refresh_status.get(collection) or {})
     if current.get('status') == 'running':
+        _log_light_refresh_skip(collection, current)
         return current
     last_success_monotonic = current.get('last_success_monotonic')
     if (
@@ -505,9 +525,12 @@ def _start_light_refresh(collection: str) -> dict:
         if remaining > 0:
             current['status'] = 'cooldown'
             current['cooldown_remaining_seconds'] = remaining
+            _log_light_refresh_skip(collection, current)
             return current
     if not _daily_refresh_lock.acquire(blocking=False):
-        return {'status': 'running', 'collection': collection, 'reason': 'refresh already running'}
+        result = {'status': 'running', 'collection': collection, 'reason': 'refresh already running'}
+        _log_light_refresh_skip(collection, result)
+        return result
     try:
         thread = threading.Thread(target=_run_light_refresh_collection, args=(collection,), daemon=True)
         thread.start()
@@ -2010,7 +2033,10 @@ def refresh_light():
     if not collection:
         return jsonify(status='skipped', reason='no collection selected')
     if not _rate_limit(f'refresh_light:{request.remote_addr}:{collection}', seconds=2):
-        return jsonify(_light_refresh_snapshot(collection))
+        result = _light_refresh_snapshot(collection)
+        result['reason'] = result.get('reason') or 'rate limited'
+        _log_light_refresh_skip(collection, result)
+        return jsonify(result)
     result = _start_light_refresh(collection)
     status_code = 400 if result.get('status') == 'invalid' else 200
     return jsonify(result), status_code

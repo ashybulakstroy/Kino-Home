@@ -10,6 +10,7 @@ logs/
 
 data/*
 !data/.gitkeep
+!data/kp_manual_ids.json
 !data/posters/
 data/posters/*
 !data/posters/placeholder.png

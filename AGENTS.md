@@ -35,6 +35,12 @@ python stream_server.py             # -> http://localhost:14876, если SERVER
 | `python generate_page.py --collection=kino_sng` | Сгенерировать HTML из кеша одной коллекции |
 | `python stream_server.py` | Запустить веб-сервер |
 
+При фоновом запуске сервера нельзя перезаписывать лог-файлы. Не использовать `Start-Process -RedirectStandardOutput logs\server.log`, потому что PowerShell открывает файл с перезаписью. Использовать append-перенаправление через `cmd /c`, например:
+
+```powershell
+Start-Process -FilePath "cmd.exe" -ArgumentList '/c', '.venv\Scripts\python.exe -u stream_server.py 1>>logs\server.out.log 2>>logs\server.err.log' -WorkingDirectory (Get-Location) -WindowStyle Hidden
+```
+
 ## Архитектура
 
 | Файл | Назначение |
