@@ -285,11 +285,11 @@ def _world_movie_key(topic):
         year = match.group(1) if match else ""
     title = re.sub(r"\b(19\d{2}|20\d{2})\b", " ", title)
     title = re.sub(
-        r"\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|bluray|brrip|hdrip|dvdrip|"
+        r"\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|dl|bluray|brrip|hdrip|dvdrip|"
         r"dcprip|hdtv|hdscr|cam|ts|tc|telesync|line|bone|vostfr|multi|dual|imax|"
-        r"x264|x265|h264|h265|hevc|avc|aac|aac5|ac3|ddp|ddp5|dts|atmos|"
-        r"mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\s*1|2\s*0|"
-        r"yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks)\b",
+        r"x\s*264|x\s*265|h\s*264|h\s*265|hevc|avc|aac\s*5\s*1|aac\s*2\s*0|aac|aac\s*5|aac\s*2|ac3|ddp\s*5\s*1|ddp|ddp\s*5|dts|atmos|"
+        r"mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\.1|2\.0|7\.1|5\s*1|2\s*0|7\s*1|"
+        r"yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks|pmntp|leak)\b",
         " ",
         title,
         flags=re.I,
@@ -309,6 +309,20 @@ def _enrich_field_empty(t, field):
     if isinstance(val, (int, float)) and val == 0:
         return True
     return False
+
+
+def _title_noise_score(value):
+    text = str(value or "").lower()
+    tokens = re.findall(r"[a-z0-9]+", text)
+    noisy = {
+        "1080p", "720p", "2160p", "480p", "4k", "webrip", "web", "dl",
+        "bluray", "brrip", "hdrip", "dvdrip", "hdtv", "hdscr", "cam",
+        "ts", "tc", "bone", "vostfr", "x264", "x265", "h264", "h265",
+        "hevc", "avc", "aac", "aac5", "ac3", "ddp", "ddp5", "dts",
+        "atmos", "mkv", "mp4", "avi", "10bits", "10bit", "8bits",
+        "8bit", "fas", "dks", "line", "imax",
+    }
+    return sum(1 for token in tokens if token in noisy) + max(0, len(tokens) - 6)
 
 
 def deduplicate_world_topics(topics):
@@ -360,6 +374,20 @@ def _merge_duplicates_in_group(group):
 
     best_candidates = [t for t in group if t.get("magnet")]
     best = max(best_candidates or group, key=_seeders)
+    best_key = _world_movie_key(best)
+    best_noise = _title_noise_score(best.get("movie_title") or best.get("title") or "")
+    for member in group:
+        if member is best or _world_movie_key(member) != best_key:
+            continue
+        member_title = member.get("movie_title") or ""
+        member_noise = _title_noise_score(member_title)
+        if member_title and member_noise < best_noise:
+            best["movie_title"] = member_title
+            if member.get("movie_year"):
+                best["movie_year"] = member.get("movie_year")
+            if member.get("orig_title"):
+                best["orig_title"] = member.get("orig_title")
+            best_noise = member_noise
     for field in _ENRICH_FIELDS:
         if _enrich_field_empty(best, field):
             for member in group:

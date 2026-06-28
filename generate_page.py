@@ -4,6 +4,7 @@
 import gzip
 import json
 import os
+import copy
 import re
 import sys
 import threading
@@ -81,11 +82,11 @@ def _normalize_world_movie_title(value):
     text = str(value or '').lower()
     text = re.sub(r'\b(19\d{2}|20\d{2})\b', ' ', text)
     text = re.sub(
-        r'\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|bluray|brrip|hdrip|dvdrip|'
+        r'\b(?:1080p|720p|2160p|480p|4k|webrip|web-dl|web|dl|bluray|brrip|hdrip|dvdrip|'
         r'dcprip|hdtv|hdscr|cam|ts|tc|telesync|line|bone|vostfr|multi|dual|imax|'
-        r'x264|x265|h264|h265|hevc|avc|aac|aac5|ac3|ddp|ddp5|dts|atmos|'
-        r'mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\s*1|2\s*0|'
-        r'yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks)\b',
+        r'x\s*264|x\s*265|h\s*264|h\s*265|hevc|avc|aac\s*5\s*1|aac\s*2\s*0|aac|aac\s*5|aac\s*2|ac3|ddp\s*5\s*1|ddp|ddp\s*5|dts|atmos|'
+        r'mp4|mkv|avi|10bit|10bits|8bit|8bits|2ch|6ch|7ch|5\.1|2\.0|7\.1|5\s*1|2\s*0|7\s*1|'
+        r'yts|yify|rarbg|rmteam|neonoir|supacvnt|flux|btm|yg|fas|dks|pmntp|leak)\b',
         ' ',
         text,
         flags=re.I,
@@ -188,6 +189,7 @@ KP_SEARCH_CACHE = os.path.join(DATA_DIR, "kp_search_cache.json")
 YOUTUBE_CACHE = os.path.join(DATA_DIR, "youtube_cache.json")
 KP_TRAILER_CACHE = os.path.join(DATA_DIR, "kinopoisk_trailer_cache.json")
 IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
+WORLD_TITLE_IDENTITY_CACHE = os.path.join(DATA_DIR, "world_title_identity_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
 HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
@@ -659,6 +661,54 @@ def clean_title(raw):
     t = re.sub(r'(?i)\b(LEAK|PLAY|DUAL|LINKS|SCREENER|TS|CAM|HDRip)\b', '', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t, year
+
+
+def _world_prefix_candidates(raw):
+    text = re.sub(r'[._]+', ' ', raw or '')
+    text = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    out = []
+    for m in re.finditer(r'\b(19\d{2}|20\d{2})\b', text):
+        year = m.group(1)
+        prefix = text[:m.start()].strip(' -._')
+        if not prefix:
+            continue
+        words = prefix.split()
+        for n in range(len(words), max(len(words) - 4, 0), -1):
+            candidate = ' '.join(words[:n]).strip(' -._')
+            if len(candidate) >= 2:
+                out.append((candidate, year))
+    seen = set()
+    unique = []
+    for title, year in out:
+        key = (title.lower(), year)
+        if key not in seen:
+            seen.add(key)
+            unique.append((title, year))
+    return unique
+
+
+def _cached_world_imdb_prefix_match(title, year):
+    cache = load_json(WORLD_TITLE_IDENTITY_CACHE) or {}
+    key = f"{title}|{year}".lower()
+    if key in cache:
+        return cache[key] or None
+    result = search_imdb(title, year)
+    if result and result.get('id'):
+        value = {'title': title, 'year': year, 'imdb_id': result['id']}
+    else:
+        value = None
+    cache[key] = value
+    save_json(WORLD_TITLE_IDENTITY_CACHE, cache)
+    return value
+
+
+def world_identity_clean_title(raw):
+    for candidate, year in _world_prefix_candidates(raw):
+        match = _cached_world_imdb_prefix_match(candidate, year)
+        if match:
+            return match['title'], match['year']
+    return clean_title(raw)
 
 
 def parse_piratebay_date(raw):
@@ -2100,6 +2150,11 @@ def local_poster_path(poster_url):
     return os.path.join(POSTERS_DIR, filename)
 
 
+def is_placeholder_poster_url(poster_url):
+    poster_url = (poster_url or '').replace('\\', '/').lower()
+    return poster_url.endswith('/placeholder.png') or poster_url == 'placeholder.png'
+
+
 def normalize_poster_url(poster_url):
     poster_url = (poster_url or '').replace('\\', '/')
     if poster_url.startswith('posters/'):
@@ -2123,6 +2178,8 @@ def should_try_external_poster_fallback(topic):
 def has_real_poster(topic):
     poster_url = topic.get('poster_url', '') or ''
     if not poster_url:
+        return False
+    if is_placeholder_poster_url(poster_url):
         return False
     local_path = local_poster_path(poster_url)
     if not (local_path and os.path.exists(local_path)):
@@ -2292,29 +2349,40 @@ def repair_world_titles(topics):
         if movie_year:
             without_year = re.sub(rf'\s*\(?{re.escape(movie_year)}\)?\s*$', '', movie_title).strip()
             if without_year and without_year != movie_title:
+                old_key = world_listing_movie_key(t)
                 old_title = movie_title[:50]
                 t['movie_title'] = without_year
                 movie_title = without_year
-                count += 1
-                print(f"  title: {old_title} -> {without_year} ({movie_year})")
+                if old_key != world_listing_movie_key(t):
+                    count += 1
+                    print(f"  title: {old_title} -> {without_year} ({movie_year})")
         if not raw_title or not tech.search(movie_title):
             continue
         new_title, year = clean_world_title(raw_title)
         if not new_title or new_title == movie_title:
             continue
         old_title = movie_title[:50]
+        old_key = world_listing_movie_key(t)
+        new_key = world_listing_movie_key({
+            **t,
+            'movie_title': new_title,
+            'movie_year': year or t.get('movie_year'),
+        })
+        same_title_key = old_key.split('|', 1)[0] == new_key.split('|', 1)[0]
         t['movie_title'] = new_title
         if year:
             t['movie_year'] = year
-        t['imdb_id'] = None
-        t['imdb_rating'] = None
-        t['imdb_votes'] = None
-        t['kp_id'] = None
-        t['kp_rating'] = None
-        t['kp_votes'] = None
-        t['poster_url'] = ''
-        count += 1
-        print(f"  title: {old_title} -> {new_title} ({t.get('movie_year', '')})")
+        if old_key != new_key and not same_title_key:
+            t['imdb_id'] = None
+            t['imdb_rating'] = None
+            t['imdb_votes'] = None
+            t['kp_id'] = None
+            t['kp_rating'] = None
+            t['kp_votes'] = None
+            t['poster_url'] = ''
+        if old_key != new_key and not same_title_key:
+            count += 1
+            print(f"  title: {old_title} -> {new_title} ({t.get('movie_year', '')})")
     if count:
         print(f"  World-тем восстановлено: {count}")
     return topics
@@ -2550,6 +2618,44 @@ def ensure_topic_defaults(topic):
     return topic
 
 
+def preserve_cached_topic_enrichment(fresh_topic, cached_topic):
+    """Keep durable enrichment when a refreshed listing/topic lacks it."""
+    if not cached_topic:
+        return fresh_topic
+
+    if is_world_topic(fresh_topic) and cached_topic.get('movie_title'):
+        fresh_key = world_listing_movie_key(fresh_topic)
+        cached_key = world_listing_movie_key(cached_topic)
+        if cached_key and (fresh_key == cached_key or re.search(r'\b(?:1080p|720p|2160p|web|web-dl|bluray|brrip|hdrip|dvdrip|x264|x265|h264|h265|hevc|bone|ddp|aac|mkv|mp4)\b', str(fresh_topic.get('movie_title') or ''), flags=re.I)):
+            fresh_topic['movie_title'] = cached_topic.get('movie_title') or fresh_topic.get('movie_title')
+            if cached_topic.get('movie_year'):
+                fresh_topic['movie_year'] = cached_topic.get('movie_year')
+            if cached_topic.get('orig_title'):
+                fresh_topic['orig_title'] = cached_topic.get('orig_title')
+
+    if has_real_poster(cached_topic) and not has_real_poster(fresh_topic):
+        fresh_topic['poster_url'] = cached_topic.get('poster_url') or ''
+        clear_poster_failed(fresh_topic)
+
+    preserve_if_missing = (
+        'magnet', 'imdb_id', 'imdb_rating', 'imdb_votes', 'kp_id', 'kp_rating',
+        'kp_votes', 'youtube_url', 'cast', 'format',
+    )
+    for field in preserve_if_missing:
+        if not fresh_topic.get(field) and cached_topic.get(field):
+            fresh_topic[field] = cached_topic[field]
+
+    preserve_flags = (
+        '_sanitized', '_kp_validated', '_kp_retried', '_poster_failed_at',
+        '_poster_fallback_failed_at', '_magnet_failed',
+    )
+    for field in preserve_flags:
+        if field in cached_topic and field not in fresh_topic:
+            fresh_topic[field] = cached_topic[field]
+
+    return fresh_topic
+
+
 def world_duplicate_hash(topic):
     topic_id = str(topic.get('topic_id') or '')
     if topic_id.startswith(('pb_', 'tpb_')):
@@ -2599,6 +2705,44 @@ def sync_world_duplicate_posters(topics):
     return updated
 
 
+def sync_cached_posters_by_movie_id(topics):
+    """Reuse already downloaded posters for topics with the same movie IDs."""
+    by_id = {}
+    for topic in topics:
+        if topic.get('_sanitized') or not has_real_poster(topic):
+            continue
+        for prefix, field in (('imdb', 'imdb_id'), ('kp', 'kp_id')):
+            value = str(topic.get(field) or '').strip()
+            if value and value != '0':
+                by_id.setdefault(f'{prefix}:{value}', topic)
+
+    updated = 0
+    for topic in topics:
+        if topic.get('_sanitized') or has_real_poster(topic):
+            continue
+        if resolve_existing_local_poster(topic):
+            updated += 1
+            continue
+        for prefix, field in (('imdb', 'imdb_id'), ('kp', 'kp_id')):
+            value = str(topic.get(field) or '').strip()
+            if not value or value == '0':
+                continue
+            source = by_id.get(f'{prefix}:{value}')
+            if not source:
+                continue
+            old_url = topic.get('poster_url', '')
+            topic['poster_url'] = source.get('poster_url') or ''
+            if has_real_poster(topic):
+                clear_poster_failed(topic)
+                updated += 1
+                break
+            topic['poster_url'] = old_url
+
+    if updated:
+        print(f"  Постеры из кеша по ID фильма: {updated}")
+    return updated
+
+
 def clean_catalog_topics(topics):
     playable = prune_unplayable_topics(topics)
     for topic in playable:
@@ -2608,6 +2752,7 @@ def clean_catalog_topics(topics):
     for topic in playable:
         ensure_topic_defaults(topic)
     sync_world_duplicate_posters(playable)
+    sync_cached_posters_by_movie_id(playable)
     return playable
 
 
@@ -3289,10 +3434,14 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     cache_key = f"{title}|{year}".lower()
     kp_title = _clean_kp_search_title(russian_title)
     kp_key = f"{kp_title}|{year}".lower()
-    needs_kp = not topic.get('kp_rating')
     is_world = is_world_topic(topic)
-    if is_world and topic.get('kp_id'):
-        needs_kp = True
+    if is_world:
+        if topic.get('kp_id'):
+            needs_kp = not topic.get('_kp_validated') or not topic.get('kp_rating')
+        else:
+            needs_kp = not topic.get('_kp_retried')
+    else:
+        needs_kp = not topic.get('kp_rating')
     if needs_kp and russian_title:
         if kp_key in kp_cache and kp_cache[kp_key] is not None:
             result = kp_cache[kp_key]
@@ -3428,7 +3577,7 @@ def load_collection_listing(collection, coll_info, topics_limit):
                         raw = f.read()
                     html = raw.decode('utf-8', errors='replace')
                 page_topics = parse_world_page(
-                    html, collection, source, clean_title, parse_size, now_text,
+                    html, collection, source, world_identity_clean_title, parse_size, now_text,
                     info_hash_from_magnet, detect_format_from_text,
                 )
                 page_topics = deduplicate_world_topics(page_topics)
@@ -3452,7 +3601,7 @@ def load_collection_listing(collection, coll_info, topics_limit):
             if raw:
                 html = raw.decode('utf-8', errors='replace')
                 page_topics = parse_world_page(
-                    html, collection, source, clean_title, parse_size, now_text,
+                    html, collection, source, world_identity_clean_title, parse_size, now_text,
                     info_hash_from_magnet, detect_format_from_text,
                 )
                 page_topics = deduplicate_world_topics(page_topics)
@@ -3654,7 +3803,7 @@ def main():
                 continue
 
             print("2. Слияние с кешем...")
-            cache_by_id = {t['topic_id']: t for t in topics if t.get('topic_id')}
+            cache_by_id = {t['topic_id']: copy.deepcopy(t) for t in topics if t.get('topic_id')}
 
             other = [t for t in topics if t.get('collection', 'nashe_kino') != collection]
             existing_current = [
@@ -3679,21 +3828,23 @@ def main():
                     for field in listing_update_fields:
                         if field in fresh_topic and fresh_topic.get(field) not in (None, ''):
                             t[field] = fresh_topic[field]
+                    preserve_cached_topic_enrichment(t, cache_by_id.get(t['topic_id']))
 
             # Add only genuinely new topics (not already in cache)
             new_current: list[dict] = []
+            skipped_same_movie = 0
             forbidden_keys = load_forbidden_topic_keys()
             for t in all_topics:
                 if t['topic_id'] not in existing_ids:
+                    if is_world_source(source) and not t.get('_world_listing_new_movie'):
+                        skipped_same_movie += 1
+                        continue
+                    preserve_cached_topic_enrichment(t, cache_by_id.get(t['topic_id']))
                     if matches_forbidden_topic_cache(t, forbidden_keys):
                         sanitize_topic(t)
                         print(f"  {t.get('movie_title','')}: скрыто по кешу запрещённых")
                     new_current.append(t)
-            new_enrich_current = [
-                t for t in new_current
-                if not (is_world_source(source) and not t.get('_world_listing_new_movie'))
-            ]
-            skipped_same_movie = len(new_current) - len(new_enrich_current)
+            new_enrich_current = new_current
 
             merged = other + existing_current + new_current
             print(f"  В кеше: {len(cache_by_id)}, свежих (всего): {len(all_topics)}, "
@@ -3747,9 +3898,21 @@ def main():
                 print("\nНовых тем нет, тяжёлое обогащение пропущено")
             fast_poster_topics = []
             seen_poster_topics = set()
+            hidden_ids_for_fast = load_hidden_topic_ids()
+            forbidden_keys_for_fast = load_forbidden_topic_keys()
+
+            def skip_fast_poster_candidate(candidate):
+                tid = str(candidate.get('topic_id') or '')
+                return (
+                    candidate.get('_sanitized')
+                    or tid in hidden_ids_for_fast
+                    or matches_forbidden_topic_cache(candidate, forbidden_keys_for_fast)
+                    or is_forbidden_topic(candidate)
+                )
+
             for candidate in all_new_topics:
                 tid = candidate.get('topic_id')
-                if tid and tid not in seen_poster_topics:
+                if tid and tid not in seen_poster_topics and not skip_fast_poster_candidate(candidate):
                     fast_poster_topics.append(candidate)
                     seen_poster_topics.add(tid)
             for candidate in topics:
@@ -3759,6 +3922,7 @@ def main():
                     and tid not in seen_poster_topics
                     and candidate.get('collection') in collections_to_process
                     and not has_real_poster(candidate)
+                    and not skip_fast_poster_candidate(candidate)
                 ):
                     if is_world_topic(candidate):
                         continue
@@ -3809,15 +3973,33 @@ def main():
 
         print("\n9. Проверка запрещённых тем (весь кеш)...")
         sanitized = 0
+        sanitized_repaired = 0
         for t in topics:
+            if t.get('_sanitized'):
+                before = (
+                    t.get('poster_url'), t.get('magnet'), t.get('kp_id'), t.get('imdb_id'),
+                    t.get('kp_rating'), t.get('imdb_rating'), t.get('youtube_url'),
+                )
+                sanitize_topic(t)
+                after = (
+                    t.get('poster_url'), t.get('magnet'), t.get('kp_id'), t.get('imdb_id'),
+                    t.get('kp_rating'), t.get('imdb_rating'), t.get('youtube_url'),
+                )
+                if before != after:
+                    sanitized_repaired += 1
+                continue
             if not t.get('_sanitized') and is_forbidden_topic(t):
                 sanitize_topic(t)
                 sanitized += 1
                 print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
         if sanitized:
             print(f"  Всего скрыто: {sanitized}")
-        else:
+        if sanitized_repaired:
+            print(f"  Санитизированные темы очищены повторно: {sanitized_repaired}")
+        if not sanitized and not sanitized_repaired:
             print("  Чисто")
+        elif not sanitized:
+            print("  Новых запрещённых нет")
 
         print("  Синхронизация hidden_topics с _sanitized...")
         hidden_ids = load_hidden_topic_ids()

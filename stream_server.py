@@ -61,7 +61,7 @@ class _TimestampedStream:
 
 def _install_timestamped_logs(log_file: str | None = None):
     global _LOG_FILE
-    if log_file:
+    if log_file and sys.stdout.isatty():
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         _LOG_FILE = open(log_file, 'a', encoding='utf-8')
         atexit.register(_close_log_file)
@@ -753,10 +753,7 @@ def _topic_enrich_needs(topic):
     genre_due = bool(imdb_id) and (
         not topic.get('genre') or gp.is_listing_category_genre(topic.get('genre'))
     )
-    rating_due = (
-        (not topic.get('kp_rating') and not topic.get('imdb_rating'))
-        or (bool(imdb_id) and not topic.get('imdb_rating'))
-    )
+    rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
     trailer_due = not topic.get('youtube_url')
     kp_due = (
         bool(topic.get('topic_id', '').startswith('pb_'))
