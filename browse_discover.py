@@ -16,7 +16,7 @@ import rutracker_search as rtsearch
 
 HISTORY_FILE = DATA_DIR / 'discover_history.json'
 SEARCH_CACHE_FILE = DATA_DIR / 'discover_search_cache.json'
-SEARCH_CACHE_VERSION = 'v2'
+SEARCH_CACHE_VERSION = 'v5'
 ENRICH_BATCH_LIMIT = max(1, min(WORKER_COUNT, 8))
 
 bp = Blueprint('discover', __name__)
@@ -181,6 +181,23 @@ def _format_size_bytes(size_bytes):
     return f'{value:.1f} {unit}'
 
 
+def _normalize_size_text(value):
+    value = html_lib.unescape(str(value or '')).replace('\xa0', ' ').replace(',', '.')
+    replacements = {
+        'Тбайт': 'TB',
+        'Гбайт': 'GB',
+        'Мбайт': 'MB',
+        'Кбайт': 'KB',
+        'ТБ': 'TB',
+        'ГБ': 'GB',
+        'МБ': 'MB',
+        'КБ': 'KB',
+    }
+    for src, dst in replacements.items():
+        value = re.sub(src, dst, value, flags=re.I)
+    return re.sub(r'\s+', ' ', value).strip()
+
+
 def _ensure_discover_poster(topic):
     gp.resolve_existing_local_poster(topic)
     if gp.has_real_poster(topic):
@@ -250,6 +267,68 @@ def _enrich_discover_identity(topic):
     if not topic.get('youtube_url'):
         topic['youtube_url'] = gp.resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
     return topic
+
+
+def _fill_video_fields_from_topic_page(topic):
+    if not _has_real_topic_url(topic):
+        return
+    if topic.get('size_str') and topic.get('format'):
+        return
+    topic_url = topic.get('topic_url') or ''
+    if 'rutracker.net/forum/viewtopic.php' not in topic_url:
+        return
+    try:
+        html = gp.get_topic_html(topic.get('topic_id'), topic_url, timeout=10)
+    except Exception:
+        html = ''
+    if not html:
+        return
+    if not topic.get('format'):
+        try:
+            data = gp.parse_topic_for_magnet(html)
+            if data.get('format'):
+                topic['format'] = data['format']
+        except Exception:
+            pass
+    if topic.get('size_str'):
+        return
+    text = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html_lib.unescape(text)
+    m = re.search(
+        r'(?:Размер(?:\s+файла)?|Size)\s*[:：]\s*([0-9]+(?:[.,][0-9]+)?\s*(?:TB|GB|GiB|MB|MiB|KB|Тбайт|Гбайт|Мбайт|Кбайт|ТБ|ГБ|МБ|КБ))',
+        text,
+        flags=re.I,
+    )
+    if not m:
+        m = re.search(
+            r'\b([0-9]+(?:[.,][0-9]+)?\s*(?:TB|GB|GiB|MB|MiB|KB|Тбайт|Гбайт|Мбайт|Кбайт|ТБ|ГБ|МБ|КБ))\b',
+            text,
+            flags=re.I,
+        )
+    if m:
+        size_bytes, size_str = gp.parse_size(_normalize_size_text(m.group(1)))
+        if size_str:
+            topic['size_str'] = size_str
+            topic['size_bytes'] = size_bytes or 0
+
+
+def _restore_input_video_fields(topic, data):
+    if not topic.get('size_str') and data.get('size'):
+        topic['size_str'] = data.get('size') or ''
+    if not topic.get('size_bytes') and data.get('size_bytes'):
+        try:
+            topic['size_bytes'] = int(data.get('size_bytes') or 0)
+        except (TypeError, ValueError):
+            topic['size_bytes'] = 0
+    if not topic.get('format') and data.get('format'):
+        topic['format'] = data.get('format') or ''
+    if not topic.get('format'):
+        topic['format'] = gp.detect_format_from_text(
+            ' '.join(str(v or '') for v in (
+                data.get('title'), data.get('raw_title'), topic.get('title'), topic.get('magnet')
+            ))
+        )
 
 
 def _topic_card_payload(topic, status, source_label=''):
@@ -388,6 +467,60 @@ def _discover_world(query):
             continue
     results.sort(key=lambda item: -(item.get('seeders') or 0))
     return {'stage': 'world', 'results': results[:30], 'count': len(results)}
+
+
+def _rutracker_movie_key(result):
+    title = result.get('raw_title') or result.get('title') or ''
+    clean_title, year = gp.clean_title(title)
+    title = clean_title or title
+    title = re.sub(r'\[[^\]]+\]|\([^\)]*(?:rip|xvid|divx|mkv|avi|mp4|dvd|hd|sd|web|bd)[^\)]*\)', ' ', title, flags=re.I)
+    title = re.sub(
+        r'\b(?:mkv|mp4|avi|xvid|divx|dvd|dvdrip|hdrip|webrip|web-dl|bdrip|hdtv|'
+        r'720p|1080p|2160p|4k|rip|proper|remux|лицензия|дублированный|профессиональный)\b',
+        ' ',
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r'\b(?:original|rus|russian|eng|english|sub|subs|subtitles|озвучка|субтитры)\b', ' ', title, flags=re.I)
+    title = title.lower().replace('ё', 'е')
+    title = re.sub(r'[^0-9a-zа-я]+', ' ', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    if not year:
+        m = re.search(r'\b(19\d{2}|20\d{2})\b', result.get('raw_title') or result.get('title') or '')
+        year = m.group(1) if m else ''
+    return title, year
+
+
+def _dedupe_movie_results(results):
+    grouped = {}
+    passthrough = []
+    for result in results:
+        key = _rutracker_movie_key(result)
+        if not key[0]:
+            passthrough.append(result)
+            continue
+        grouped.setdefault(key, []).append(result)
+
+    def score(item):
+        return (
+            int(bool(item.get('has_magnet') or item.get('magnet'))),
+            int(bool(item.get('has_poster') or item.get('poster_url'))),
+            int(bool(item.get('size'))),
+            int(item.get('seeders') or 0),
+            -len(str(item.get('title') or '')),
+        )
+
+    deduped = []
+    for group in grouped.values():
+        best = max(group, key=score)
+        if len(group) > 1:
+            best = dict(best)
+            best['duplicate_count'] = len(group)
+            best['status'] = f"{best.get('status') or 'Найдено'}; дублей скрыто: {len(group) - 1}"
+        deduped.append(best)
+    deduped.extend(passthrough)
+    deduped.sort(key=lambda item: (-(item.get('seeders') or 0), item.get('title') or ''))
+    return deduped
 
 
 def _fill_world_search_formats(topics):
@@ -645,6 +778,7 @@ def _discover_rutracker(query):
                 'kp_id': '',
             })
 
+    results = _dedupe_movie_results(results)
     payload = {'stage': 'rutracker', 'results': results[:30], 'count': len(results)}
     if errors:
         payload['error'] = '; '.join(errors)
@@ -696,6 +830,67 @@ def _save_discover_history(entry):
     atomic_write_json(HISTORY_FILE, history)
 
 
+def _is_enriched_discover_item(item):
+    has_video = bool(item.get('magnet') or item.get('topic_url') or item.get('has_magnet'))
+    has_video_fields = bool(item.get('format') and item.get('size'))
+    return bool(
+        item.get('status') == 'Обогащён'
+        and item.get('poster_url')
+        and item.get('poster_url') != '/data/posters/placeholder.png'
+        and (item.get('magnet') or item.get('imdb_id') or item.get('kp_id'))
+        and (has_video_fields if has_video else (item.get('trailer_url') or item.get('kp_rating') or item.get('imdb_rating')))
+    )
+
+
+def _find_enriched_history_match(data):
+    wanted = _discover_item_keys(data)
+    if not wanted:
+        return None
+    for item in reversed(_load_discover_history()):
+        if not isinstance(item, dict):
+            continue
+        if _is_enriched_discover_item(item) and (_discover_item_keys(item) & wanted):
+            return item
+    return None
+
+
+def _merge_discover_payload(old, enriched):
+    merged = dict(old)
+    for key, value in enriched.items():
+        if value not in (None, '', [], {}):
+            merged[key] = value
+    merged['status'] = enriched.get('status') or old.get('status') or ''
+    return merged
+
+
+def _update_search_cache_with_enriched(enriched):
+    enriched_keys = _discover_item_keys(enriched)
+    if not enriched_keys:
+        return 0
+    cache = _load_search_cache()
+    changed = 0
+    for entry in cache.values():
+        payload = entry.get('payload') if isinstance(entry, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        result_sets = []
+        if isinstance(payload.get('results'), list):
+            result_sets.append(payload['results'])
+        for stage_payload in (payload.get('local'), payload.get('identity'), payload.get('world'), payload.get('rutracker')):
+            if isinstance(stage_payload, dict) and isinstance(stage_payload.get('results'), list):
+                result_sets.append(stage_payload['results'])
+        for results in result_sets:
+            for idx, item in enumerate(results):
+                if not isinstance(item, dict):
+                    continue
+                if _discover_item_keys(item) & enriched_keys:
+                    results[idx] = _merge_discover_payload(item, enriched)
+                    changed += 1
+    if changed:
+        _save_search_cache(cache)
+    return changed
+
+
 def _make_discover_topic(result):
     topic_id = str(result.get('topic_id') or '')
     title = (result.get('title') or result.get('orig_title') or '').strip()
@@ -703,7 +898,7 @@ def _make_discover_topic(result):
     size_str = result.get('size') or ''
     size_bytes = result.get('size_bytes') or 0
     if not size_bytes and size_str:
-        size_bytes, size_str = gp.parse_size(size_str)
+        size_bytes, size_str = gp.parse_size(_normalize_size_text(size_str))
     collection = result.get('collection') or 'rutracker_search'
     source_kind = result.get('source_kind') or ''
     if not source_kind and collection in gp.COLLECTIONS:
@@ -761,7 +956,17 @@ def _discover_item_keys(item):
 
 
 def _enrich_discover_item(data):
+    cached = _find_enriched_history_match(data)
+    if cached:
+        return {
+            'topic_id': cached.get('topic_id') or data.get('topic_id') or '',
+            'status': 'cached',
+            'cache_hit': True,
+            'changed_fields': [],
+            'movie': cached,
+        }
     topic = _make_discover_topic(data)
+    before = _topic_card_payload(topic, 'До обогащения', 'Discover')
     result = {'topic_id': topic.get('topic_id'), 'status': 'enriching'}
     if _has_real_topic_url(topic) and 'rutracker.net/forum/viewtopic.php' in topic.get('topic_url', ''):
         try:
@@ -778,6 +983,8 @@ def _enrich_discover_item(data):
             _enrich_discover_identity(topic)
         except Exception as e:
             result['enrich_error'] = str(e)
+    _restore_input_video_fields(topic, data)
+    _fill_video_fields_from_topic_page(topic)
     _ensure_discover_poster(topic)
     payload = _topic_card_payload(topic, 'Обогащён', 'Discover')
     payload['kp_rating'] = topic.get('kp_rating', '')
@@ -786,7 +993,24 @@ def _enrich_discover_item(data):
     payload['year'] = topic.get('movie_year', '')
     payload['trailer_url'] = topic.get('trailer_url') or topic.get('youtube_url') or ''
     payload['status'] = 'Обогащён'
+    changed_fields = []
+    labels = {
+        'magnet': 'magnet',
+        'poster_url': 'постер',
+        'kp_rating': 'KP рейтинг',
+        'imdb_rating': 'IMDB рейтинг',
+        'trailer_url': 'трейлер',
+        'format': 'контейнер',
+        'size': 'размер',
+        'imdb_id': 'IMDB ID',
+        'kp_id': 'KP ID',
+    }
+    for field, label in labels.items():
+        if not before.get(field) and payload.get(field):
+            changed_fields.append(label)
     _save_discover_history(payload)
+    result['cache_updated'] = _update_search_cache_with_enriched(payload)
+    result['changed_fields'] = changed_fields
     result['status'] = 'done'
     result['movie'] = payload
     return result
@@ -838,14 +1062,14 @@ def browse_discover():
     return '''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Найти фильм</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:22px}h1{font-size:26px;margin:0 0 6px}.sub{color:#999;font-size:14px;margin:0 0 18px}.search{display:grid;grid-template-columns:1fr 150px;gap:10px;margin-bottom:14px}input{background:#242424;color:#fff;border:1px solid #333;border-radius:6px;padding:13px 14px;font-size:16px}button{background:#e50914;color:#fff;border:0;border-radius:6px;padding:0 18px;font-weight:700;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.progress{height:8px;background:#292929;border-radius:4px;overflow:hidden;margin:8px 0 12px}.fill{height:100%;width:0;background:#e50914;transition:width .2s}.status{display:flex;gap:8px;flex-wrap:wrap;color:#aaa;font-size:12px;margin-bottom:14px}.pill{background:#242424;border:1px solid #333;border-radius:4px;padding:4px 8px}.section{margin:18px 0}.section h2{font-size:18px;margin:0 0 10px;color:#ddd}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}.card{display:grid;grid-template-columns:64px 1fr;gap:10px;background:#1f1f1f;border:1px solid #333;border-radius:7px;padding:9px;min-height:104px;cursor:default;position:relative;transition:border-color .2s}.card.clickable{cursor:pointer}.card.clickable:hover{border-color:#e50914}.card.loading{opacity:.6;pointer-events:none}.card .spinner{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);border-radius:7px;z-index:2;font-size:13px;color:#e50914}.card .spinner::after{content:'';width:18px;height:18px;margin-left:8px;border:2px solid #555;border-top-color:#e50914;border-radius:50%;animation:sp .6s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}.poster{width:64px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#333;border-radius:4px}.title{font-size:15px;font-weight:700;line-height:1.25}.meta{font-size:12px;color:#aaa;margin:5px 0}.tag{display:inline-block;background:#2c2c2c;color:#ddd;border:1px solid #444;border-radius:3px;padding:2px 6px;font-size:11px;margin:2px 4px 2px 0}.actions a{display:inline-block;color:#fff;background:#333;text-decoration:none;border-radius:4px;padding:5px 8px;font-size:12px;margin-right:5px}.actions a.watch{background:#e50914}.empty{color:#777;padding:14px;background:#1b1b1b;border:1px solid #282828;border-radius:7px}.back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}.modal{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.8);align-items:center;justify-content:center;padding:20px}.modal.open{display:flex}.modal .mc{background:#1a1a1a;border:1px solid #333;border-radius:10px;max-width:520px;width:100%;max-height:90vh;overflow-y:auto;padding:20px;position:relative}.modal .mc h2{font-size:20px;margin:0 0 4px}.modal .mc .sub{font-size:13px;color:#999;margin:0 0 12px}.modal .mc .row{display:flex;gap:16px}.modal .mc .mposter{width:140px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#222;border-radius:6px;flex-shrink:0}.modal .mc .minfo{flex:1;min-width:0}.modal .mc .rating{display:inline-block;background:#242424;border:1px solid #444;border-radius:4px;padding:3px 8px;margin:2px 4px 2px 0;font-size:13px;font-weight:700}.modal .mc .rating.kp{color:#ffd700}.modal .mc .rating.imdb{color:#f5c518}.modal .mc .genre{display:inline-block;background:#2a2a2a;border:1px solid #444;border-radius:3px;padding:2px 7px;font-size:11px;color:#aaa;margin:2px 3px 2px 0}.modal .mc .close{position:absolute;top:12px;right:16px;background:none;border:none;color:#888;font-size:22px;cursor:pointer}.modal .mc .close:hover{color:#fff}.modal .mc .mactions{margin-top:12px;display:flex;gap:8px}.modal .mc .mactions a{padding:8px 16px;border-radius:5px;font-size:13px;text-decoration:none;font-weight:700}.modal .mc .mactions .watch-btn{background:#e50914;color:#fff}.modal .mc .mactions .source-btn{background:#333;color:#fff}.modal .mc .mloading{text-align:center;padding:40px 20px;color:#aaa}.modal .mc .mloading .sp{width:28px;height:28px;margin:0 auto 12px;border:3px solid #333;border-top-color:#e50914;border-radius:50%;animation:sp .6s linear infinite}
+*{box-sizing:border-box}body{margin:0;background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:22px}h1{font-size:26px;margin:0 0 6px}.sub{color:#999;font-size:14px;margin:0 0 18px}.search{display:grid;grid-template-columns:1fr 150px 120px;gap:10px;margin-bottom:14px}input{background:#242424;color:#fff;border:1px solid #333;border-radius:6px;padding:13px 14px;font-size:16px}button{background:#e50914;color:#fff;border:0;border-radius:6px;padding:0 18px;font-weight:700;cursor:pointer}button:disabled{opacity:.55;cursor:wait}button.secondary{background:#333;color:#ddd}.progress{height:8px;background:#292929;border-radius:4px;overflow:hidden;margin:8px 0 12px}.fill{height:100%;width:0;background:#e50914;transition:width .2s}.status{display:flex;gap:8px;flex-wrap:wrap;color:#aaa;font-size:12px;margin-bottom:14px}.status:empty{display:none}.pill{background:#242424;border:1px solid #333;border-radius:4px;padding:4px 8px}.section{margin:18px 0}.section h2{font-size:18px;margin:0 0 10px;color:#ddd}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}.card{display:grid;grid-template-columns:64px 1fr;gap:10px;background:#1f1f1f;border:1px solid #333;border-radius:7px;padding:9px;min-height:104px;cursor:default;position:relative;transition:border-color .2s}.card.clickable{cursor:pointer}.card.clickable:hover{border-color:#e50914}.card.loading{opacity:.6;pointer-events:none}.card .spinner{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);border-radius:7px;z-index:2;font-size:13px;color:#e50914}.card .spinner::after{content:'';width:18px;height:18px;margin-left:8px;border:2px solid #555;border-top-color:#e50914;border-radius:50%;animation:sp .6s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}.poster{width:64px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#333;border-radius:4px}.title{font-size:15px;font-weight:700;line-height:1.25}.meta{font-size:12px;color:#aaa;margin:5px 0}.tag{display:inline-block;background:#2c2c2c;color:#ddd;border:1px solid #444;border-radius:3px;padding:2px 6px;font-size:11px;margin:2px 4px 2px 0}.actions a{display:inline-block;color:#fff;background:#333;text-decoration:none;border-radius:4px;padding:5px 8px;font-size:12px;margin-right:5px}.actions a.watch{background:#e50914}.empty{color:#777;padding:14px;background:#1b1b1b;border:1px solid #282828;border-radius:7px}.back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}.modal{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.8);align-items:center;justify-content:center;padding:20px}.modal.open{display:flex}.modal .mc{background:transparent;border:0;border-radius:0;max-width:360px;width:100%;max-height:92vh;overflow:visible;padding:0;position:relative}.modal .mc .close{position:absolute;top:-42px;right:0;width:34px;height:34px;background:#e94560;border:0;border-radius:4px;color:#fff;font-size:22px;cursor:pointer;z-index:3}.modal .mc .mloading{text-align:center;padding:34px 20px;color:#aaa;background:#1a1a1a;border:1px solid #333;border-radius:8px}.modal .mc .mloading .sp{width:28px;height:28px;margin:0 auto 12px;border:3px solid #333;border-top-color:#e50914;border-radius:50%;animation:sp .6s linear infinite}.enrich-steps{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:14px}.enrich-step{font-size:12px;color:#888;background:#242424;border:1px solid #333;border-radius:4px;padding:4px 7px;transition:all .2s}.enrich-step.active{color:#fff;background:#e50914;border-color:#e50914;box-shadow:0 0 12px rgba(229,9,20,.35)}.enrich-bar{height:4px;background:#2a2a2a;border-radius:2px;overflow:hidden;margin-top:12px}.enrich-bar span{display:block;height:100%;width:34%;background:#e50914;border-radius:2px;animation:slide 1.1s ease-in-out infinite}@keyframes slide{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}.movie-tile{background:#fff;color:#1a1a1a;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;box-shadow:0 8px 28px rgba(0,0,0,.35)}.movie-tile .pc{display:block;width:100%;position:relative;background:#111;cursor:pointer}.movie-tile .pc img{display:block;width:100%;aspect-ratio:2/3;object-fit:cover;background:#222}.movie-tile .pb{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:64px;color:rgba(255,255,255,.85);text-shadow:0 0 20px rgba(0,0,0,.6);pointer-events:none}.tile-body{padding:12px}.tile-title{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}.tile-info{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}.rb{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none;background:#f5c518;color:#111}.tile-genre,.tile-format,.tile-size,.tile-imdb{font-size:14px;color:#666;text-decoration:none}.tile-format{color:#e67e22;font-weight:600}.tile-cast{font-size:14px;color:#555;line-height:1.4;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tile-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.tile-actions a,.tile-actions button{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:700;text-decoration:none;border:0;cursor:pointer}.bt{background:#da3633;color:#fff}.wb{background:#2da44e;color:#fff}.bm{background:#eee;color:#333}.tile-empty{background:#eee;color:#777;font-size:12px;padding:4px 8px;border-radius:4px}@media(max-width:640px){.search{grid-template-columns:1fr}.search button{height:44px}}
 </style></head><body>
 <a href="/test" class="back">Назад</a>
 <h1>Найти фильм</h1>
 <p class="sub">Кликните по результату, чтобы обогатить (magnet, постер, рейтинги, трейлер) и открыть карточку фильма.</p>
-<div class="search"><input id="q" placeholder="Например: F1 The Movie, Сваты 2, Interstellar" autofocus><button id="go">Искать</button></div>
+<div class="search"><input id="q" placeholder="Например: F1 The Movie, Сваты 2, Interstellar" autofocus><button id="go">Искать</button><button id="clear" class="secondary" type="button">Очистить</button></div>
 <div class="progress"><div class="fill" id="fill"></div></div>
-<div class="status" id="status"><span class="pill">Готово</span></div>
+<div class="status" id="status"></div>
 <div id="out"></div>
 <div class="modal" id="modal"><div class="mc" id="mc"></div></div>
 <script>
@@ -869,33 +1093,48 @@ function card(m){
   return '<div class="card clickable" data-id="'+esc(m.topic_id||'')+'" data-json="'+esc(JSON.stringify(m))+'"><div class="poster" style="background-image:url('+pu(m)+')"></div><div><div class="title">'+esc(m.title||m.orig_title||'?')+'</div><div class="meta">'+esc([m.source,m.year,ids,m.seeders?'\u0441\u0438\u0434\u043e\u0432 '+m.seeders:''].filter(Boolean).join(' \u00b7 '))+'</div><div><span class="tag">'+esc(fmt)+'</span><span class="tag">'+esc(size)+'</span></div><span class="tag">'+esc(m.status||'')+'</span><div class="actions">'+cardActions(m)+'</div></div></div>';
 }
 function enrichedCard(m){
-  const h=hash(m), ids=[m.imdb_id?'IMDb '+m.imdb_id:'',m.kp_id?'KP '+m.kp_id:''].filter(Boolean).join(' \u00b7');
-  let ratings='';
-  if(m.kp_rating)ratings+='<span class="rating kp">KP '+esc(m.kp_rating)+'</span>';
-  if(m.imdb_rating)ratings+='<span class="rating imdb">IMDb '+esc(m.imdb_rating)+'</span>';
-  let genres='';
-  if(m.genre)genres=m.genre.split(',').map(g=>'<span class="genre">'+esc(g.trim())+'</span>').join('');
-  let watchBtn='',sourceBtn='',magnetText='';
-  if(h)watchBtn='<a class="watch-btn" href="#" onclick="watchMovie(currentMovie);return false">\u0421\u043c\u043e\u0442\u0440\u0435\u0442\u044c</a>';
-  if(m.magnet)magnetText='<div style="margin-top:10px;font-size:11px;color:#777;word-break:break-all">Magnet: '+esc(m.magnet.slice(0,160))+(m.magnet.length>160?'...':'')+'</div>';
-  if(m.topic_url)sourceBtn='<a class="source-btn" href="'+esc(m.topic_url)+'" target="_blank">\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a</a>';
-  if(m.trailer_url)sourceBtn+='<a class="source-btn" href="'+esc(m.trailer_url)+'" target="_blank">\u0422\u0440\u0435\u0439\u043b\u0435\u0440</a>';
-  const tech=[m.format,m.size].filter(Boolean).join(' \u00b7 ');
-  return '<button class="close" onclick="closeModal()">\u00d7</button><div class="row"><div class="mposter" style="background-image:url('+pu(m)+')"></div><div class="minfo"><h2>'+esc(m.title||m.orig_title||'?')+'</h2><div class="sub">'+esc([m.orig_title,m.year,ids,tech].filter(Boolean).join(' \u00b7 '))+'</div>'+ratings+'<div style="margin-top:6px">'+genres+'</div><div class="mactions">'+watchBtn+sourceBtn+'</div>'+magnetText+'</div></div>';
+  const rating=m.kp_rating||m.imdb_rating||'0';
+  const ratingLabel=m.kp_rating?'KP':(m.imdb_rating?'IMDB':'');
+  const ratingHtml=ratingLabel?'<span class="rb">'+ratingLabel+' '+esc(rating)+'</span>':'';
+  const genre=m.genre?'<span class="tile-genre">'+esc(m.genre)+'</span>':'';
+  const fmt=m.format?'<span class="tile-format">Формат: '+esc(m.format)+'</span>':'<span class="tile-empty">формат ?</span>';
+  const size=m.size?'<span class="tile-size">'+esc(m.size)+'</span>':'<span class="tile-empty">размер ?</span>';
+  const cast=m.cast?'<div class="tile-cast">'+esc(m.cast).slice(0,120)+'</div>':'';
+  const trailer=m.trailer_url||'https://www.youtube.com/results?search_query='+encodeURIComponent([m.title,m.year,'official trailer'].filter(Boolean).join(' '));
+  const trailerBtn='<a href="'+esc(trailer)+'" onclick="window.open(this.href,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;);return false" class="bt">▶ Трейлер</a>';
+  const watchBtn=m.magnet?'<button class="wb" onclick="watchMovie(currentMovie);return false">▶ Смотреть</button>':'';
+  const magnetBtn=m.magnet?'<a href="'+esc(m.magnet)+'" class="bm" title="Скачать kino">🧲</a>':'';
+  const ratingUrl=m.kp_id?'https://www.kinopoisk.ru/film/'+encodeURIComponent(m.kp_id)+'/':(m.imdb_id?'https://www.imdb.com/title/'+encodeURIComponent(m.imdb_id)+'/':'#');
+  const sourceUrl=m.topic_url||ratingUrl;
+  return '<button class="close" onclick="closeModal()">×</button><div class="movie-tile tile-card"><div class="pc" data-yt="'+esc(trailer)+'" onclick="window.open(this.dataset.yt,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;)"><img src="'+pu(m)+'" alt=""><span class="pb">▶</span></div><div class="tile-body"><a href="'+esc(sourceUrl)+'" class="tile-title" target="_blank">'+esc(m.raw_title||m.title||m.orig_title||'?')+'</a><div class="tile-info">'+ratingHtml+genre+fmt+size+'</div>'+cast+'<div class="tile-actions">'+trailerBtn+watchBtn+magnetBtn+'<a href="'+esc(ratingUrl)+'" target="_blank" class="tile-imdb">'+esc(ratingLabel||'ID')+'</a></div></div></div>';
 }
 function section(name,data){const items=data.results||[];return '<div class="section"><h2>'+esc(name)+' <span class="tag">'+(data.count||items.length)+'</span></h2>'+(items.length?'<div class="grid">'+items.map(card).join('')+'</div>':'<div class="empty">\u041d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e</div>')+'</div>'}
+function isEnriched(m){const hasVideo=!!(m.magnet||m.topic_url||m.has_magnet);const hasVideoFields=!!(m.format&&m.size);return (m.status==='Обогащён'||m.has_poster||m.poster_url)&&m.poster_url&&m.poster_url.indexOf('placeholder.png')===-1&&(m.magnet||m.imdb_id||m.kp_id)&&(hasVideo?hasVideoFields:(m.trailer_url||m.kp_rating||m.imdb_rating))}
+function enrichLoadingHtml(tasks){const list=(tasks.length?tasks:['проверка кеша']);return '<div class="mloading"><div class="sp"></div>Обогащение...<div class="enrich-steps">'+list.map((t,i)=>'<span class="enrich-step '+(i===0?'active':'')+'">'+esc(t)+'</span>').join('')+'</div><div class="enrich-bar"><span></span></div><div style="font-size:12px;color:#666;margin-top:10px">Если данные уже в кеше, открою сразу</div></div>'}
+function startEnrichCycle(){let i=0;return setInterval(()=>{const steps=[...document.querySelectorAll('.enrich-step')];if(!steps.length)return;steps.forEach(s=>s.classList.remove('active'));i=(i+1)%steps.length;steps[i].classList.add('active')},700)}
 async function enrichItem(m){
   const modal=document.getElementById('modal'),mc=document.getElementById('mc');
   modal.classList.add('open');
-  mc.innerHTML='<div class="mloading"><div class="sp"></div>\u041e\u0431\u043e\u0433\u0430\u0449\u0435\u043d\u0438\u0435...<br><span style="font-size:12px;color:#666">\u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430 magnet, \u043f\u043e\u0441\u0442\u0435\u0440\u0430, \u0440\u0435\u0439\u0442\u0438\u043d\u0433\u043e\u0432, \u0442\u0440\u0435\u0439\u043b\u0435\u0440\u0430</span></div>';
+  if(isEnriched(m)){currentMovie=m;mc.innerHTML=enrichedCard(m);return;}
+  const tasks=[];
+  if(!m.magnet&&m.topic_url)tasks.push('magnet');
+  if(!m.poster_url||m.poster_url.indexOf('placeholder.png')!==-1)tasks.push('постер');
+  if(!m.kp_rating&&!m.imdb_rating)tasks.push('рейтинг');
+  if(!m.trailer_url)tasks.push('трейлер');
+  if(!m.format)tasks.push('контейнер');
+  if(!m.size)tasks.push('размер');
+  mc.innerHTML=enrichLoadingHtml(tasks);
+  const cycle=startEnrichCycle();
   try{
     const selectedKey=m.topic_id||m.magnet||m.imdb_id||m.kp_id||m.title||'';
     const batch=[m].concat(allResults.filter(x=>x!==m)).slice(0,8);
     const r=await fetch('/api/discover/enrich_batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selected_key:selectedKey,items:batch})});
     const d=await r.json();
-    if(d.movie){currentMovie=d.movie;mc.innerHTML=enrichedCard(d.movie);}
+    clearInterval(cycle);
+    if(d.movie){currentMovie=d.movie;const added=(d.results||[]).flatMap(x=>x.changed_fields||[]).filter((v,i,a)=>a.indexOf(v)===i);if(added.length){mc.innerHTML='<div class="mloading"><div class="sp"></div>\u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e: '+esc(added.join(', '))+'</div>';setTimeout(()=>{mc.innerHTML=enrichedCard(d.movie)},450)}else{mc.innerHTML=enrichedCard(d.movie)}setTimeout(()=>run(true),0);}
     else mc.innerHTML='<div class="mloading">\u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0431\u043e\u0433\u0430\u0449\u0435\u043d\u0438\u044f</div>';
   }catch(e){
+    clearInterval(cycle);
     mc.innerHTML='<div class="mloading">\u041e\u0448\u0438\u0431\u043a\u0430: '+esc(e.message)+'</div>';
   }
 }
@@ -929,7 +1168,9 @@ document.getElementById('out').addEventListener('click',function(e){
   if(!raw)return;
   try{enrichItem(JSON.parse(raw))}catch(e){}
 });
-async function run(){const q=document.getElementById('q').value.trim();if(q.length<2)return;const btn=document.getElementById('go'),fill=document.getElementById('fill'),st=document.getElementById('status'),out=document.getElementById('out');btn.disabled=true;out.innerHTML='';allResults=[];fill.style.width='0%';let html='';for(let i=0;i<stages.length;i++){const[scope,label]=stages[i];st.innerHTML='<span class="pill">\u042d\u0442\u0430\u043f '+(i+1)+'/'+stages.length+': '+label+'</span>';try{const r=await fetch('/api/discover?scope='+scope+'&q='+encodeURIComponent(q));const d=await r.json();if(d.results)allResults=allResults.concat(d.results);html+=section(label,d);out.innerHTML=html}catch(e){html+='<div class="section"><h2>'+esc(label)+'</h2><div class="empty">\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0438\u0441\u043a\u0430</div></div>';out.innerHTML=html}fill.style.width=Math.round((i+1)/stages.length*100)+'%'}st.innerHTML='<span class="pill">\u0413\u043e\u0442\u043e\u0432\u043e</span>';btn.disabled=false}
+async function run(silent=false){const q=document.getElementById('q').value.trim();if(q.length<2)return;const btn=document.getElementById('go'),fill=document.getElementById('fill'),st=document.getElementById('status'),out=document.getElementById('out');btn.disabled=true;out.innerHTML='';allResults=[];fill.style.width='0%';let html='';for(let i=0;i<stages.length;i++){const[scope,label]=stages[i];if(!silent)st.innerHTML='<span class="pill">\u042d\u0442\u0430\u043f '+(i+1)+'/'+stages.length+': '+label+'</span>';try{const r=await fetch('/api/discover?scope='+scope+'&q='+encodeURIComponent(q));const d=await r.json();if(d.results)allResults=allResults.concat(d.results);html+=section(label,d);out.innerHTML=html}catch(e){html+='<div class="section"><h2>'+esc(label)+'</h2><div class="empty">\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0438\u0441\u043a\u0430</div></div>';out.innerHTML=html}fill.style.width=Math.round((i+1)/stages.length*100)+'%'}st.innerHTML='';btn.disabled=false}
+function clearSearch(){document.getElementById('q').value='';document.getElementById('out').innerHTML='';document.getElementById('status').innerHTML='';document.getElementById('fill').style.width='0%';allResults=[];document.getElementById('q').focus();}
 document.getElementById('go').addEventListener('click',run);
+document.getElementById('clear').addEventListener('click',clearSearch);
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')run()});
 </script></body></html>'''
