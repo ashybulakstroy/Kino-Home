@@ -10,6 +10,8 @@ import threading
 import subprocess
 import shutil
 import atexit
+import urllib.parse
+import html as html_lib
 from pathlib import Path
 from typing import TextIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +22,7 @@ from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_A
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
+from browse_discover import bp as discover_bp
 
 
 _LOG_FILE: TextIO | None = None
@@ -109,6 +112,7 @@ class _LazyEngine:
 engine = _LazyEngine()
 
 app = Flask(__name__, static_folder=None)
+app.register_blueprint(discover_bp)
 
 STREAM_IDLE_TIMEOUT = 30
 SESSION_SWEEP_INTERVAL = 10
@@ -1962,7 +1966,7 @@ def index():
         html = html.replace(old_collection_reload, light_collection_reload, 1)
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
-    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
+    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/discover">Найти фильм</a><a href="/browse/missing">Вне витрины</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
     if 'class="bl"' not in html:
         html = html.replace('<table id="tbl">', f'{browse_links}<table id="tbl">', 1)
     public_style = '.rmv,.eb{display:none!important}' if PUBLIC_MODE else ''
@@ -2238,6 +2242,8 @@ h1{{font-size:28px;margin-bottom:6px}}
 <div class="card"><h3>🔲 Матрица</h3><p>Случайные 16 постеров в сетке 4×4. Клик — плеер. Перемешать заново.</p><a href="/browse/matrix">Открыть</a><span class="tag">сетка</span><span class="tag">постеры</span></div>
 <div class="card"><h3>📊 Статистика</h3><p>Графики: жанры, годы, коллекции. Количество, рейтинги, распределение.</p><a href="/browse/stats">Открыть</a><span class="tag">чарты</span><span class="tag">данные</span></div>
 <div class="card"><h3>🔎 Поиск</h3><p>Поиск фильмов по названию (русскому или оригинальному). Результаты мгновенно по мере ввода.</p><a href="/browse/search">Открыть</a><span class="tag">поиск</span><span class="tag">название</span></div>
+<div class="card"><h3>Найти фильм</h3><p>Поиск по витрине, кешу, IMDb/KP и внешним источникам, если фильма нет у нас.</p><a href="/browse/discover">Открыть</a><span class="tag">external</span><span class="tag">поиск</span></div>
+<div class="card"><h3>🧭 Вне витрины</h3><p>Экспериментальный поиск по всем темам кеша, скрытым, вне лимитов и snapshot источников.</p><a href="/browse/missing">Открыть</a><span class="tag">аудит</span><span class="tag">причины</span></div>
 <div class="card"><h3>🏆 Топ</h3><p>Топ-50 фильмов по рейтингу Кинопоиска и IMDB. Сортировка, бейджи, номера мест.</p><a href="/browse/top">Открыть</a><span class="tag">рейтинг</span><span class="tag">топ</span></div>
 <div class="card"><h3>📂 Коллекции</h3><p>Фильмы сгруппированные по коллекциям: Наше кино, Новинки, Кино СНГ и другие.</p><a href="/browse/collections">Открыть</a><span class="tag">группы</span><span class="tag">коллекции</span></div>
 </div>
@@ -2909,6 +2915,215 @@ document.getElementById('results').innerHTML=filtered.length?filtered.map(card).
 document.getElementById('results').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
 document.getElementById('q').addEventListener('input',function(){{render(this.value);}});
 render('');
+</script></body></html>'''
+
+
+def _missing_topic_reason(topic, display_ids: set[str], hidden_ids: set[str]) -> list[str]:
+    reasons = []
+    topic_id = str(topic.get('topic_id') or '')
+    if topic_id in hidden_ids:
+        reasons.append('hidden')
+    if topic.get('_sanitized'):
+        reasons.append('sanitized')
+    if not topic.get('magnet') or topic.get('magnet') == '0':
+        reasons.append('no magnet')
+    if topic_id and topic_id not in display_ids:
+        reasons.append('outside display set')
+    hidden_source = f"{topic.get('genre', '')} {topic.get('title', '')}".lower()
+    if any(h in hidden_source for h in gp.HIDDEN_GENRES):
+        reasons.append('forbidden text/genre')
+    if not gp.has_real_poster(topic):
+        reasons.append('missing poster')
+    return reasons
+
+
+def _missing_search_items():
+    topics = load_full_topics()
+    hidden_ids = gp.load_hidden_topic_ids()
+    display_topics = gp.filter_world_top(gp.clean_catalog_topics(topics))
+    display_ids = {str(t.get('topic_id') or '') for t in display_topics if t.get('topic_id')}
+    topic_ids = {str(t.get('topic_id') or '') for t in topics if t.get('topic_id')}
+    display_keys = {gp.world_listing_movie_key(t) for t in display_topics if gp.is_world_topic(t)}
+    catalog_keys = {gp.world_listing_movie_key(t) for t in topics if gp.is_world_topic(t)}
+
+    items = []
+    for topic in topics:
+        topic_id = str(topic.get('topic_id') or '')
+        collection = topic.get('collection') or ''
+        collection_label = gp.COLLECTIONS.get(collection, {}).get('name', collection)
+        reasons = _missing_topic_reason(topic, display_ids, hidden_ids)
+        in_display = topic_id in display_ids
+        items.append({
+            'kind': 'cache',
+            'topic_id': topic_id,
+            'collection': collection,
+            'collection_label': collection_label,
+            'title': topic.get('movie_title') or topic.get('title') or '',
+            'orig_title': topic.get('orig_title') or '',
+            'year': topic.get('movie_year') or '',
+            'genre': topic.get('genre') or '',
+            'seeders': topic.get('seeders') or 0,
+            'imdb_id': topic.get('imdb_id') or '',
+            'kp_id': topic.get('kp_id') or '',
+            'poster_url': gp.display_poster_url(topic),
+            'has_poster': gp.has_real_poster(topic),
+            'has_magnet': bool(topic.get('magnet') and topic.get('magnet') != '0'),
+            'in_display': in_display,
+            'reasons': reasons,
+            'search': ' '.join(str(v or '') for v in (
+                topic_id, collection, collection_label, topic.get('movie_title'),
+                topic.get('orig_title'), topic.get('title'), topic.get('movie_year'),
+                topic.get('genre'), topic.get('imdb_id'), topic.get('kp_id'),
+            )).lower(),
+        })
+
+    seen_snapshot = set()
+    for collection, info in gp.COLLECTIONS.items():
+        if not gp.is_world_source(info.get('source', '')):
+            continue
+        snapshot = gp.load_world_listing_snapshot(collection)
+        collection_label = info.get('name', collection)
+        for entry in snapshot.get('items') or []:
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get('key') or '')
+            topic_id = str(entry.get('topic_id') or '')
+            row_key = (collection, key, topic_id)
+            if row_key in seen_snapshot:
+                continue
+            seen_snapshot.add(row_key)
+            in_catalog = topic_id in topic_ids or key in catalog_keys
+            in_display = key in display_keys or topic_id in display_ids
+            if in_catalog and in_display:
+                continue
+            reasons = []
+            if not in_catalog:
+                reasons.append('source not in catalog')
+            elif not in_display:
+                reasons.append('source not in display')
+            items.append({
+                'kind': 'source',
+                'topic_id': topic_id,
+                'collection': collection,
+                'collection_label': collection_label,
+                'title': entry.get('title') or '',
+                'orig_title': '',
+                'year': entry.get('year') or '',
+                'genre': '',
+                'seeders': 0,
+                'imdb_id': '',
+                'kp_id': '',
+                'poster_url': '/data/posters/placeholder.png',
+                'has_poster': False,
+                'has_magnet': bool(topic_id),
+                'in_display': False,
+                'reasons': reasons,
+                'search': ' '.join(str(v or '') for v in (
+                    topic_id, collection, collection_label, entry.get('title'),
+                    entry.get('year'), key,
+                )).lower(),
+            })
+    return items
+
+
+@app.route('/browse/missing')
+def browse_missing():
+    items = _missing_search_items()
+    items_json = json.dumps(items, ensure_ascii=False).replace('</script>', '<\\/script>')
+    return f'''<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Вне витрины</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
+h1{{font-size:24px;margin-bottom:6px}}
+.sub{{color:#888;font-size:13px;margin-bottom:16px}}
+.bar{{display:grid;grid-template-columns:minmax(220px,1fr) 180px 170px 140px;gap:10px;align-items:center;margin-bottom:12px}}
+input,select{{width:100%;padding:11px 12px;border:1px solid #333;border-radius:6px;background:#242424;color:#fff;outline:0}}
+input:focus,select:focus{{border-color:#e50914}}
+label{{font-size:13px;color:#bbb;display:flex;align-items:center;gap:8px;white-space:nowrap}}
+input[type=checkbox]{{width:auto}}
+.progress{{height:8px;background:#2a2a2a;border-radius:4px;overflow:hidden;margin:8px 0 14px}}
+.fill{{height:100%;width:0;background:#e50914;transition:width .08s linear}}
+.meta{{display:flex;gap:12px;flex-wrap:wrap;color:#aaa;font-size:12px;margin-bottom:12px}}
+.pill{{background:#252525;border:1px solid #333;border-radius:4px;padding:4px 8px}}
+#results{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}}
+.card{{display:grid;grid-template-columns:58px 1fr;gap:10px;background:#1f1f1f;border:1px solid #303030;border-radius:6px;padding:8px;min-height:92px}}
+.poster{{width:58px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#333;border-radius:4px}}
+.title{{font-size:14px;font-weight:650;line-height:1.25;margin-bottom:4px}}
+.m{{font-size:12px;color:#aaa;margin-bottom:6px}}
+.reasons{{display:flex;gap:5px;flex-wrap:wrap}}
+.r{{font-size:11px;background:#3a2a1a;color:#ffc27a;border:1px solid #664117;border-radius:3px;padding:2px 5px}}
+.r.ok{{background:#14351f;color:#7ee39b;border-color:#245b35}}
+.kind{{font-size:11px;color:#888;text-transform:uppercase;margin-left:4px}}
+.empty{{color:#777;text-align:center;padding:40px;grid-column:1/-1}}
+.back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
+.back:hover{{background:#e50914;border-color:#e50914}}
+@media(max-width:760px){{.bar{{grid-template-columns:1fr}}}}
+</style></head><body>
+<a href="/test" class="back">← Тест</a>
+<h1>Вне витрины</h1>
+<p class="sub">Поиск по всему кешу, темам вне отображения и snapshot World-источников.</p>
+<div class="bar">
+  <input id="q" type="text" placeholder="Название, ID, коллекция, IMDb/KP..." autofocus>
+  <select id="collection"><option value="">Все коллекции</option></select>
+  <select id="reason"><option value="">Все причины</option></select>
+  <label><input id="missingOnly" type="checkbox" checked> Только вне витрины</label>
+</div>
+<div class="progress"><div class="fill" id="fill"></div></div>
+<div class="meta"><span class="pill" id="progressText">Готово к поиску</span><span class="pill" id="countText"></span><span class="pill">Всего записей: {len(items)}</span></div>
+<div id="results"></div>
+<script>
+const ITEMS={items_json};
+const CHUNK=80;
+let token=0;
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function pu(m){{const p=m.poster_url||''; if(!p)return '/data/posters/placeholder.png'; return p.indexOf('data/')===0?'/'+p:p;}}
+function norm(s){{return String(s||'').toLowerCase().trim()}}
+function initFilters(){{
+  const cols=[...new Map(ITEMS.map(x=>[x.collection,x.collection_label||x.collection])).entries()].filter(x=>x[0]).sort((a,b)=>a[1].localeCompare(b[1]));
+  document.getElementById('collection').innerHTML='<option value="">Все коллекции</option>'+cols.map(([v,l])=>'<option value="'+esc(v)+'">'+esc(l)+'</option>').join('');
+  const reasons=[...new Set(ITEMS.flatMap(x=>x.reasons||[]))].sort();
+  document.getElementById('reason').innerHTML='<option value="">Все причины</option>'+reasons.map(r=>'<option value="'+esc(r)+'">'+esc(r)+'</option>').join('');
+}}
+function card(m){{
+  const reasons=(m.reasons&&m.reasons.length?m.reasons:['in display']).map(r=>'<span class="r '+(r==='in display'?'ok':'')+'">'+esc(r)+'</span>').join('');
+  const ids=[m.imdb_id?'IMDb '+m.imdb_id:'',m.kp_id?'KP '+m.kp_id:''].filter(Boolean).join(' · ');
+  return '<div class="card"><div class="poster" style="background-image:url('+pu(m)+')"></div><div><div class="title">'+esc(m.title||m.orig_title||'?')+' <span class="kind">'+esc(m.kind)+'</span></div><div class="m">'+esc([m.collection_label,m.year,ids,m.seeders?'сидов '+m.seeders:''].filter(Boolean).join(' · '))+'</div><div class="reasons">'+reasons+'</div></div></div>';
+}}
+function criteria(){{
+  return {{
+    q:norm(document.getElementById('q').value),
+    collection:document.getElementById('collection').value,
+    reason:document.getElementById('reason').value,
+    missingOnly:document.getElementById('missingOnly').checked
+  }};
+}}
+function match(m,c){{
+  if(c.q && !(m.search||'').includes(c.q))return false;
+  if(c.collection && m.collection!==c.collection)return false;
+  if(c.reason && !(m.reasons||[]).includes(c.reason))return false;
+  if(c.missingOnly && m.in_display)return false;
+  return true;
+}}
+function runSearch(){{
+  const my=++token,c=criteria(),out=[];let i=0;
+  const fill=document.getElementById('fill'),pt=document.getElementById('progressText'),ct=document.getElementById('countText'),res=document.getElementById('results');
+  fill.style.width='0%';pt.textContent='Поиск... 0/'+ITEMS.length;ct.textContent='';res.innerHTML='';
+  function step(){{
+    if(my!==token)return;
+    const end=Math.min(i+CHUNK,ITEMS.length);
+    for(;i<end;i++)if(match(ITEMS[i],c))out.push(ITEMS[i]);
+    const pct=ITEMS.length?Math.round(i/ITEMS.length*100):100;
+    fill.style.width=pct+'%';pt.textContent='Поиск... '+i+'/'+ITEMS.length;ct.textContent='Найдено: '+out.length;
+    if(i<ITEMS.length){{setTimeout(step,0);return;}}
+    pt.textContent='Готово: обработано '+ITEMS.length;
+    res.innerHTML=out.length?out.map(card).join(''):'<div class="empty">Ничего не найдено</div>';
+  }}
+  setTimeout(step,0);
+}}
+['q','collection','reason','missingOnly'].forEach(id=>document.getElementById(id).addEventListener(id==='q'?'input':'change',runSearch));
+initFilters();
+runSearch();
 </script></body></html>'''
 
 

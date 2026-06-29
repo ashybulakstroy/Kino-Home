@@ -228,7 +228,7 @@ def parse_tpbparty_page(
 ):
     soup = BeautifulSoup(html, "html.parser")
     topics = []
-    rows = soup.select("#searchResult > tr:not(.header):not(.altHeader)")
+    rows = soup.select("#searchResult tbody tr, #searchResult > tr:not(.header):not(.altHeader)")
     for row in rows:
         tds = row.find_all("td")
         if len(tds) < 8:
@@ -245,7 +245,7 @@ def parse_tpbparty_page(
         category_el = row.select_one(".vertTh a")
         category = category_el.get_text(strip=True) if category_el else ""
         href = title_el.get("href", "")
-        topic_url = urllib.parse.urljoin("https://tpb.party", href) if href else ""
+        topic_url = urllib.parse.urljoin("https://thepiratebay.party", href) if href else ""
         uploaded = tds[2].get_text(strip=True) if len(tds) > 2 else ""
         size_str = tds[4].get_text(strip=True) if len(tds) > 4 else ""
         seeders = tds[5].get_text(strip=True) if len(tds) > 5 else "0"

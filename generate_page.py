@@ -659,7 +659,8 @@ def clean_title(raw):
                r')\b', ' ', t, flags=re.I)
     t = re.sub(r'[._]', ' ', t)
     t = re.sub(r'\s+', ' ', t).strip()
-    t = re.sub(r'\s*-\s*\w+$', '', t)
+    t = re.sub(r'\s*-\s*[A-Za-z0-9]+\s*$', '', t)
+    t = re.sub(r'\s*-\s*$', '', t)
     t = re.sub(r'(?i)\b(LEAK|PLAY|DUAL|LINKS|SCREENER|TS|CAM|HDRip)\b', '', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t, year
