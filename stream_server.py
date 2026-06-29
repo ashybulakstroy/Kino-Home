@@ -23,6 +23,7 @@ from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_A
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
 from browse_discover import bp as discover_bp
+from activity_collections import record_watched_magnet
 
 
 _LOG_FILE: TextIO | None = None
@@ -260,6 +261,17 @@ def _generate_display_html(topics):
     return gp.generate_html(gp.filter_world_top(topics))
 
 
+def _record_watched_activity(magnet, extra=None):
+    try:
+        topic = record_watched_magnet(magnet, extra=extra or {})
+        if topic:
+            topics = load_full_topics()
+            atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', _generate_display_html(topics))
+            print(f"Activity: Watched <- {topic.get('movie_title') or topic.get('title') or topic.get('topic_id')}")
+    except Exception as exc:
+        print(f"Activity: Watched не записан: {exc}")
+
+
 def _today_stamp() -> str:
     return date.today().isoformat()
 
@@ -371,7 +383,7 @@ def _run_refresh_process(collection=None, fast=False):
 def _run_all_collections_refresh():
     started_at = time.monotonic()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
-    for collection in gp.COLLECTIONS:
+    for collection in gp.REFRESH_COLLECTIONS:
         print(f'Автообновление: коллекция {collection}')
         proc = _run_refresh_process(collection, fast=True)
         assert proc.stdout is not None
@@ -387,7 +399,7 @@ def _run_all_collections_refresh():
 
 def _iter_collections_refresh_output(collections=None, fast=False):
     if collections is None:
-        collections = gp.COLLECTIONS.keys()
+        collections = gp.REFRESH_COLLECTIONS.keys()
     started_at = time.monotonic()
     _copy_existing_refresh_data(REFRESH_STAGING_DIR)
     for collection in collections:
@@ -503,6 +515,10 @@ def _log_light_refresh_skip(collection: str, status: dict):
 def _start_light_refresh(collection: str) -> dict:
     if collection not in gp.COLLECTIONS:
         result = {'status': 'invalid', 'collection': collection, 'error': 'unknown collection'}
+        _log_light_refresh_skip(collection, result)
+        return result
+    if gp.COLLECTIONS.get(collection, {}).get('activity'):
+        result = {'status': 'skipped', 'collection': collection, 'reason': 'activity collection'}
         _log_light_refresh_skip(collection, result)
         return result
     if _background_enrich_lock.locked():
@@ -1014,8 +1030,8 @@ def _sync_listing_order(cache_only: bool = False):
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
         changed = False
-        from generate_page import COLLECTIONS, sync_listing_order_for_collection
-        for coll, info in COLLECTIONS.items():
+        from generate_page import REFRESH_COLLECTIONS, sync_listing_order_for_collection
+        for coll, info in REFRESH_COLLECTIONS.items():
             if info.get('source', 'rutracker') != 'rutracker':
                 continue
             order_map = sync_listing_order_for_collection(coll, cache_only=cache_only)
@@ -1359,6 +1375,7 @@ def watch():
     except TimeoutError as e:
         return jsonify(error=str(e)), 504
 
+    _record_watched_activity(magnet, data.get('movie') if isinstance(data.get('movie'), dict) else None)
     return jsonify(info_hash=info_hash)
 
 
@@ -1389,12 +1406,15 @@ def watch_sync():
             info_hash = engine.add_magnet_async(magnet)
         except ValueError as e:
             return jsonify(error=str(e)), 400
+        _record_watched_activity(magnet, data.get('movie') if isinstance(data.get('movie'), dict) else None)
         return jsonify(info_hash=info_hash, async_mode=True)
     try:
         info_hash = engine.add_magnet(magnet, timeout=7)
     except TimeoutError:
         info_hash = engine.add_magnet_async(magnet)
+        _record_watched_activity(magnet, data.get('movie') if isinstance(data.get('movie'), dict) else None)
         return jsonify(info_hash=info_hash, async_mode=True)
+    _record_watched_activity(magnet, data.get('movie') if isinstance(data.get('movie'), dict) else None)
     return jsonify(info_hash=info_hash, async_mode=False)
 
 

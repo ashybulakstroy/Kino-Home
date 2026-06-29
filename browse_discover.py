@@ -10,7 +10,8 @@ from flask import Blueprint, request, jsonify
 from bs4 import BeautifulSoup
 
 from config import DATA_DIR, WORKER_COUNT, DISCOVER_SEARCH_CACHE_TTL_DAYS
-from project_io import atomic_write_json
+from project_io import atomic_write_json, atomic_write_text
+from activity_collections import record_discovered
 import generate_page as gp
 import rutracker_search as rtsearch
 
@@ -28,6 +29,11 @@ def _load_full_topics():
         return json.loads(path.read_text('utf-8'))
     except (OSError, json.JSONDecodeError):
         return []
+
+
+def _regenerate_index_from_catalog():
+    topics = _load_full_topics()
+    atomic_write_text(DATA_DIR / 'index-kino.html', gp.generate_html(gp.filter_world_top(topics)))
 
 
 def _cache_key(scope, query):
@@ -363,6 +369,7 @@ def _topic_card_payload(topic, status, source_label=''):
         'imdb_rating': topic.get('imdb_rating') or '',
         'kp_rating': topic.get('kp_rating') or '',
         'genre': topic.get('genre') or '',
+        'cast': topic.get('cast') or '',
         'trailer_url': topic.get('trailer_url') or topic.get('youtube_url') or '',
     }
 
@@ -958,13 +965,20 @@ def _discover_item_keys(item):
 def _enrich_discover_item(data):
     cached = _find_enriched_history_match(data)
     if cached:
-        return {
+        result = {
             'topic_id': cached.get('topic_id') or data.get('topic_id') or '',
             'status': 'cached',
             'cache_hit': True,
             'changed_fields': [],
             'movie': cached,
         }
+        try:
+            record_discovered(cached)
+            _regenerate_index_from_catalog()
+            result['activity_collection'] = 'discovered'
+        except Exception as e:
+            result['activity_error'] = str(e)
+        return result
     topic = _make_discover_topic(data)
     before = _topic_card_payload(topic, 'До обогащения', 'Discover')
     result = {'topic_id': topic.get('topic_id'), 'status': 'enriching'}
@@ -1009,6 +1023,12 @@ def _enrich_discover_item(data):
         if not before.get(field) and payload.get(field):
             changed_fields.append(label)
     _save_discover_history(payload)
+    try:
+        record_discovered(payload)
+        _regenerate_index_from_catalog()
+        result['activity_collection'] = 'discovered'
+    except Exception as e:
+        result['activity_error'] = str(e)
     result['cache_updated'] = _update_search_cache_with_enriched(payload)
     result['changed_fields'] = changed_fields
     result['status'] = 'done'
@@ -1154,7 +1174,7 @@ function closeModal(){document.getElementById('modal').classList.remove('open')}
 async function watchMovie(m){
   if(!m||!m.magnet)return;
   try{
-    const r=await fetch('/watch_sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({magnet:m.magnet,async_only:true})});
+    const r=await fetch('/watch_sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({magnet:m.magnet,async_only:true,movie:m})});
     const d=await r.json().catch(()=>({}));
     if(d.info_hash)window.open('/player.html#'+d.info_hash,'_blank');
     else alert(d.error||'\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c');
