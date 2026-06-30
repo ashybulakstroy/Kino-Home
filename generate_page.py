@@ -441,7 +441,7 @@ def date_to_timestamp(value):
     if not value:
         return 0
     value = str(value).strip()
-    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
         try:
             return int(datetime.strptime(value, fmt).timestamp())
         except ValueError:
@@ -3171,6 +3171,14 @@ def sync_listing_order_for_collection(collection: str, cache_only: bool = False)
 def generate_html(topics, hidden_ids: set[str] | None = None):
     if hidden_ids is None:
         hidden_ids = load_hidden_topic_ids()
+    coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
+    topics = sorted(
+        topics,
+        key=lambda t: (
+            coll_order.get(t.get('collection', ''), 999),
+            int(t.get('listing_order') if t.get('listing_order') is not None else 999),
+        ),
+    )
     rows = []
     tiles = []
 

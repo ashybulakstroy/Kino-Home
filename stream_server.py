@@ -27,6 +27,7 @@ from activity_collections import record_watched_magnet
 
 
 _LOG_FILE: TextIO | None = None
+INDEX_INJECT_VERSION = 'v11'
 
 
 class _TimestampedStream:
@@ -259,6 +260,20 @@ def load_full_topics():
 
 def _generate_display_html(topics):
     return gp.generate_html(gp.filter_world_top(topics))
+
+
+def _catalog_version():
+    index_path = DATA_DIR / 'index-kino.html'
+    if not index_path.exists():
+        return {'exists': False, 'version': ''}
+    stat = index_path.stat()
+    version = f'{stat.st_mtime}-{stat.st_size}-{INDEX_INJECT_VERSION}'
+    return {
+        'exists': True,
+        'version': version,
+        'mtime': stat.st_mtime,
+        'size': stat.st_size,
+    }
 
 
 def _record_watched_activity(magnet, extra=None):
@@ -1929,6 +1944,11 @@ def poster_asset(filename):
     return send_from_directory(str(DATA_DIR / 'posters'), filename)
 
 
+@app.route('/catalog_version')
+def catalog_version():
+    return jsonify(_catalog_version())
+
+
 @app.route('/')
 def index():
     index_path = DATA_DIR / 'index-kino.html'
@@ -1937,8 +1957,7 @@ def index():
         return '<h1>Kino Gallery</h1><p>index-kino.html not found. Run generate_page.py first.</p>'
 
     stat = index_path.stat()
-    INJECT_VER = 'v10'
-    etag_val = f'{stat.st_mtime}-{stat.st_size}-{INJECT_VER}'
+    etag_val = _catalog_version()['version']
 
     if request.if_none_match.contains(etag_val):
         return Response(status=304)
@@ -1992,6 +2011,24 @@ def index():
     public_style = '.rmv,.eb{display:none!important}' if PUBLIC_MODE else ''
     bl_style = f'<style>.bl{{display:flex;flex-wrap:wrap;gap:8px;padding:10px 14px;background:#1a1a2e;border-bottom:2px solid #8ab4f8;margin-bottom:4px}}.bl a{{color:#fff;text-decoration:none;font-size:14px;font-weight:600;padding:7px 16px;border-radius:6px;background:#16213e;border:1px solid #0f3460;transition:all .2s}}.bl a:hover{{background:#0f3460;border-color:#8ab4f8;transform:translateY(-1px)}}{public_style}</style>'
     html = html.replace('</head>', f'{bl_style}</head>', 1)
+    freshness_script = (
+        "<script>(function(){"
+        f"var KG_CATALOG_VERSION={json.dumps(etag_val)};"
+        f"var KG_ACTIVITY_COLLECTIONS={json.dumps(list(gp.ACTIVITY_COLLECTIONS.keys()))};"
+        "var checking=false,lastCheck=0;"
+        "function selectedActivity(){var s=document.getElementById('cs'),v=s?s.value:'';return KG_ACTIVITY_COLLECTIONS.indexOf(v)!==-1}"
+        "function reloadFresh(){window.location.href='/?r='+Date.now()}"
+        "function checkFresh(force){var now=Date.now();if(checking||(!force&&now-lastCheck<5000))return;checking=true;lastCheck=now;"
+        "fetch('/catalog_version',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
+        "if(d&&d.version&&d.version!==KG_CATALOG_VERSION)reloadFresh()"
+        "}).catch(function(){}).finally(function(){checking=false})}"
+        "window.kgCheckCatalogFresh=checkFresh;"
+        "window.addEventListener('focus',function(){checkFresh(false)});"
+        "document.addEventListener('visibilitychange',function(){if(!document.hidden)checkFresh(false)});"
+        "document.addEventListener('change',function(e){if(e.target&&e.target.id==='cs'&&selectedActivity())checkFresh(true)},true);"
+        "})();</script>"
+    )
+    html = html.replace('</body>', f'{freshness_script}</body>', 1)
 
     with _html_cache_lock:
         _html_cache = (stat.st_mtime, etag_val, html)
@@ -2221,7 +2258,35 @@ h1{font-size:24px;font-weight:700;padding:20px 30px 10px}
 h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
 .back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}
 .back:hover{background:#e50914;border-color:#e50914}
-.avi-badge{position:absolute;bottom:4px;right:4px;width:clamp(14px,10%,28px);aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#000;color:#fff;border:2px solid #fff;border-radius:4px;font-size:clamp(8px,.7vw,14px);pointer-events:none;z-index:5;line-height:1}
+.avi-badge{position:absolute;right:4px;bottom:4px;min-width:18%;height:clamp(18px,12%,34px);padding:0 5px;display:flex;align-items:center;justify-content:center;background:#000;border:1px solid rgba(255,255,255,.65);border-radius:4px;font-size:clamp(9px,.8vw,14px);font-weight:800;letter-spacing:.4px;pointer-events:none;z-index:5;line-height:1;text-transform:uppercase;box-shadow:0 2px 8px rgba(0,0,0,.55)}
+.avi-badge.fmt-mp4{color:#ff4d4d;border-color:#ff4d4d}
+.avi-badge.fmt-mkv{color:#4da3ff;border-color:#4da3ff}
+.avi-badge.fmt-avi{color:#60a5fa;border-color:#60a5fa}
+.avi-badge.fmt-webm{color:#46d369;border-color:#46d369}
+.avi-badge.fmt-other{color:#f5c518;border-color:#f5c518}
+.kg-modal{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;padding:20px}
+.kg-modal.open{display:flex}
+.kg-mc{position:relative;width:min(360px,92vw);max-height:92vh;overflow:visible}
+.kg-close{position:absolute;top:-42px;right:0;width:34px;height:34px;background:#e94560;border:0;border-radius:4px;color:#fff;font-size:22px;cursor:pointer;z-index:3}
+.movie-tile{position:relative;background:#fff;color:#1a1a1a;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;box-shadow:0 8px 28px rgba(0,0,0,.38)}
+.movie-tile .pc{display:block;width:100%;position:relative;background:#111;cursor:pointer}
+.movie-tile .pc img{display:block;width:100%;aspect-ratio:2/3;object-fit:cover;background:#222}
+.movie-tile .pb{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:64px;color:rgba(255,255,255,.85);text-shadow:0 0 20px rgba(0,0,0,.6);pointer-events:none}
+.tile-body{padding:12px}
+.tile-title{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}
+.tile-info{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.rb{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none;background:#f5c518;color:#111}
+.tile-genre,.tile-format,.tile-size,.tile-imdb{font-size:14px;color:#666;text-decoration:none}
+.tile-format{color:#e67e22;font-weight:600}
+.tile-cast{font-size:14px;color:#555;line-height:1.4;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.tile-actions a,.tile-actions button{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:700;text-decoration:none;border:0;cursor:pointer}
+.bt{background:#da3633;color:#fff}
+.wb{background:#2da44e;color:#fff}
+.bm{background:#eee;color:#333}
+.rmv{position:absolute;top:8px;right:8px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;background:#e94560;color:#fff;border:0;border-radius:4px;font-size:20px;font-weight:700;line-height:1;cursor:pointer;z-index:4;box-shadow:0 2px 8px rgba(0,0,0,.35)}
+.rmv:hover{background:#ff5f7a}
+.tile-empty{background:#eee;color:#777;font-size:12px;padding:4px 8px;border-radius:4px}
 '''
 
 
@@ -2282,11 +2347,118 @@ def _poster_style(poster_url: str) -> str:
     return f'background-image:url(/{poster_url})'
 
 
+def _format_badge_html(format_value: str) -> str:
+    fmt = str(format_value or '').strip().upper()
+    if not fmt:
+        return ''
+    fmt_class = re.sub(r'[^a-z0-9]+', '', fmt.lower()) or 'other'
+    if fmt_class not in {'mp4', 'mkv', 'avi', 'webm'}:
+        fmt_class = 'other'
+    return f'<span class="avi-badge fmt-{fmt_class}">{fmt}</span>'
+
+
+def _browse_movie_modal_html() -> str:
+    return '<div class="kg-modal" id="kgMovieModal"><div class="kg-mc" id="kgMovieModalContent"></div></div>'
+
+
+def _browse_movie_modal_script() -> str:
+    return r'''<script>
+function kgEsc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function kgMovieSource(){return typeof MOVIES==='undefined'?{}:MOVIES}
+function kgMovieMap(){const src=kgMovieSource();if(Array.isArray(src)){const m={};src.forEach(x=>{if(x&&x.topic_id)m[String(x.topic_id)]=x});return m}return src||{}}
+function kgMovieById(tid){return kgMovieMap()[String(tid||'')]}
+function kgPoster(m){const p=m.poster_url||'';return p?p.indexOf('data/')===0?'/'+p:p:'/data/posters/placeholder.png'}
+function kgSizeText(m){let n=parseInt(m.size_bytes||0,10);if(!n)return m.size||m.size_str||'';const u=['B','KB','MB','GB','TB'];let i=0,v=n;while(v>=1024&&i<u.length-1){v/=1024;i++}return i===0?String(Math.round(v))+' '+u[i]:v.toFixed(1)+' '+u[i]}
+function kgTrailerUrl(m){return m.trailer_url||m.youtube_url||('https://www.youtube.com/results?search_query='+encodeURIComponent([m.orig_title||m.movie_title||m.title,m.movie_year,'official trailer'].filter(Boolean).join(' ')))}
+function kgCloseMovieCard(){const modal=document.getElementById('kgMovieModal');if(modal)modal.classList.remove('open')}
+function kgOpenMovieCard(m){
+  if(!m)return;
+  window.kgCurrentMovie=m;
+  const rating=m.kp_rating||m.imdb_rating||'';
+  const ratingLabel=m.kp_rating?'KP':(m.imdb_rating?'IMDB':'');
+  const ratingHtml=rating?'<span class="rb">'+kgEsc(ratingLabel+' '+rating)+'</span>':'';
+  const genre=m.genre?'<span class="tile-genre">'+kgEsc(m.genre)+'</span>':'';
+  const fmt=m.format?'<span class="tile-format">Формат: '+kgEsc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
+  const size=kgSizeText(m)?'<span class="tile-size">'+kgEsc(kgSizeText(m))+'</span>':'<span class="tile-empty">размер ?</span>';
+  const cast=m.cast?'<div class="tile-cast">'+kgEsc(m.cast).slice(0,120)+'</div>':'';
+  const trailer=kgTrailerUrl(m);
+  const ratingUrl=m.kp_id?'https://www.kinopoisk.ru/film/'+encodeURIComponent(m.kp_id)+'/':(m.imdb_id?'https://www.imdb.com/title/'+encodeURIComponent(m.imdb_id)+'/':'#');
+  const sourceUrl=m.topic_url||ratingUrl;
+  const trailerBtn='<a href="'+kgEsc(trailer)+'" onclick="window.open(this.href,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;);return false" class="bt">▶ Трейлер</a>';
+  const watchBtn=m.magnet?'<button class="wb" onclick="kgWatchMovie(window.kgCurrentMovie);return false">▶ Смотреть</button>':'';
+  const magnetBtn=m.magnet?'<a href="'+kgEsc(m.magnet)+'" class="bm" title="Скачать kino">🧲</a>':'';
+  const removeBtn=m.topic_id?'<button class="rmv" title="Скрыть фильм" onclick="kgHideMovie(window.kgCurrentMovie);return false">×</button>':'';
+  const mc=document.getElementById('kgMovieModalContent'),modal=document.getElementById('kgMovieModal');
+  if(!mc||!modal)return;
+  mc.innerHTML='<button class="kg-close" onclick="kgCloseMovieCard()">×</button><div class="movie-tile tile-card">'+removeBtn+'<div class="pc" data-yt="'+kgEsc(trailer)+'" onclick="window.open(this.dataset.yt,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;)"><img src="'+kgPoster(m)+'" alt=""><span class="pb">▶</span></div><div class="tile-body"><a href="'+kgEsc(sourceUrl)+'" class="tile-title" target="_blank">'+kgEsc(m.orig_title||m.movie_title||m.title||'?')+'</a><div class="tile-info">'+ratingHtml+genre+fmt+size+'</div>'+cast+'<div class="tile-actions">'+trailerBtn+watchBtn+magnetBtn+'<a href="'+kgEsc(ratingUrl)+'" target="_blank" class="tile-imdb">'+kgEsc(ratingLabel||'ID')+'</a></div></div></div>';
+  modal.classList.add('open');
+}
+function kgOpenMovieCardById(tid){kgOpenMovieCard(kgMovieById(tid))}
+async function kgHideMovie(m){
+  if(!m||!m.topic_id)return;
+  const tid=String(m.topic_id);
+  try{await fetch('/hide/'+encodeURIComponent(tid),{method:'POST'})}catch(e){}
+  const cssEscape=(window.CSS&&CSS.escape)?CSS.escape:function(s){return s.replace(/["\\]/g,'\\$&')};
+  document.querySelectorAll('[data-tid="'+cssEscape(tid)+'"]').forEach(el=>el.remove());
+  const src=kgMovieSource();if(Array.isArray(src)){for(let i=src.length-1;i>=0;i--)if(String(src[i].topic_id||'')===tid)src.splice(i,1)}else delete src[tid];
+  kgCloseMovieCard();
+}
+async function kgWatchMovie(m){
+  if(!m||!m.magnet)return;
+  try{
+    const r=await fetch('/watch_sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({magnet:m.magnet,async_only:true,movie:m})});
+    const d=await r.json();
+    if(d.info_hash)window.open('/player.html#'+d.info_hash,'_blank');
+  }catch(e){}
+}
+document.addEventListener('click',function(e){const modal=document.getElementById('kgMovieModal');if(modal&&e.target===modal)kgCloseMovieCard()});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')kgCloseMovieCard()});
+</script>'''
+
+
+def _carousel_movie_key(movie):
+    title = movie.get('movie_title') or movie.get('orig_title') or movie.get('title') or ''
+    title = re.sub(r'\b(19\d{2}|20\d{2})\b', ' ', str(title).lower())
+    title = title.replace('ё', 'е')
+    title = re.sub(r'[^0-9a-zа-я]+', ' ', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    year = str(movie.get('movie_year') or '').strip()
+    return f'{title}|{year}' if title else str(movie.get('topic_id') or '')
+
+
+def _carousel_movie_score(movie):
+    poster_ok = 1 if 'placeholder.png' not in _poster_style(movie.get('poster_url', '')) else 0
+    def rating_value(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    rating = max(rating_value(movie.get('kp_rating')), rating_value(movie.get('imdb_rating')))
+    return (
+        poster_ok,
+        int(movie.get('seeders') or 0),
+        rating,
+        -int(movie.get('size_bytes') or 0),
+    )
+
+
+def _dedupe_carousel_items(items):
+    best = {}
+    for movie in items:
+        key = _carousel_movie_key(movie)
+        current = best.get(key)
+        if current is None or _carousel_movie_score(movie) > _carousel_movie_score(current):
+            best[key] = movie
+    return list(best.values())
+
+
 @app.route('/browse/carousel')
 def browse_carousel():
     movies = _get_movies()
     hidden = gp.load_hidden_topic_ids()
     movies = [m for m in movies if m['topic_id'] not in hidden]
+    movies_by_id = {str(m.get('topic_id') or ''): m for m in movies if m.get('topic_id')}
+    movies_json = json.dumps(movies_by_id, ensure_ascii=False, default=str).replace('</script>', '<\\/script>')
     genre_map: dict[str, list] = {}
     for m in movies:
         for g in m.get('genre', '').split(','):
@@ -2297,14 +2469,16 @@ def browse_carousel():
     rows_html = ''
     sorted_genres = sorted(genre_map.items(), key=lambda x: -len(x[1]))
     for genre, items in sorted_genres:
+        items = _dedupe_carousel_items(items)
         items.sort(key=lambda m: (0 if 'background-image' in _poster_style(m.get('poster_url', '')) else 1, -(m.get('seeders') or 0)))
         cards = ''
         for m in items:
             poster_style = _poster_style(m.get('poster_url', ''))
             yr = m.get('movie_year', '')
             rt = m.get('kp_rating') or m.get('imdb_rating') or ''
-            avi_badge = '<span class="avi-badge">⏳</span>' if m.get('format','').upper() == 'AVI' else ''
-            cards += f'''<div class="cc">
+            avi_badge = _format_badge_html(m.get('format', ''))
+            topic_id = html_lib.escape(str(m.get('topic_id') or ''))
+            cards += f'''<div class="cc" data-tid="{topic_id}">
 <div class="cp" style="{poster_style}">{avi_badge}</div>
 <div class="ci"><strong>{m.get('orig_title') or m.get('movie_title','')}</strong>{" "+yr if yr else ""}{" · "+rt if rt else ""}</div>
 </div>'''
@@ -2320,10 +2494,86 @@ def browse_carousel():
 .cc:hover{{transform:scale(1.05)}}
 .cp{{width:180px;height:270px;background-size:cover;background-position:center;border-radius:6px;position:relative}}
 .ci{{font-size:12px;color:#ccc;padding:6px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.modal{{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:center;justify-content:center;padding:20px}}
+.modal.open{{display:flex}}
+.mc{{position:relative;width:min(360px,92vw);max-height:92vh;overflow:visible}}
+.close{{position:absolute;top:-42px;right:0;width:34px;height:34px;background:#e94560;border:0;border-radius:4px;color:#fff;font-size:22px;cursor:pointer;z-index:3}}
+.movie-tile{{background:#fff;color:#1a1a1a;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;box-shadow:0 8px 28px rgba(0,0,0,.38)}}
+.movie-tile .pc{{display:block;width:100%;position:relative;background:#111;cursor:pointer}}
+.movie-tile .pc img{{display:block;width:100%;aspect-ratio:2/3;object-fit:cover;background:#222}}
+.movie-tile .pb{{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:64px;color:rgba(255,255,255,.85);text-shadow:0 0 20px rgba(0,0,0,.6);pointer-events:none}}
+.tile-body{{padding:12px}}
+.tile-title{{font-size:20px;font-weight:600;color:#1a73e8;text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3;margin-bottom:4px}}
+.tile-info{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}}
+.rb{{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none;background:#f5c518;color:#111}}
+.tile-genre,.tile-format,.tile-size,.tile-imdb{{font-size:14px;color:#666;text-decoration:none}}
+.tile-format{{color:#e67e22;font-weight:600}}
+.tile-cast{{font-size:14px;color:#555;line-height:1.4;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.tile-actions{{display:flex;gap:6px;align-items:center;flex-wrap:wrap}}
+.tile-actions a,.tile-actions button{{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:700;text-decoration:none;border:0;cursor:pointer}}
+.bt{{background:#da3633;color:#fff}}
+.wb{{background:#2da44e;color:#fff}}
+.bm{{background:#eee;color:#333}}
+.rmv{{position:absolute;top:8px;right:8px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;background:#e94560;color:#fff;border:0;border-radius:4px;font-size:20px;font-weight:700;line-height:1;cursor:pointer;z-index:4;box-shadow:0 2px 8px rgba(0,0,0,.35)}}
+.rmv:hover{{background:#ff5f7a}}
+.tile-empty{{background:#eee;color:#777;font-size:12px;padding:4px 8px;border-radius:4px}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>🎠 По жанрам</h1>
 {rows_html}
+<div class="modal" id="modal"><div class="mc" id="mc"></div></div>
+<script>
+const MOVIES={movies_json};
+let currentMovie=null;
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function pu(m){{const p=m.poster_url||'';return p?p.indexOf('data/')===0?'/'+p:p:'/data/posters/placeholder.png'}}
+function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
+function sizeText(m){{let n=parseInt(m.size_bytes||0,10);if(!n)return m.size||m.size_str||'';const u=['B','KB','MB','GB','TB'];let i=0,v=n;while(v>=1024&&i<u.length-1){{v/=1024;i++}}return i===0?String(Math.round(v))+' '+u[i]:v.toFixed(1)+' '+u[i]}}
+function trailerUrl(m){{return m.trailer_url||m.youtube_url||('https://www.youtube.com/results?search_query='+encodeURIComponent([m.orig_title||m.movie_title,m.movie_year,'official trailer'].filter(Boolean).join(' ')))}}
+function openCard(m){{
+  currentMovie=m;
+  const rating=m.kp_rating||m.imdb_rating||'';
+  const ratingLabel=m.kp_rating?'KP':(m.imdb_rating?'IMDB':'');
+  const ratingHtml=rating?'<span class="rb">'+esc(ratingLabel+' '+rating)+'</span>':'';
+  const genre=m.genre?'<span class="tile-genre">'+esc(m.genre)+'</span>':'';
+  const fmt=m.format?'<span class="tile-format">Формат: '+esc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
+  const size=sizeText(m)?'<span class="tile-size">'+esc(sizeText(m))+'</span>':'<span class="tile-empty">размер ?</span>';
+  const cast=m.cast?'<div class="tile-cast">'+esc(m.cast).slice(0,120)+'</div>':'';
+  const trailer=trailerUrl(m);
+  const ratingUrl=m.kp_id?'https://www.kinopoisk.ru/film/'+encodeURIComponent(m.kp_id)+'/':(m.imdb_id?'https://www.imdb.com/title/'+encodeURIComponent(m.imdb_id)+'/':'#');
+  const sourceUrl=m.topic_url||ratingUrl;
+  const trailerBtn='<a href="'+esc(trailer)+'" onclick="window.open(this.href,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;);return false" class="bt">▶ Трейлер</a>';
+  const watchBtn=m.magnet?'<button class="wb" onclick="watchMovie(currentMovie);return false">▶ Смотреть</button>':'';
+  const magnetBtn=m.magnet?'<a href="'+esc(m.magnet)+'" class="bm" title="Скачать kino">🧲</a>':'';
+  const removeBtn=m.topic_id?'<button class="rmv" title="Скрыть фильм" onclick="hideMovie(currentMovie);return false">×</button>':'';
+  document.getElementById('mc').innerHTML='<button class="close" onclick="closeModal()">×</button><div class="movie-tile tile-card">'+removeBtn+'<div class="pc" data-yt="'+esc(trailer)+'" onclick="window.open(this.dataset.yt,&quot;tr&quot;,&quot;width=960,height=540,menubar=no,toolbar=no,location=no&quot;)"><img src="'+pu(m)+'" alt=""><span class="pb">▶</span></div><div class="tile-body"><a href="'+esc(sourceUrl)+'" class="tile-title" target="_blank">'+esc(m.orig_title||m.movie_title||m.title||'?')+'</a><div class="tile-info">'+ratingHtml+genre+fmt+size+'</div>'+cast+'<div class="tile-actions">'+trailerBtn+watchBtn+magnetBtn+'<a href="'+esc(ratingUrl)+'" target="_blank" class="tile-imdb">'+esc(ratingLabel||'ID')+'</a></div></div></div>';
+  document.getElementById('modal').classList.add('open');
+}}
+function closeModal(){{document.getElementById('modal').classList.remove('open')}}
+async function hideMovie(m){{
+  if(!m||!m.topic_id)return;
+  try{{await fetch('/hide/'+encodeURIComponent(m.topic_id),{{method:'POST'}});}}catch(e){{}}
+  const tid=String(m.topic_id);
+  const cssEscape=(window.CSS&&CSS.escape)?CSS.escape:function(s){{return s.replace(/["\\\\]/g,'\\\\$&')}};
+  document.querySelectorAll('.cc[data-tid="'+cssEscape(tid)+'"]').forEach(function(el){{el.remove()}});
+  delete MOVIES[tid];
+  closeModal();
+}}
+async function watchMovie(m){{
+  if(!m||!m.magnet)return;
+  try{{
+    const r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{magnet:m.magnet,async_only:true,movie:m}})}});
+    const d=await r.json();
+    if(d.info_hash)window.open('/player.html#'+d.info_hash,'_blank');
+  }}catch(e){{}}
+}}
+document.addEventListener('click',function(e){{
+  const card=e.target.closest('.cc[data-tid]');
+  if(card){{const m=MOVIES[card.dataset.tid];if(m)openCard(m);}}
+}});
+document.getElementById('modal').addEventListener('click',function(e){{if(e.target===this)closeModal()}});
+document.addEventListener('keydown',function(e){{if(e.key==='Escape')closeModal()}});
+</script>
 </body></html>'''
 
 
@@ -2353,20 +2603,20 @@ body{{background:#000;display:flex;align-items:center;justify-content:center}}
 #nav button{{background:rgba(255,255,255,.1);color:#fff;border:1px solid #555;padding:8px 20px;border-radius:4px;font-size:16px;cursor:pointer}}
 #nav button:hover{{background:rgba(255,255,255,.2)}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <div id="rc"><div class="bg" id="bg"></div><div class="poster" id="poster"></div><div class="info"><h2 id="title"></h2><div class="meta" id="meta"></div><div class="desc" id="cast"></div><div class="btns" id="btns"></div></div></div>
 <div id="nav"><button onclick="prev()">←</button><button onclick="next()">→</button></div>
  <script>
 const MOVIES = {movies_json};
 function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 let idx = Math.floor(Math.random()*MOVIES.length);
 function show(i){{
 const m=MOVIES[i];if(!m)return;
 const p=posterUrl(m);
 document.getElementById('bg').style.backgroundImage='url('+p+')';
 const pe=document.getElementById('poster');pe.style.backgroundImage='url('+p+')';
-let b=pe.querySelector('.avi-badge');
-if((m.format||'').toUpperCase()==='AVI'){{if(!b){{b=document.createElement('span');b.className='avi-badge';b.textContent='⏳';pe.appendChild(b)}}}}else if(b){{b.remove()}}
+let b=pe.querySelector('.avi-badge');if(b)b.remove();pe.insertAdjacentHTML('beforeend',fmtBadge(m));
 document.getElementById('title').textContent=m.orig_title||m.movie_title||'';
 document.getElementById('meta').textContent=[m.movie_year,m.genre,m.kp_rating?'KP '+m.kp_rating:'',m.imdb_rating?'IMDB '+m.imdb_rating:''].filter(Boolean).join(' · ');
 document.getElementById('cast').textContent=m.cast||'';
@@ -2411,6 +2661,10 @@ body{{display:flex;padding:0}}
 #sidebar input[type=checkbox]{{margin-right:6px}}
 #sidebar select,#sidebar input[type=range]{{width:100%;margin:4px 0 8px;padding:4px;background:#333;color:#fff;border:1px solid #555;border-radius:3px}}
 #sidebar input[type=range]{{padding:0}}
+.side-row{{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:14px 0 8px}}
+.side-row h3{{margin:0!important}}
+.clear-genres{{background:#333;color:#fff;border:1px solid #555;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer}}
+.clear-genres:hover{{background:#444;border-color:#777}}
 #results{{flex:1;padding:20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;align-content:start}}
 .fr{{width:160px;cursor:pointer;transition:transform .2s}}
 .fr:hover{{transform:scale(1.05)}}
@@ -2418,12 +2672,14 @@ body{{display:flex;padding:0}}
 .fr .fi{{font-size:12px;color:#ccc;padding:4px 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 #count{{position:fixed;bottom:10px;right:20px;background:rgba(0,0,0,.7);padding:6px 14px;border-radius:4px;font-size:13px;z-index:100}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
-<div id="sidebar"><h3>Жанры</h3>{genre_opts}<h3>Год от</h3><select id="yrFrom"><option value="">Все</option>{year_opts}</select><h3>Год до</h3><select id="yrTo"><option value="">Все</option>{year_opts}</select><h3>Рейтинг ≥</h3><input type="range" id="minRt" min="0" max="10" step="0.5" value="0"><span id="rtVal">0</span><h3>Коллекция</h3><select id="coll"><option value="">Все</option>{coll_opts}</select><h3>Формат</h3><select id="fmt"><option value="">Все</option>{fmt_opts}</select><h3>Сиды ≥</h3><input type="range" id="minSd" min="0" max="100" step="1" value="0"><span id="sdVal">0</span></div>
+<a href="/test" class="back">Назад</a>
+<div id="sidebar"><div class="side-row"><h3>Жанры</h3><button class="clear-genres" type="button" id="clearGenres">Очистить</button></div>{genre_opts}<h3>Год от</h3><select id="yrFrom"><option value="">Все</option>{year_opts}</select><h3>Год до</h3><select id="yrTo"><option value="">Все</option>{year_opts}</select><h3>Рейтинг ≥</h3><input type="range" id="minRt" min="0" max="10" step="0.5" value="0"><span id="rtVal">0</span><h3>Коллекция</h3><select id="coll"><option value="">Все</option>{coll_opts}</select><h3>Формат</h3><select id="fmt"><option value="">Все</option>{fmt_opts}</select><h3>Сиды ≥</h3><input type="range" id="minSd" min="0" max="100" step="1" value="0"><span id="sdVal">0</span></div>
 <div id="results"></div><div id="count"></div>
+{_browse_movie_modal_html()}
  <script>
 const MOVIES = {movies_json};
 function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function filter(){{
 const selGenres=new Set([...document.querySelectorAll('.fg:checked')].map(c=>c.value));
 const yrFrom=document.getElementById('yrFrom').value;
@@ -2450,21 +2706,21 @@ document.getElementById('count').textContent=out.length+' фильмов';
 document.getElementById('results').innerHTML=out.map(m=>{{
 const p=posterUrl(m)?'background-image:url('+posterUrl(m)+')':'background:#333';
 const hash=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase();
-                const aviBadge=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';
-                const fmtBadge=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
-                return '<div class=fr data-href="/player.html#'+(hash||'')+'"><div class=fp style="'+p+'">'+aviBadge+'</div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtBadge+'</div></div>';
+                const fmtText=m.format?'<span style="float:right;font-size:10px;color:#888">'+m.format.toUpperCase()+'</span>':'';
+                return '<div class=fr data-tid="'+(m.topic_id||'')+'"><div class=fp style="'+p+'">'+fmtBadge(m)+'</div><div class=fi>'+(m.orig_title||m.movie_title||'')+fmtText+'</div></div>';
 }}).join('');
 }}
 document.querySelectorAll('.fg').forEach(c=>c.addEventListener('change',filter));
+document.getElementById('clearGenres').addEventListener('click',function(){{document.querySelectorAll('.fg').forEach(c=>c.checked=false);filter()}});
 document.getElementById('yrFrom').addEventListener('change',filter);
 document.getElementById('yrTo').addEventListener('change',filter);
 document.getElementById('minRt').addEventListener('input',filter);
 document.getElementById('coll').addEventListener('change',filter);
 document.getElementById('fmt').addEventListener('change',filter);
 document.getElementById('minSd').addEventListener('input',filter);
-document.getElementById('results').addEventListener('click',function(e){{var t=e.target.closest('.fr');if(t&&t.dataset.href)location=t.dataset.href}});
+document.getElementById('results').addEventListener('click',function(e){{var t=e.target.closest('.fr[data-tid]');if(t)kgOpenMovieCardById(t.dataset.tid)}});
 filter();
-</script></body></html>'''
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 
 @app.route('/browse/timeline')
@@ -2478,6 +2734,7 @@ def browse_timeline():
         y = m.get('movie_year', '')
         if y:
             year_map.setdefault(y, []).append(m)
+    movies_json = json.dumps(movies, ensure_ascii=False, default=str).replace('</script>', '<\\/script>')
     years = sorted(year_map.keys(), reverse=True)
     rows_html = ''
     for y in years:
@@ -2486,12 +2743,11 @@ def browse_timeline():
         for m in items:
             rt = m.get('kp_rating') or m.get('imdb_rating') or '—'
             poster_style = _poster_style(m.get('poster_url', ''))
-            match = re.search(r'btih:([A-Fa-f0-9]{40})', m.get('magnet', ''))
-            player_url = f'/player.html#{match.group(1).lower()}' if match else '#'
             title = m.get('orig_title') or m.get('movie_title', '')
             from html import escape as h_esc
-            avi_badge = '<span class="avi-badge">⏳</span>' if m.get('format','').upper() == 'AVI' else ''
-            cards += f'''<div class="tc" onclick="location=\'{h_esc(player_url)}\'">
+            avi_badge = _format_badge_html(m.get('format', ''))
+            topic_id = h_esc(str(m.get('topic_id') or ''))
+            cards += f'''<div class="tc" data-tid="{topic_id}" onclick="event.stopPropagation();kgOpenMovieCardById('{topic_id}')">
 <div class="tp" style="{poster_style}">{avi_badge}</div>
 <div class="ti"><strong>{h_esc(title)}</strong> <span class="tr">{rt}</span></div>
 </div>'''
@@ -2519,10 +2775,13 @@ body{{padding:20px 30px}}
 .ti{{font-size:11px;color:#ccc;padding:4px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .tr{{color:#888}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>📅 По годам</h1>
 {rows_html}
-</body></html>'''
+{_browse_movie_modal_html()}
+<script>
+const MOVIES={movies_json};
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 
 @app.route('/browse/shuffle')
@@ -2573,7 +2832,7 @@ body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui
 .back{{position:fixed;top:12px;right:16px;z-index:20;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
 .back:hover{{color:#fff}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <div id="timer"></div>
 <div id="bg"></div>
 <div id="main-w"><div class="mp" id="mpCur"></div><div class="mp next-idle" id="mpNext"></div></div>
@@ -2583,6 +2842,7 @@ body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui
  <script>
 const MOVIES = {movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 let idx=Math.floor(Math.random()*MOVIES.length),paused=false,speed=5,timer=0,animating=false;
 const FRAME=106; // width+gap (100+6)
 const HALF=12;
@@ -2611,7 +2871,7 @@ leftHtml.push('<div class="fr blank"></div>');
 continue;
 }}
                 const fi=(center+o+total)%total;
-                leftHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+((MOVIES[fi].format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'</div>');
+                leftHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+fmtBadge(MOVIES[fi])+'</div>');
 }}
 for(let o=1;o<=HALF;o++){{
 if(direction==='forward'&&o===1){{
@@ -2619,7 +2879,7 @@ rightHtml.push('<div class="fr blank"></div>');
 continue;
 }}
                 const fi=(center+o+total)%total;
-                rightHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+((MOVIES[fi].format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'</div>');
+                rightHtml.push('<div class="fr" style="background-image:url('+pu(MOVIES[fi])+')">'+fmtBadge(MOVIES[fi])+'</div>');
 }}
 left.innerHTML=leftHtml.join('');
 right.innerHTML=rightHtml.join('');
@@ -2728,7 +2988,7 @@ h1{{font-size:22px;margin-bottom:20px;color:#888}}
 .back{{position:fixed;top:20px;left:20px;z-index:10;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
 .back:hover{{color:#fff}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <button id="skip" onclick="next()">Пропустить →</button>
 <h1>Какой фильм лучше?</h1>
 <div id="arena"><div class="fighter" id="fa" onclick="vote(0)"><div class="poster" id="pa"></div><div class="title" id="ta"></div><div class="meta" id="ma"></div></div><div class="vs">VS</div><div class="fighter" id="fb" onclick="vote(1)"><div class="poster" id="pb"></div><div class="title" id="tb"></div><div class="meta" id="mb"></div></div></div>
@@ -2737,13 +2997,13 @@ h1{{font-size:22px;margin-bottom:20px;color:#888}}
 const MOVIES={movies_json};
 let i=Math.floor(Math.random()*MOVIES.length),score=0;
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function pick(n){{return MOVIES[(i+n)%MOVIES.length]}}
 function show(){{
 const a=pick(0),b=pick(1+Math.floor(Math.random()*(MOVIES.length-2)));
 const set=(el,poster,title,meta)=>{{
 el.style.backgroundImage='url('+pu(poster)+')';
-let b=el.querySelector('.avi-badge');
-if((poster.format||'').toUpperCase()==='AVI'){{if(!b){{b=document.createElement('span');b.className='avi-badge';b.textContent='⏳';el.appendChild(b)}}}}else if(b){{b.remove()}}
+let b=el.querySelector('.avi-badge');if(b)b.remove();el.insertAdjacentHTML('beforeend',fmtBadge(poster));
 document.getElementById('t'+el.id[1]).textContent=poster.orig_title||poster.movie_title||'';
 document.getElementById('m'+el.id[1]).textContent=[poster.movie_year,poster.kp_rating?'KP '+poster.kp_rating:'',poster.imdb_rating?'IMDB '+poster.imdb_rating:''].filter(Boolean).join(' · ');
 }};
@@ -2764,6 +3024,7 @@ def browse_matrix():
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Матрица</title>
 <style>
+{BROWSE_CSS}
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#0a0a0a;color:#fff;font-family:system-ui,sans-serif;overflow-y:auto;height:100vh}}
 #grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:28px}}
@@ -2778,19 +3039,21 @@ body{{background:#0a0a0a;color:#fff;font-family:system-ui,sans-serif;overflow-y:
 .back{{position:fixed;top:20px;left:20px;z-index:10;color:#888;text-decoration:none;font-size:13px;padding:4px 10px;border-radius:4px;background:rgba(0,0,0,.4)}}
 .back:hover{{color:#fff}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <button id="shuffle" onclick="sc()" style="right:20px">🔀 Перемешать</button><button id="pauseBtn" onclick="togglePause()" style="right:100px">⏸ Пауза</button>
 <div id="grid"></div>
+{_browse_movie_modal_html()}
 <script>
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function sc(){{
 const a=[...MOVIES];
 for(let i=a.length-1;i>0;i--){{const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
 a.length=8;
 const g=document.getElementById('grid');
-    g.innerHTML=a.map(m=>'<div class="cell" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')">'+((m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'')+'<div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
-    g.onclick=function(e){{var c=e.target.closest(\'.cell\');if(c&&c.dataset.hash){{window.open(\'/player.html#\'+c.dataset.hash,\'_blank\');}}}}
+    g.innerHTML=a.map(m=>'<div class="cell" data-tid="'+(m.topic_id||'')+'" data-hash="'+((m.magnet||'').match(/btih:([A-Fa-f0-9]+)/)?.[1]?.toLowerCase()||'')+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="label">'+(m.orig_title||m.movie_title||'')+'</div></div>').join('');
+    g.onclick=function(e){{var c=e.target.closest(\'.cell[data-tid]\');if(c)kgOpenMovieCardById(c.dataset.tid)}}
 }}
 sc();
 var _ti=setInterval(sc,10000);
@@ -2798,7 +3061,7 @@ function togglePause(){{
 if(_ti){{clearInterval(_ti);_ti=null;document.getElementById('pauseBtn').textContent='▶ Пуск';}}
 else{{_ti=setInterval(sc,10000);document.getElementById('pauseBtn').textContent='⏸ Пауза';}}
 }}
-</script></body></html>'''
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 @app.route('/browse/stats')
 def browse_stats():
@@ -2813,6 +3076,7 @@ def browse_stats():
                 genre_counts[g] = genre_counts.get(g, 0) + 1
     top_genres = sorted(genre_counts.items(), key=lambda x: -x[1])[:15]
     total = len(movies)
+    movies_json = json.dumps(movies, ensure_ascii=False).replace('</script>', '<\\/script>')
     top = {k: v for k, v in top_genres}
     genre_json = json.dumps(top, ensure_ascii=False)
     year_groups: dict[int, int] = {}
@@ -2832,10 +3096,22 @@ def browse_stats():
         c = m.get('collection', '')
         if c:
             coll_counts[c] = coll_counts.get(c, 0) + 1
-    coll_json = json.dumps(coll_counts, ensure_ascii=False)
+    coll_items = [
+        {
+            'id': collection,
+            'label': gp.COLLECTIONS.get(collection, {}).get('name', collection),
+            'count': count,
+        }
+        for collection, count in sorted(
+            coll_counts.items(),
+            key=lambda item: list(gp.COLLECTIONS.keys()).index(item[0]) if item[0] in gp.COLLECTIONS else 999,
+        )
+    ]
+    coll_json = json.dumps(coll_items, ensure_ascii=False)
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Статистика</title>
 <style>
+{BROWSE_CSS}
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:30px}}
 h1{{font-size:24px;margin-bottom:4px}}
@@ -2847,13 +3123,23 @@ h1{{font-size:24px;margin-bottom:4px}}
 .stat-label{{font-size:13px;color:#888}}
 canvas{{max-width:100%;height:auto!important}}
 .bar{{display:flex;align-items:center;margin:4px 0;gap:8px}}
+.bar[data-genre],.bar[data-collection]{{cursor:pointer;border-radius:4px;padding:2px 4px}}
+.bar[data-genre]:hover,.bar[data-collection]:hover{{background:#2a2a2a}}
+.bar.active{{background:#333}}
 .bar-label{{font-size:12px;width:100px;text-align:right;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .bar-fill{{height:16px;border-radius:3px;min-width:2px;transition:width .5s}}
 .bar-val{{font-size:11px;color:#666}}
+#drilldown{{margin-top:24px}}
+#drilldown h2{{font-size:18px;margin-bottom:12px;color:#ddd}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}}
+.card{{position:relative;aspect-ratio:2/3;background-size:cover;background-position:center;border-radius:6px;cursor:pointer;overflow:hidden;background-color:#1a1a1a;transition:transform .2s,box-shadow .2s}}
+.card:hover{{transform:scale(1.03);box-shadow:0 0 20px rgba(229,9,20,.3);z-index:2}}
+.card .info{{position:absolute;bottom:0;left:0;right:0;padding:8px;background:linear-gradient(transparent,rgba(0,0,0,.9));font-size:12px;opacity:0;transition:opacity .2s}}
+.card:hover .info{{opacity:1}}
 .back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}}
 .back:hover{{background:#e50914;border-color:#e50914}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>📊 Статистика</h1>
 <p class="sub">{total} фильмов, {rated} с рейтингом, средний {avg_rating}</p>
 <div class="row">
@@ -2861,15 +3147,44 @@ canvas{{max-width:100%;height:auto!important}}
 <div class="box"><h2>📅 Годы</h2><canvas id="yearChart" height="200"></canvas></div>
 <div class="box"><h2>📂 Коллекции</h2><div id="coll-bars"></div></div>
 </div>
+<div id="drilldown"></div>
+{_browse_movie_modal_html()}
 <script>
+const MOVIES={movies_json};
 const GENRES={genre_json};
 const YEARS={years_json};
 const COLLS={coll_json};
 const COLORS=['#e50914','#f5c518','#46d369','#0072eb','#e87c03','#b9090b','#1a73e8','#34a853','#ea4335','#fbbc04','#ff6d01','#c44601','#564d4d','#808080','#a0a0a0'];
 const maxG=Math.max(...Object.values(GENRES));
-document.getElementById('genre-bars').innerHTML=Object.entries(GENRES).map(([g,n],i)=>'<div class="bar"><span class="bar-label">'+g+'</span><div class="bar-fill" style="width:'+(n/maxG*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
-const maxC=Math.max(...Object.values(COLLS));
-document.getElementById('coll-bars').innerHTML=Object.entries(COLLS).map(([c,n],i)=>'<div class="bar"><span class="bar-label">'+c+'</span><div class="bar-fill" style="width:'+(n/maxC*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
+function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
+function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function card(m){{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+document.getElementById('genre-bars').innerHTML=Object.entries(GENRES).map(([g,n],i)=>'<div class="bar" data-genre="'+esc(g)+'"><span class="bar-label">'+esc(g)+'</span><div class="bar-fill" style="width:'+(n/maxG*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
+const maxC=Math.max(...COLLS.map(x=>x.count));
+document.getElementById('coll-bars').innerHTML=COLLS.map((c,i)=>'<div class="bar" data-collection="'+esc(c.id)+'" data-label="'+esc(c.label)+'"><span class="bar-label">'+esc(c.label)+'</span><div class="bar-fill" style="width:'+(c.count/maxC*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+c.count+'</span></div>').join('');
+function showDrilldown(title, films){{
+document.getElementById('drilldown').innerHTML='<h2>'+esc(title)+' <span style="color:#888;font-size:13px">('+films.length+')</span></h2><div class="grid">'+films.map(card).join('')+'</div>';
+document.getElementById('drilldown').scrollIntoView({{behavior:'smooth',block:'start'}});
+}}
+document.getElementById('genre-bars').addEventListener('click',e=>{{
+const row=e.target.closest('.bar[data-genre]');if(!row)return;
+document.querySelectorAll('.bar').forEach(x=>x.classList.remove('active'));
+row.classList.add('active');
+const genre=row.dataset.genre;
+const films=MOVIES.filter(m=>(m.genre||'').split(',').map(x=>x.trim().toLowerCase()).includes(genre));
+showDrilldown(genre, films);
+}});
+document.getElementById('coll-bars').addEventListener('click',e=>{{
+const row=e.target.closest('.bar[data-collection]');if(!row)return;
+document.querySelectorAll('.bar').forEach(x=>x.classList.remove('active'));
+row.classList.add('active');
+const collection=row.dataset.collection;
+const films=MOVIES.filter(m=>(m.collection||'')===collection);
+showDrilldown(row.dataset.label||collection, films);
+}});
+document.getElementById('drilldown').addEventListener('click',e=>{{const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
 const canvas=document.getElementById('yearChart');
 const ctx=canvas.getContext('2d');
 const years=Object.keys(YEARS);
@@ -2889,7 +3204,7 @@ ctx.font='9px sans-serif';
 ctx.textAlign='center';
 ctx.fillText(yr,x+barW/2,y-27-barH);
 }});
-</script></body></html>'''
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 @app.route('/browse/search')
 def browse_search():
@@ -2900,6 +3215,7 @@ def browse_search():
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Поиск</title>
 <style>
+{BROWSE_CSS}
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
 input[type=text]{{width:100%;padding:14px 18px;font-size:18px;border:0;border-radius:8px;background:#2a2a2a;color:#fff;outline:0}}
@@ -2915,27 +3231,28 @@ input[type=text]::placeholder{{color:#666}}
 .back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
 .back:hover{{background:#e50914;border-color:#e50914}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <input type="text" id="q" placeholder="Название фильма..." autofocus>
 <p class="cnt" id="cnt"></p>
 <div id="results"></div>
+{_browse_movie_modal_html()}
 <script>
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-function card(m){{const h=hash(m);const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+h+'" style="background-image:url('+pu(m)+')">'+ab+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function card(m){{const h=hash(m);return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+h+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 function render(q){{
 const ql=q.toLowerCase().trim();
 const filtered=ql?MOVIES.filter(m=>(m.movie_title||'').toLowerCase().includes(ql)||(m.orig_title||'').toLowerCase().includes(ql)):MOVIES;
 document.getElementById('cnt').textContent='Найдено: '+filtered.length;
 document.getElementById('results').innerHTML=filtered.length?filtered.map(card).join(''):'<div class="no">Ничего не найдено</div>';
 }}
-document.getElementById('results').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
+document.getElementById('results').addEventListener('click',e=>{{const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
 document.getElementById('q').addEventListener('input',function(){{render(this.value);}});
 render('');
-</script></body></html>'''
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 
 def _missing_topic_reason(topic, display_ids: set[str], hidden_ids: set[str]) -> list[str]:
@@ -2986,6 +3303,7 @@ def _missing_search_items():
             'imdb_id': topic.get('imdb_id') or '',
             'kp_id': topic.get('kp_id') or '',
             'poster_url': gp.display_poster_url(topic),
+            'format': (topic.get('format') or '').upper(),
             'has_poster': gp.has_real_poster(topic),
             'has_magnet': bool(topic.get('magnet') and topic.get('magnet') != '0'),
             'in_display': in_display,
@@ -3034,6 +3352,7 @@ def _missing_search_items():
                 'imdb_id': '',
                 'kp_id': '',
                 'poster_url': '/data/posters/placeholder.png',
+                'format': '',
                 'has_poster': False,
                 'has_magnet': bool(topic_id),
                 'in_display': False,
@@ -3068,7 +3387,7 @@ input[type=checkbox]{{width:auto}}
 .pill{{background:#252525;border:1px solid #333;border-radius:4px;padding:4px 8px}}
 #results{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}}
 .card{{display:grid;grid-template-columns:58px 1fr;gap:10px;background:#1f1f1f;border:1px solid #303030;border-radius:6px;padding:8px;min-height:92px}}
-.poster{{width:58px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#333;border-radius:4px}}
+.poster{{position:relative;width:58px;aspect-ratio:2/3;background-size:cover;background-position:center;background-color:#333;border-radius:4px;overflow:hidden}}
 .title{{font-size:14px;font-weight:650;line-height:1.25;margin-bottom:4px}}
 .m{{font-size:12px;color:#aaa;margin-bottom:6px}}
 .reasons{{display:flex;gap:5px;flex-wrap:wrap}}
@@ -3080,7 +3399,7 @@ input[type=checkbox]{{width:auto}}
 .back:hover{{background:#e50914;border-color:#e50914}}
 @media(max-width:760px){{.bar{{grid-template-columns:1fr}}}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>Вне витрины</h1>
 <p class="sub">Поиск по всему кешу, темам вне отображения и snapshot World-источников.</p>
 <div class="bar">
@@ -3098,6 +3417,7 @@ const CHUNK=80;
 let token=0;
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function pu(m){{const p=m.poster_url||''; if(!p)return '/data/posters/placeholder.png'; return p.indexOf('data/')===0?'/'+p:p;}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function norm(s){{return String(s||'').toLowerCase().trim()}}
 function initFilters(){{
   const cols=[...new Map(ITEMS.map(x=>[x.collection,x.collection_label||x.collection])).entries()].filter(x=>x[0]).sort((a,b)=>a[1].localeCompare(b[1]));
@@ -3108,7 +3428,7 @@ function initFilters(){{
 function card(m){{
   const reasons=(m.reasons&&m.reasons.length?m.reasons:['in display']).map(r=>'<span class="r '+(r==='in display'?'ok':'')+'">'+esc(r)+'</span>').join('');
   const ids=[m.imdb_id?'IMDb '+m.imdb_id:'',m.kp_id?'KP '+m.kp_id:''].filter(Boolean).join(' · ');
-  return '<div class="card"><div class="poster" style="background-image:url('+pu(m)+')"></div><div><div class="title">'+esc(m.title||m.orig_title||'?')+' <span class="kind">'+esc(m.kind)+'</span></div><div class="m">'+esc([m.collection_label,m.year,ids,m.seeders?'сидов '+m.seeders:''].filter(Boolean).join(' · '))+'</div><div class="reasons">'+reasons+'</div></div></div>';
+  return '<div class="card"><div class="poster" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'</div><div><div class="title">'+esc(m.title||m.orig_title||'?')+' <span class="kind">'+esc(m.kind)+'</span></div><div class="m">'+esc([m.collection_label,m.year,ids,m.seeders?'сидов '+m.seeders:''].filter(Boolean).join(' · '))+'</div><div class="reasons">'+reasons+'</div></div></div>';
 }}
 function criteria(){{
   return {{
@@ -3162,6 +3482,7 @@ def browse_top():
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Топ-50</title>
 <style>
+{BROWSE_CSS}
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
 h1{{font-size:24px}}
@@ -3176,20 +3497,21 @@ h1{{font-size:24px}}
 .back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
 .back:hover{{background:#e50914;border-color:#e50914}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>🏆 Топ-50</h1>
 <p class="sub">По рейтингу Кинопоиска и IMDB</p>
 <div id="grid"></div>
+{_browse_movie_modal_html()}
 <script>
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function rt(m){{return Math.max(parseFloat(m.kp_rating)||0,parseFloat(m.imdb_rating)||0)}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+ab+'<span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}).join('');
-document.getElementById('grid').addEventListener('click',e=>{{const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
-</script></body></html>'''
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}).join('');
+document.getElementById('grid').addEventListener('click',e=>{{const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 
 @app.route('/browse/collections')
@@ -3201,12 +3523,24 @@ def browse_collections():
     for m in movies:
         c = m.get('collection', 'unknown')
         groups.setdefault(c, []).append(m)
+    for items in groups.values():
+        items.sort(key=lambda m: int(m.get('listing_order') if m.get('listing_order') is not None else 999999))
+    ordered_groups = {
+        key: groups[key]
+        for key in gp.COLLECTIONS.keys()
+        if key in groups
+    }
+    for key in sorted(k for k in groups.keys() if k not in ordered_groups):
+        ordered_groups[key] = groups[key]
+    groups = ordered_groups
     coll_json = json.dumps(groups, ensure_ascii=False, default=str).replace('</script>', '<\\/script>')
-    labels = {'nashe_kino': 'Наше кино', 'kino_sng': 'Кино СНГ', 'novinki_2026': 'Новинки 2026', 'kino_sng_hd': 'Кино СНГ HD'}
+    movies_json = json.dumps(movies, ensure_ascii=False, default=str).replace('</script>', '<\\/script>')
+    labels = {key: info.get('name', key) for key, info in gp.COLLECTIONS.items()}
     labels_json = json.dumps(labels, ensure_ascii=False)
     return f'''<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Коллекции</title>
 <style>
+{BROWSE_CSS}
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#141414;color:#fff;font-family:system-ui,sans-serif;padding:20px}}
 h1{{font-size:24px;margin-bottom:4px}}
@@ -3225,22 +3559,24 @@ h1{{font-size:24px;margin-bottom:4px}}
 .back{{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer;text-decoration:none}}
 .back:hover{{background:#e50914;border-color:#e50914}}
 </style></head><body>
-<a href="/test" class="back">← Тест</a>
+<a href="/test" class="back">Назад</a>
 <h1>📂 Коллекции</h1>
 <p class="sub">{len(movies)} фильмов, {len(groups)} коллекций</p>
 <div id="root"></div>
+{_browse_movie_modal_html()}
 <script>
+const MOVIES={movies_json};
 const GROUPS={coll_json};
 const LABELS={labels_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function label(k){{return LABELS[k]||k}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function openMovie(h){{if(h) window.open('/player.html#'+h,'_blank')}}
-function card(m){{const ab=(m.format||'').toUpperCase()==='AVI'?'<span class=avi-badge>⏳</span>':'';return '<div class="card" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+ab+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function card(m){{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2><span class="arrow'+(gi===0?' open':'')+'">&#9660;</span>'+esc(label(key))+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(card).join('')+'</div></div>').join('');
-document.getElementById('root').addEventListener('click',e=>{{const h=e.target.closest('h2');if(h){{const g=h.nextElementSibling;g.style.display=g.style.display==='none'?'':'none';h.querySelector('.arrow').classList.toggle('open');return}}const c=e.target.closest('.card');if(c)openMovie(c.dataset.hash)}});
-</script></body></html>'''
+document.getElementById('root').addEventListener('click',e=>{{const h=e.target.closest('h2');if(h){{const g=h.nextElementSibling;g.style.display=g.style.display==='none'?'':'none';h.querySelector('.arrow').classList.toggle('open');return}}const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
+</script>{_browse_movie_modal_script()}</body></html>'''
 
 
 if __name__ == '__main__':
@@ -3294,3 +3630,4 @@ if __name__ == '__main__':
     sock.close()
     print(f' * Running on http://127.0.0.1:{port}')
     server.serve_forever()
+
