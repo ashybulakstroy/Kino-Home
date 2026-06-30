@@ -208,6 +208,12 @@ def _ensure_discover_poster(topic):
     gp.resolve_existing_local_poster(topic)
     if gp.has_real_poster(topic):
         return
+    _rutracker_fetch_failed = (
+        'rutracker.net' in str(topic.get('topic_url', ''))
+        and topic.get('_magnet_failed')
+    )
+    if _rutracker_fetch_failed:
+        return
     poster_url = topic.get('poster_url') or ''
     if gp.is_external_poster_url(poster_url) and topic.get('imdb_id'):
         local_url = gp.download_poster(topic.get('imdb_id'), poster_url)
@@ -949,6 +955,21 @@ def api_discover_enrich():
     return jsonify(_enrich_discover_item(data))
 
 
+@bp.route('/api/discover/record', methods=['POST'])
+def api_discover_record():
+    data = request.get_json(silent=True) or {}
+    if not data.get('title') and not (data.get('imdb_id') or data.get('kp_id') or data.get('magnet')):
+        return jsonify(error='no movie data'), 400
+    try:
+        result = record_discovered(data)
+        if result:
+            _regenerate_index_from_catalog()
+            return jsonify(status='recorded', topic_id=result.get('topic_id'))
+        return jsonify(status='skipped', reason='no magnet')
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
 def _discover_item_key(item):
     return str(item.get('topic_id') or item.get('magnet') or item.get('imdb_id') or item.get('kp_id') or item.get('title') or '')
 
@@ -962,7 +983,7 @@ def _discover_item_keys(item):
     }
 
 
-def _enrich_discover_item(data):
+def _enrich_discover_item(data, record=True):
     cached = _find_enriched_history_match(data)
     if cached:
         result = {
@@ -972,12 +993,13 @@ def _enrich_discover_item(data):
             'changed_fields': [],
             'movie': cached,
         }
-        try:
-            record_discovered(cached)
-            _regenerate_index_from_catalog()
-            result['activity_collection'] = 'discovered'
-        except Exception as e:
-            result['activity_error'] = str(e)
+        if record:
+            try:
+                record_discovered(cached)
+                _regenerate_index_from_catalog()
+                result['activity_collection'] = 'discovered'
+            except Exception as e:
+                result['activity_error'] = str(e)
         return result
     topic = _make_discover_topic(data)
     before = _topic_card_payload(topic, 'До обогащения', 'Discover')
@@ -1023,12 +1045,13 @@ def _enrich_discover_item(data):
         if not before.get(field) and payload.get(field):
             changed_fields.append(label)
     _save_discover_history(payload)
-    try:
-        record_discovered(payload)
-        _regenerate_index_from_catalog()
-        result['activity_collection'] = 'discovered'
-    except Exception as e:
-        result['activity_error'] = str(e)
+    if record:
+        try:
+            record_discovered(payload)
+            _regenerate_index_from_catalog()
+            result['activity_collection'] = 'discovered'
+        except Exception as e:
+            result['activity_error'] = str(e)
     result['cache_updated'] = _update_search_cache_with_enriched(payload)
     result['changed_fields'] = changed_fields
     result['status'] = 'done'
@@ -1059,7 +1082,10 @@ def api_discover_enrich_batch():
         return jsonify(error='no items'), 400
     results = []
     with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(deduped))) as executor:
-        futures = {executor.submit(_enrich_discover_item, item): item for item in deduped}
+        def _submit(item):
+            rec = bool(selected_key and selected_key == _discover_item_key(item))
+            return executor.submit(_enrich_discover_item, item, record=rec)
+        futures = {_submit(item): item for item in deduped}
         for future in as_completed(futures):
             try:
                 results.append(future.result())
@@ -1147,7 +1173,7 @@ function replaceResultCards(movie){
 async function enrichItem(m){
   const modal=document.getElementById('modal'),mc=document.getElementById('mc');
   modal.classList.add('open');
-  if(isEnriched(m)){currentMovie=m;mc.innerHTML=enrichedCard(m);return;}
+  if(isEnriched(m)){currentMovie=m;mc.innerHTML=enrichedCard(m);fetch('/api/discover/record',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(m)}).catch(()=>{});return;}
   const tasks=[];
   if(!m.magnet&&m.topic_url)tasks.push('magnet');
   if(!m.poster_url||m.poster_url.indexOf('placeholder.png')!==-1)tasks.push('постер');

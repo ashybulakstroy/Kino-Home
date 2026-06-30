@@ -101,6 +101,16 @@ def normalize_activity_topic(source, collection):
     return topic
 
 
+def _renumber_collection(items, collection, start=1):
+    for item in items:
+        if isinstance(item, dict) and item.get('collection') == collection:
+            current = item.get('listing_order')
+            try:
+                item['listing_order'] = int(current) + start
+            except (TypeError, ValueError):
+                item['listing_order'] = start
+
+
 def upsert_activity_topic(source, collection):
     topic = normalize_activity_topic(source, collection)
     key = activity_key(topic)
@@ -109,13 +119,24 @@ def upsert_activity_topic(source, collection):
     with file_lock(CATALOG_FILE):
         catalog = _load_catalog()
         kept = []
+        old_dates = {}
         for item in catalog:
             if not isinstance(item, dict):
                 continue
             same_collection = item.get('collection') == collection
             if same_collection and activity_key(item) == key:
+                old_dates = {
+                    'date_str': item.get('date_str'),
+                    'added_at': item.get('added_at'),
+                }
                 continue
             kept.append(item)
+        if old_dates.get('date_str'):
+            topic['date_str'] = old_dates['date_str']
+        if old_dates.get('added_at'):
+            topic['added_at'] = old_dates['added_at']
+        _renumber_collection(kept, collection, start=1)
+        topic['listing_order'] = 0
         kept.append(topic)
         atomic_write_json_unlocked(CATALOG_FILE, kept)
     return topic

@@ -3558,6 +3558,12 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
         except Exception:
             pass
 
+    _rutracker_fetch_failed = (
+        'rutracker.net' in topic.get('topic_url', '')
+        and topic.get('_magnet_failed')
+        and not has_real_poster(topic)
+    )
+
     if is_world:
         try:
             html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
@@ -3578,7 +3584,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
 
     if not is_world:
         search_topic_kinopoisk(topic, russian_title, year, kp_cache)
-        if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
+        if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
             local_url = download_kinopoisk_poster(topic['kp_id'])
             if local_url:
                 topic['poster_url'] = local_url
@@ -3593,7 +3599,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                 topic['imdb_id'] = result
             else:
                 topic['imdb_id'] = result.get('id')
-                if not has_real_poster(topic) and retry_poster and result.get('poster'):
+                if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and result.get('poster'):
                     local_url = download_poster(topic['imdb_id'], result['poster'])
                     if local_url:
                         topic['poster_url'] = local_url
@@ -3620,7 +3626,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
             if not topic.get('imdb_rating') and rating_data.get('rating'):
                 topic['imdb_rating'] = rating_data['rating']
                 topic['imdb_votes'] = rating_data.get('votes', '')
-            if not has_real_poster(topic) and retry_poster and rating_data.get('poster'):
+            if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and rating_data.get('poster'):
                 local_url = download_poster(imdb_id, rating_data['poster'])
                 if local_url:
                     topic['poster_url'] = local_url
@@ -3630,7 +3636,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if is_world:
         search_topic_kinopoisk(topic, russian_title, year, kp_cache)
 
-    if not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
+    if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
         local_url = download_kinopoisk_poster(topic['kp_id'])
         if local_url:
             topic['poster_url'] = local_url
