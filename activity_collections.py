@@ -45,6 +45,25 @@ def activity_key(topic):
     )
 
 
+def _activity_title_key(topic):
+    title = str(topic.get('movie_title') or topic.get('title') or topic.get('raw_title') or '').lower().replace('ё', 'е')
+    title = re.sub(r'\b(?:rus|eng|sub|subs|bd|bdrip|hdrip|webrip|web-dl|dvd|dvdrip|avi|mkv|mp4)\b', ' ', title, flags=re.I)
+    return re.sub(r'[^0-9a-zа-я]+', '', title)
+
+
+def _same_activity_movie(left, right):
+    for field in ('imdb_id', 'kp_id', 'source_topic_id', 'original_topic_id'):
+        a = str(left.get(field) or '')
+        b = str(right.get(field) or '')
+        if a and b and a == b:
+            return True
+    a = _activity_title_key(left)
+    b = _activity_title_key(right)
+    if len(a) < 6 or len(b) < 6:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
 def activity_topic_id(collection, topic):
     key = activity_key(topic)
     safe = re.sub(r'[^0-9a-zA-Z_]+', '_', key).strip('_').lower()[:80] or 'movie'
@@ -101,18 +120,13 @@ def normalize_activity_topic(source, collection):
     return topic
 
 
-def _renumber_collection(items, collection, start=1):
-    selected = [item for item in items if isinstance(item, dict) and item.get('collection') == collection]
-    selected.sort(key=lambda item: int(item.get('listing_order') if item.get('listing_order') is not None else 999999))
-    for offset, item in enumerate(selected, start=start):
-        item['listing_order'] = offset
-
-
 def upsert_activity_topic(source, collection):
+    source_topic = dict(source or {})
+    key = activity_key(source_topic)
     topic = normalize_activity_topic(source, collection)
-    key = activity_key(topic)
     if not key or not topic.get('magnet'):
         return None
+    topic.pop('listing_order', None)
     with file_lock(CATALOG_FILE):
         catalog = _load_catalog()
         kept = []
@@ -120,11 +134,9 @@ def upsert_activity_topic(source, collection):
             if not isinstance(item, dict):
                 continue
             same_collection = item.get('collection') == collection
-            if same_collection and activity_key(item) == key:
+            if same_collection and (activity_key(item) == key or _same_activity_movie(item, source_topic)):
                 continue
             kept.append(item)
-        _renumber_collection(kept, collection, start=1)
-        topic['listing_order'] = 0
         kept.append(topic)
         atomic_write_json_unlocked(CATALOG_FILE, kept)
     return topic

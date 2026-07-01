@@ -2206,11 +2206,11 @@ def parse_topic_for_magnet(html):
         if poster_el:
             poster = poster_el.get('title', '')
     fmt = ''
-    known = {'avi', 'mkv', 'matroska', 'mp4', 'mpeg-4', 'mpeg', 'webm'}
-    known_map = {'AVI': 'AVI', 'Matroska': 'MKV', 'MKV': 'MKV', 'MP4': 'MP4', 'MPEG-4': 'MP4', 'WEBM': 'WEBM'}
+    known = {'avi', 'mkv', 'matroska', 'mp4', 'mpeg-4', 'mpeg', 'mov', 'webm'}
+    known_map = {'AVI': 'AVI', 'Matroska': 'MKV', 'MKV': 'MKV', 'MP4': 'MP4', 'MPEG-4': 'MP4', 'MPEG': 'MP4', 'MOV': 'MP4', 'WEBM': 'WEBM'}
     text = re.sub(r'<[^>]+>', '', html)
-    fmt_token = r'(AVI|MKV|Matroska|MP4|MPEG-4|MPEG|WEBM)'
-    m = re.search(r'Формат(?:\s+видео)?\s*[:：]\s*' + fmt_token, text, re.I)
+    fmt_token = r'(AVI|MKV|Matroska|MP4|MPEG-4|MPEG|MOV|WEBM)'
+    m = re.search(r'Формат(?:\s*\([^)]*\)|\s+видео)?\s*[:：]\s*' + fmt_token, text, re.I)
     if not m:
         m = re.search(r'Format(?:\s+video)?\s*[:：]\s*' + fmt_token, text, re.I)
     if m:
@@ -2222,7 +2222,7 @@ def parse_topic_for_magnet(html):
         part = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
         part = re.sub(r'<[^>]+>', '', part)
         for line in part.split('\n'):
-            ck = re.search(r'(?:Формат|Format)(?:\s+(?:видео|video))?\s*[:：]\s*' + fmt_token, line, re.I)
+            ck = re.search(r'(?:Формат|Format)(?:\s*\([^)]*\)|\s+(?:видео|video))?\s*[:：]\s*' + fmt_token, line, re.I)
             if ck:
                 cand = ck.group(1).rstrip(':').rstrip(',')
                 if cand.lower() in known:
@@ -3172,11 +3172,16 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
     if hidden_ids is None:
         hidden_ids = load_hidden_topic_ids()
     coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
+    def collection_item_order(topic):
+        collection = topic.get('collection', '')
+        if COLLECTIONS.get(collection, {}).get('activity'):
+            return -date_to_timestamp(topic.get('activity_at') or topic.get('added_at') or topic.get('date_str'))
+        return int(topic.get('listing_order') if topic.get('listing_order') is not None else 999)
     topics = sorted(
         topics,
         key=lambda t: (
             coll_order.get(t.get('collection', ''), 999),
-            int(t.get('listing_order') if t.get('listing_order') is not None else 999),
+            collection_item_order(t),
         ),
     )
     rows = []
@@ -3276,7 +3281,10 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
 
         rated_attr = '1' if t.get('kp_rating') or t.get('imdb_rating') else '0'
 
-        listing_order = t.get('listing_order', 999)
+        if COLLECTIONS.get(t.get('collection', ''), {}).get('activity'):
+            listing_order = -date_to_timestamp(t.get('activity_at') or t.get('added_at') or t.get('date_str'))
+        else:
+            listing_order = t.get('listing_order', 999)
         rows.append(f'''<tr data-date="{date_ts}" data-order="{listing_order}" data-tid="{escape(t['topic_id'])}" data-title="{clean_t}" data-year="{movie_year}" data-container="{escape(container)}" data-seeders="{seeders}" data-genre="{escape(genre.lower())}" data-collection="{collection}" data-rated="{rated_attr}">
 <td><a href="{escape(t['topic_url'])}" class="tn" target="_blank">{escape(t['title'])}</a>
 <div class="ml">
@@ -3471,7 +3479,7 @@ document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});doc
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
 function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss'),f=document.getElementById('fs');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value);if(f)localStorage.setItem('fv',f.value)}}
-function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r='+Date.now();return}}function reloadFresh(){{window.location.href='/?r='+Date.now()}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running'&&n<3)setTimeout(function(){{poll(n+1)}},1500)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
+function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r=';return}}function reloadFresh(){{window.location.href='/?r='}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running'&&n<3)setTimeout(function(){{poll(n+1)}},1500)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
 function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}

@@ -1968,13 +1968,13 @@ def index():
             return Response(_html_cache[2], content_type='text/html; charset=utf-8')
 
     html = index_path.read_text('utf-8')
-    old_collection_reload = "function rc(){sf();localStorage.removeItem('gv');window.location.href='/?r='+Date.now()}"
+    old_collection_reload = "function rc(){sf();localStorage.removeItem('gv');window.location.href='/?r='}"
     old_blocking_light_reload = (
         "function rc(){sf();localStorage.removeItem('gv');"
         "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
         "var c=document.getElementById('cs'),v=c?c.value:'';"
-        "if(!v){window.location.href='/?r='+Date.now();return}"
-        "function done(){window.location.href='/?r='+Date.now()}"
+        "if(!v){window.location.href='/?r=';return}"
+        "function done(){window.location.href='/?r='}"
         "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
         ".then(function(r){return r.json()}).then(function(d){"
         "if(d.status==='running'&&n<120)setTimeout(function(){poll(n+1)},2000);"
@@ -1987,8 +1987,8 @@ def index():
         "function rc(){sf();localStorage.removeItem('gv');"
         "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
         "var c=document.getElementById('cs'),v=c?c.value:'';"
-        "if(!v){window.location.href='/?r='+Date.now();return}"
-        "function reloadFresh(){window.location.href='/?r='+Date.now()}"
+        "if(!v){window.location.href='/?r=';return}"
+        "function reloadFresh(){window.location.href='/?r='}"
         "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
         ".then(function(r){return r.json()}).then(function(d){"
         "if(d.status==='done')reloadFresh();"
@@ -2017,7 +2017,7 @@ def index():
         f"var KG_ACTIVITY_COLLECTIONS={json.dumps(list(gp.ACTIVITY_COLLECTIONS.keys()))};"
         "var checking=false,lastCheck=0;"
         "function selectedActivity(){var s=document.getElementById('cs'),v=s?s.value:'';return KG_ACTIVITY_COLLECTIONS.indexOf(v)!==-1}"
-        "function reloadFresh(){window.location.href='/?r='+Date.now()}"
+        "function reloadFresh(){window.location.href='/?r='}"
         "function checkFresh(force){var now=Date.now();if(checking||(!force&&now-lastCheck<5000))return;checking=true;lastCheck=now;"
         "fetch('/catalog_version',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
         "if(d&&d.version&&d.version!==KG_CATALOG_VERSION)reloadFresh()"
@@ -3519,12 +3519,26 @@ def browse_collections():
     movies = _get_movies()
     hidden = gp.load_hidden_topic_ids()
     movies = [m for m in movies if m['topic_id'] not in hidden]
+    def collection_item_order(movie):
+        collection = movie.get('collection', '')
+        if gp.COLLECTIONS.get(collection, {}).get('activity'):
+            value = str(movie.get('activity_at') or movie.get('added_at') or movie.get('date_str') or '')
+            for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S'):
+                try:
+                    return -datetime.strptime(value, fmt).timestamp()
+                except ValueError:
+                    pass
+            try:
+                return -datetime.fromisoformat(value).timestamp()
+            except ValueError:
+                return 0
+        return int(movie.get('listing_order') if movie.get('listing_order') is not None else 999999)
     groups: dict[str, list] = {}
     for m in movies:
         c = m.get('collection', 'unknown')
         groups.setdefault(c, []).append(m)
     for items in groups.values():
-        items.sort(key=lambda m: int(m.get('listing_order') if m.get('listing_order') is not None else 999999))
+        items.sort(key=collection_item_order)
     ordered_groups = {
         key: groups[key]
         for key in gp.COLLECTIONS.keys()
