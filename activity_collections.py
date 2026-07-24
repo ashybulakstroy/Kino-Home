@@ -146,10 +146,25 @@ def find_catalog_topic_by_magnet(magnet):
     wanted = _info_hash(magnet)
     if not wanted:
         return None
-    for topic in _load_catalog():
-        if isinstance(topic, dict) and _info_hash(topic.get('magnet')) == wanted:
-            return dict(topic)
-    return None
+    candidates = [
+        topic for topic in _load_catalog()
+        if isinstance(topic, dict) and _info_hash(topic.get('magnet')) == wanted
+    ]
+    if not candidates:
+        return None
+
+    def completeness(topic):
+        enriched = sum(bool(topic.get(field)) for field in (
+            'poster_url', 'imdb_id', 'kp_id', 'youtube_url',
+            'genre', 'format', 'size_bytes',
+        ))
+        return (
+            0 if topic.get('collection') in ACTIVITY_COLLECTIONS else 1,
+            enriched,
+            1 if topic.get('poster_url') else 0,
+        )
+
+    return dict(max(candidates, key=completeness))
 
 
 def record_discovered(source):
@@ -162,6 +177,8 @@ def record_watched(source):
 
 def record_watched_magnet(magnet, extra=None):
     topic = find_catalog_topic_by_magnet(magnet) or {}
-    topic.update(extra or {})
+    for key, value in (extra or {}).items():
+        if topic.get(key) in (None, '', [], {}, 0) and value not in (None, '', [], {}, 0):
+            topic[key] = value
     topic['magnet'] = magnet
     return record_watched(topic)

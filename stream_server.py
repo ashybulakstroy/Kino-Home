@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from flask import Flask, request, Response, jsonify, send_file, send_from_directory, abort, redirect, stream_with_context
 
-from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES, LIGHT_REFRESH_COOLDOWN_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_RETRY_COOLDOWN_MINUTES, ENRICH_NO_CHANGE_RETRY_DAYS
+from config import BASE_DIR, DATA_DIR, TEMP_DIR, MAX_TEMP_SIZE_BYTES, TEMP_MAX_AGE_SECS, MAX_TEMP_FILES, SERVER_PORT, ENRICH_INTERVAL_MINUTES, DAILY_REFRESH_MAX_PER_DAY, DAILY_REFRESH_STARTUP_COOLDOWN_MINUTES, LIGHT_REFRESH_COOLDOWN_MINUTES, TOPIC_MAX_AGE_DAYS, PUBLIC_MODE, WORKER_COUNT, MAX_ENRICH_RETRIES, ENRICH_RETRY_COOLDOWN_MINUTES, ENRICH_NO_CHANGE_RETRY_DAYS, STREAM_IDLE_TIMEOUT_SECONDS
 
 import generate_page as gp
 from project_io import atomic_write_json_unlocked, atomic_write_text, atomic_write_text_unlocked, file_lock
@@ -27,7 +27,7 @@ from activity_collections import record_watched_magnet
 
 
 _LOG_FILE: TextIO | None = None
-INDEX_INJECT_VERSION = 'v11'
+INDEX_INJECT_VERSION = 'v13'
 _KINO_BANNER = (
     '*   *  *****  *   *   ****',
     '*  *     *    **  *  *    *',
@@ -140,7 +140,7 @@ engine = _LazyEngine()
 app = Flask(__name__, static_folder=None)
 app.register_blueprint(discover_bp)
 
-STREAM_IDLE_TIMEOUT = 30
+STREAM_IDLE_TIMEOUT = max(30, STREAM_IDLE_TIMEOUT_SECONDS)
 SESSION_SWEEP_INTERVAL = 10
 MAX_STREAM_SESSIONS = 10
 _sessions_lock = threading.Lock()
@@ -1537,6 +1537,9 @@ def stream_replacement():
 def status(info_hash):
     if PUBLIC_MODE and not _catalog_allows_hash(info_hash):
         return jsonify(error='not allowed'), 403
+    sid = request.args.get('sid')
+    if sid:
+        _touch_stream_session(sid)
     s = engine.get_status(info_hash)
     if s is None:
         return jsonify(error='not found'), 404
@@ -2082,13 +2085,18 @@ def index():
         "<script>(function(){"
         f"var KG_CATALOG_VERSION={json.dumps(etag_val)};"
         f"var KG_ACTIVITY_COLLECTIONS={json.dumps(list(gp.ACTIVITY_COLLECTIONS.keys()))};"
-        "var checking=false,lastCheck=0;"
+        "var checking=false,lastCheck=0,pendingVersion='';"
         "function selectedActivity(){var s=document.getElementById('cs'),v=s?s.value:'';return KG_ACTIVITY_COLLECTIONS.indexOf(v)!==-1}"
-        "function reloadFresh(){window.location.href='/?r='}"
+        "function playerActive(){var o=document.getElementById('player-overlay');"
+        "return (typeof currentSession!=='undefined'&&!!currentSession)||"
+        "(typeof currentHash!=='undefined'&&!!currentHash)||(o&&!o.classList.contains('hidden'))}"
+        "function reloadFresh(version){if(playerActive()){pendingVersion=version||pendingVersion||'1';return false}"
+        "window.location.href='/?r=';return true}"
         "function checkFresh(force){var now=Date.now();if(checking||(!force&&now-lastCheck<5000))return;checking=true;lastCheck=now;"
         "fetch('/catalog_version',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
-        "if(d&&d.version&&d.version!==KG_CATALOG_VERSION)reloadFresh()"
+        "if(d&&d.version&&d.version!==KG_CATALOG_VERSION)reloadFresh(d.version)"
         "}).catch(function(){}).finally(function(){checking=false})}"
+        "window.kgApplyPendingCatalog=function(){if(pendingVersion&&!playerActive())reloadFresh(pendingVersion)};"
         "window.kgCheckCatalogFresh=checkFresh;"
         "window.addEventListener('focus',function(){checkFresh(false)});"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)checkFresh(false)});"
