@@ -271,6 +271,7 @@ class TorrentEngine:
         enough_overall = progress >= READY_MIN_PROGRESS
         startup_buffer_ready = buffered_bytes >= start_buffer_bytes
         enough_buffer = buffered_bytes >= min_buffer_bytes
+        required_buffer_bytes = start_buffer_bytes if speed_ok else min_buffer_bytes
         ready = (
             progress >= 1.0
             if not streamable
@@ -296,6 +297,7 @@ class TorrentEngine:
             'buffered_bytes': buffered_bytes,
             'start_buffer_bytes': start_buffer_bytes,
             'min_buffer_bytes': min_buffer_bytes,
+            'required_buffer_bytes': required_buffer_bytes,
             'estimated_bitrate': int(estimated_bitrate),
         }
 

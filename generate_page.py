@@ -41,8 +41,8 @@ COLLECTIONS = {
     'kino_sng':            {'name': 'Фильмы ближнего зарубежья',        'url': 'https://rutracker.net/forum/viewforum.php?f=2540', 'age_cleanup': False, 'skip_topics': 0},
     'novinki_2026':        {'name': 'Новинки 2026',                    'url': 'https://rutracker.net/forum/viewforum.php?f=252',   'age_cleanup': True,  'skip_topics': 0},
     'kino_sng_hd':         {'name': 'Фильмы Ближнего Зарубежья (HD Video)', 'url': 'https://rutracker.net/forum/viewforum.php?f=1247', 'age_cleanup': False, 'skip_topics': 0},
-    'piratebay_top':       {'name': 'World *',                         'url': 'https://1.piratebays.to/top/207', 'age_cleanup': True, 'source': 'piratebay', 'max_topics': 60},
-    'tpbparty_top':        {'name': 'World **',                        'url': 'https://tpb.party/top/207',       'age_cleanup': True, 'source': 'tpbparty',  'max_topics': 60},
+    'piratebay_top':       {'name': 'World *',                         'url': 'https://1.piratebays.to/top/207', 'age_cleanup': False, 'source': 'piratebay'},
+    'tpbparty_top':        {'name': 'World **',                        'url': 'https://tpb.party/top/207',       'age_cleanup': False, 'source': 'tpbparty'},
 }
 COLLECTIONS.update(ACTIVITY_COLLECTIONS)
 REFRESH_COLLECTIONS = {
@@ -549,13 +549,44 @@ def save_json(path, data):
 
 def parse_size(text):
     text = text.strip().replace('\xa0', ' ').replace(',', '.')
-    m = re.match(r'([\d.]+)\s*(TB|GB|MB|KB)', text, re.I)
+    m = re.match(r'([\d.]+)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB|B)\b', text, re.I)
     if not m:
         return 0, text
     val = float(m.group(1))
     unit = m.group(2).upper()
-    multipliers = {'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+    multipliers = {
+        'B': 1,
+        'KB': 1024,
+        'KIB': 1024,
+        'MB': 1024**2,
+        'MIB': 1024**2,
+        'GB': 1024**3,
+        'GIB': 1024**3,
+        'TB': 1024**4,
+        'TIB': 1024**4,
+    }
     return int(val * multipliers.get(unit, 1)), text
+
+
+def inline_html_text(element):
+    """Read inline HTML without joining words split by tags such as <wbr>."""
+    if element is None:
+        return ''
+    return re.sub(r'\s+', ' ', element.get_text('', strip=False)).strip()
+
+
+def remove_parenthesized_text(value):
+    """Remove parenthesized credits, including nested parentheses."""
+    result = []
+    depth = 0
+    for char in value or '':
+        if char == '(':
+            depth += 1
+        elif char == ')' and depth:
+            depth -= 1
+        elif depth == 0:
+            result.append(char)
+    return ''.join(result)
 
 
 def parse_rutracker_title(raw):
@@ -629,7 +660,7 @@ def parse_rutracker_title(raw):
                 if ym:
                     year = ym.group(1)
 
-    title_part = re.sub(r'\([^)]*\)', '', title_part).strip()
+    title_part = remove_parenthesized_text(title_part).strip()
 
     russian_title = title_part
     english_title = ''
@@ -1985,7 +2016,7 @@ def parse_forum_page(html, collection='nashe_kino', skip_topics=0):
         title_el = row.select_one('a.torTopic.tt-text')
         if not title_el:
             continue
-        title = title_el.get_text(strip=True)
+        title = inline_html_text(title_el)
         author_el = row.select_one('.topicAuthor')
         author = author_el.get_text(strip=True) if author_el else ''
         size_str = size_el.get_text(strip=True)
@@ -2140,6 +2171,30 @@ def _format_from_file_text(text):
     return ''
 
 
+def parse_world_file_info(html):
+    """Return format and size of the largest video in a World file list."""
+    soup = BeautifulSoup(html or '', 'html.parser')
+    best = {}
+    for row in soup.select('#filelistContainer tr'):
+        cells = row.find_all('td')
+        if not cells:
+            continue
+        filename = inline_html_text(cells[0])
+        fmt = _format_from_file_text(filename)
+        if not fmt:
+            continue
+        size_text = inline_html_text(cells[1]) if len(cells) > 1 else ''
+        size_bytes, size_clean = parse_size(size_text)
+        if not best or size_bytes > best.get('size_bytes', 0):
+            best = {
+                'format': fmt,
+                'size_str': size_clean,
+                'size_bytes': size_bytes,
+                'video_file': filename,
+            }
+    return best
+
+
 def _piratebay_magnet_from_html(html):
     soup = BeautifulSoup(html or '', 'html.parser')
     link = soup.select_one('a[href^="magnet:?xt=urn:btih:"]')
@@ -2198,6 +2253,9 @@ def _format_from_magnet_metadata(magnet, timeout=20):
 
 
 def parse_piratebay_format(html):
+    file_info = parse_world_file_info(html)
+    if file_info.get('format'):
+        return file_info['format']
     soup = BeautifulSoup(html, 'html.parser')
     nfo_pre = soup.select_one('.nfo pre')
     if nfo_pre:
@@ -2458,6 +2516,58 @@ def mark_poster_failed(topic):
     topic['_poster_failed_at'] = today_text()
     if is_external_poster_url(topic.get('poster_url')):
         topic['_poster_fallback_failed_at'] = today_text()
+
+
+def repair_cached_rutracker_titles(topics):
+    """Restore spaces lost around <wbr> using cached Rutracker topic pages."""
+    title_updates = 0
+    movie_title_updates = 0
+    for topic in topics:
+        topic_id = str(topic.get('topic_id') or '')
+        if not topic_id.isdigit() or is_world_topic(topic):
+            continue
+        cache_path = os.path.join(TOPIC_CACHE_DIR, f'{topic_id}.html')
+        if not os.path.exists(cache_path):
+            continue
+        html = get_topic_html(topic_id, topic.get('topic_url', ''), timeout=10)
+        if not html or '<wbr' not in html.lower():
+            continue
+        title_element = BeautifulSoup(html, 'html.parser').select_one('#topic-title')
+        corrected_title = inline_html_text(title_element)
+        if not corrected_title or corrected_title == topic.get('title'):
+            continue
+
+        old_movie_title = topic.get('movie_title') or ''
+        parsed = parse_rutracker_title(corrected_title)
+        topic['title'] = corrected_title
+        title_updates += 1
+        if parsed[0] and parsed[0] != old_movie_title:
+            topic['movie_title'] = parsed[0]
+            if parsed[1]:
+                topic['orig_title'] = parsed[1]
+            if parsed[2]:
+                topic['movie_year'] = parsed[2]
+            if parsed[3] and not topic.get('genre'):
+                topic['genre'] = parsed[3]
+            if parsed[4] and not topic.get('quality'):
+                topic['quality'] = parsed[4]
+            for field in (
+                '_enrich_retries',
+                '_enrich_attempt_at',
+                '_enrich_no_change_at',
+            ):
+                topic.pop(field, None)
+            movie_title_updates += 1
+            print(f"  {topic_id}: {old_movie_title} -> {parsed[0]}")
+
+    print(
+        f"  Заголовки из кеша: обновлено {title_updates}, "
+        f"поисковых имён: {movie_title_updates}"
+    )
+    return {
+        'title_updates': title_updates,
+        'movie_title_updates': movie_title_updates,
+    }
 
 
 def fix_bad_topics(topics):
@@ -2981,80 +3091,9 @@ def clean_catalog_topics(topics):
 
 
 def enrich(topics, ratings, basics):
-    total = len(topics)
-    yt_cache = load_json(YOUTUBE_CACHE) or {}
-    for i, t in enumerate(topics, 1):
-        eng_title = t.get('orig_title') or t['movie_title']
-        year = t['movie_year']
-        if not eng_title:
-            continue
-        cache_key = f"{eng_title}|{year}".lower()
-        imdb_id = t.get('imdb_id')
-        print(f"  [{i}/{total}] {t['movie_title']}...", end=' ', flush=True)
-        if not has_real_poster(t):
-            resolve_existing_local_poster(t)
-        if primary_id_source(t) == 'kp' and not has_real_poster(t) and t.get('kp_id'):
-            kp_local = download_kinopoisk_poster(t['kp_id'])
-            if kp_local:
-                t['poster_url'] = kp_local
-                print(f"KP постер ✓", end='')
-        if imdb_id:
-            bdata = basics.get(imdb_id)
-            genre = bdata.get('genres', '') if isinstance(bdata, dict) else ''
-            if not genre:
-                rating_data = fetch_imdb_rating(imdb_id)
-                if rating_data.get('genres'):
-                    genre = rating_data['genres']
-                if not has_real_poster(t) and rating_data.get('poster'):
-                    local_url = download_poster(imdb_id, rating_data['poster'])
-                    if local_url:
-                        t['poster_url'] = local_url
-                if rating_data.get('rating'):
-                    t['imdb_rating'] = rating_data['rating']
-                    t['imdb_votes'] = rating_data.get('votes', '')
-                    print(f"IMDB {rating_data['rating']} (scraped)", end='')
-            t['genre'] = clean_and_translate_genre(genre)
-            rdata = ratings.get(imdb_id)
-            if isinstance(rdata, dict):
-                t['imdb_rating'] = rdata['rating']
-                t['imdb_votes'] = rdata['votes']
-                print(f"IMDB {rdata['rating']}", end='')
-            elif not t.get('imdb_rating'):
-                print(f"ID {imdb_id} — нет рейтинга", end='')
-        if not has_real_poster(t) and t.get('kp_id'):
-            kp_local = download_kinopoisk_poster(t['kp_id'])
-            if kp_local:
-                t['poster_url'] = kp_local
-                print(f", KP постер ✓", end='')
-        if t.get('youtube_url'):
-            pass
-        elif yt_cache.get(cache_key):
-            cached_url = yt_cache[cache_key]
-            cached_ok = (
-                is_verified_world_youtube_trailer(SESSION, cached_url, eng_title, year)
-                if is_world_topic(t)
-                else True
-            )
-            if cached_ok:
-                t['youtube_url'] = cached_url
-            else:
-                yt_url = resolve_topic_trailer_url(t)
-                t['youtube_url'] = yt_url
-                yt_cache[cache_key] = yt_url
-                save_json(YOUTUBE_CACHE, yt_cache)
-                if yt_url:
-                    print(f", трейлер ✓", end='')
-                time.sleep(0.1)
-        else:
-            yt_url = resolve_topic_trailer_url(t)
-            t['youtube_url'] = yt_url
-            yt_cache[cache_key] = yt_url
-            save_json(YOUTUBE_CACHE, yt_cache)
-            if yt_url:
-                print(f", трейлер ✓", end='')
-            time.sleep(0.1)
-        print()
-    return topics
+    from enrich_service import enrich_topics
+
+    return enrich_topics(topics, ratings, basics)
 
 
 def fast_enrich_posters(topics):
@@ -3614,7 +3653,7 @@ function closePlayer(){{if(playerPoll){{clearInterval(playerPoll);playerPoll=nul
 function startStream(p, h) {{p.dataset.mode='stream';p.muted=true;p.src=streamUrl('stream',h);p.play().then(function(){{}}).catch(function(){{document.getElementById('player-status').textContent='Нажмите ▶ в плеере для запуска'}})}}
 function startTranscode(p, h) {{var s=document.getElementById('player-status');s.textContent='Перекодирование видео в MP4...';p.dataset.mode='aac';p.muted=true;p.src=streamUrl('transcode',h);p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска'}})}}
 function stalledText(d){{var elapsed=currentWatchStartedAt?Math.floor((Date.now()-currentWatchStartedAt)/1000):0;if(elapsed>=120&&!(d.downloaded||0))return'Торрент не грузится: за 2 минуты нет входящей загрузки. peers '+(d.num_peers||0);return ''}}
-function pollPlayer(h){{var s=document.getElementById('player-status'),p=document.getElementById('inline-player');if(playerPoll)clearInterval(playerPoll);playerPoll=setInterval(async function(){{try{{var r=await fetch('/status/'+h);if(!r.ok){{s.textContent='Ожидание добавления...';return}}var d=await r.json();var stalled=stalledText(d);if(stalled){{s.textContent=stalled;return}}if(d.state==='pending'){{s.textContent='Получаю метаданные... '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);return}}if(d.state==='checking_files'){{s.textContent='Проверяю уже скачанные данные... '+fmtBytes(d.total)+' · peers '+(d.num_peers||0);return}}var pct=Math.round((d.progress||0)*1000)/10;s.textContent=(d.ready?'Видео готово, запускаю...':'Буферизация...')+' '+pct+'% · '+fmtBytes(d.downloaded)+' / '+fmtBytes(d.total)+' · '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);if(d.ready){{clearInterval(playerPoll);playerPoll=null;if(d.format==='avi'){{startTranscode(p,h)}}else{{startStream(p,h)}}}}}}catch(_e){{s.textContent='Нет связи с сервером'}}}},1500)}}
+function pollPlayer(h){{var s=document.getElementById('player-status'),p=document.getElementById('inline-player');if(playerPoll)clearInterval(playerPoll);playerPoll=setInterval(async function(){{try{{var r=await fetch('/status/'+h);if(!r.ok){{s.textContent='Ожидание добавления...';return}}var d=await r.json();var stalled=stalledText(d);if(stalled){{s.textContent=stalled;return}}if(d.state==='pending'){{s.textContent='Получаю метаданные... '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);return}}if(d.state==='checking_files'){{s.textContent='Проверяю уже скачанные данные... '+fmtBytes(d.total)+' · peers '+(d.num_peers||0);return}}var pct=Math.round((d.progress||0)*1000)/10,total='Всего скачано '+pct+'% ('+fmtBytes(d.downloaded)+' / '+fmtBytes(d.total)+')',network=fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);if(d.ready){{s.textContent='Видео готово, запускаю... · '+total+' · '+network}}else if(d.transcode){{s.textContent='Подготовка всего файла · '+total+' · '+network}}else{{var required=d.required_buffer_bytes||d.min_buffer_bytes||d.start_buffer_bytes||0;s.textContent='Буфер начала '+fmtBytes(d.buffered_bytes||0)+' / '+fmtBytes(required)+' · '+total+' · '+network}}if(d.ready){{clearInterval(playerPoll);playerPoll=null;if(d.format==='avi'){{startTranscode(p,h)}}else{{startStream(p,h)}}}}}}catch(_e){{s.textContent='Нет связи с сервером'}}}},1500)}}
 async function startWatchMagnet(m,statusText,asyncOnly){{var h=hashFromMagnet(m),s=document.getElementById('player-status'),e=document.getElementById('player-error');if(!m)return '';if(!h){{window.open(m);return ''}}currentHash=h;currentSession=newSession(h);currentWatchStartedAt=Date.now();s.textContent=statusText||'Запускаю поток...';pollPlayer(h);try{{var payload={{magnet:m}};if(asyncOnly)payload.async_only=true;if(currentWatchMeta)payload.movie=currentWatchMeta;var r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});var d=await r.json().catch(function(){{return {{}}}});if(!r.ok||!d.info_hash){{e.textContent=d.error||'Не удалось добавить kino';return ''}}if(d.info_hash.toLowerCase()!==h){{h=d.info_hash;currentHash=h;currentSession=newSession(h);pollPlayer(h)}}s.textContent=d.async_mode?'Получаю метаданные...':'Буферизация...';return h}}catch(_err){{e.textContent='Ошибка соединения с сервером';return ''}}}}
 async function watch(el){{currentWatchMeta=watchMetaFromEl(el);var m=el.getAttribute('data-magnet'),container=(el.getAttribute('data-container')||'').toLowerCase(),replacement=findStreamReplacement(el);stopCurrentSession();var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';e.textContent='';if(replacement){{await startWatchMagnet(replacement.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false);return}}if(isSlowContainer(container)){{var originalHash=hashFromMagnet(m);var originalSid='';var started=await startWatchMagnet(m,'Запускаю подготовку файла, параллельно ищу быстрый способ онлайн-просмотра...',true);originalSid=currentSession;try{{var _sr=await fetch('/status/'+started);if(_sr.ok){{var _sd=await _sr.json();if(_sd.progress>=1.0){{s.textContent='Файл уже загружен, запускаю поток...';if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}startTranscode(p,started);return}}}}}}catch(_e){{}}findExternalStreamReplacement(el).then(async function(rep){{if(!rep){{if(currentHash===originalHash||currentHash===started)s.textContent='Быстрый онлайн-вариант не найден, продолжаю подготовку файла...';return}}if(currentHash!==originalHash&&currentHash!==started)return;var oldHash=currentHash,oldSid=currentSession||originalSid;s.textContent='Найден быстрый способ онлайн-просмотра, переключаю...';try{{await fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{sid:oldSid,hash:oldHash}})}})}}catch(_e){{}}currentHash='';currentSession='';await startWatchMagnet(rep.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false)}});return}}await startWatchMagnet(m,'Запускаю поток...',false)}}
 function ac(){{af()}}
@@ -3635,170 +3674,21 @@ async function enrich(el){{var tid=el.getAttribute('data-tid');if(!tid)return;el
 
 
 def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
-    """Enrich a single topic dict with missing data (poster, magnet, ratings, trailers)."""
-    if topic.get('_sanitized') or topic.get('imdb_id') == '0':
-        return topic
-    title = topic.get('orig_title') or topic['movie_title']
-    russian_title = topic['movie_title']
-    year = topic['movie_year']
-    raw_name = topic['title']
-    if not title:
-        return topic
-    kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    is_world = is_world_topic(topic)
-    retry_poster = (
-        force_poster_retry
-        or should_retry_poster(topic)
-        or should_try_external_poster_fallback(topic)
+    """Fill missing topic fields without replacing populated values."""
+    from enrich_service import enrich_topic as fill_missing_topic
+
+    return fill_missing_topic(
+        topic,
+        force_poster_retry=force_poster_retry,
+        include_trailer=include_trailer,
     )
 
-    if not has_real_poster(topic) and retry_poster:
-        localize_existing_poster(topic)
 
-    if not has_real_poster(topic):
-        resolve_existing_local_poster(topic)
+def repair_topic(topic, include_trailer=True):
+    """Explicitly verify and repair existing topic fields."""
+    from enrich_service import repair_topic as verify_and_repair_topic
 
-    if not topic.get('magnet') or topic.get('_magnet_failed'):
-        try:
-            html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
-            if html:
-                data = parse_topic_for_magnet(html)
-                if data.get('magnet'):
-                    topic['magnet'] = data['magnet']
-                    topic.pop('_magnet_failed', None)
-                    if data.get('poster') and not has_real_poster(topic) and retry_poster:
-                        set_local_poster_from_url(topic, data['poster'])
-                    if data.get('imdb') and not topic.get('imdb_id'):
-                        topic['imdb_id'] = data['imdb']
-                    if data.get('format') and not topic.get('format'):
-                        topic['format'] = data['format']
-        except Exception:
-            topic['_magnet_failed'] = True
-
-    if (not has_real_poster(topic) and retry_poster) or not topic.get('format'):
-        try:
-            html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
-            if html:
-                data = parse_topic_for_magnet(html)
-                if data.get('poster') and not has_real_poster(topic) and retry_poster:
-                    set_local_poster_from_url(topic, data['poster'])
-                if data.get('format') and not topic.get('format'):
-                    topic['format'] = data['format']
-        except Exception:
-            pass
-
-    _rutracker_fetch_failed = (
-        'rutracker.net' in topic.get('topic_url', '')
-        and topic.get('_magnet_failed')
-        and not has_real_poster(topic)
-    )
-
-    if is_world:
-        try:
-            html = get_topic_html(topic['topic_id'], topic['topic_url'], timeout=10)
-            if html:
-                imdb = parse_piratebay_detail(html)
-                if imdb:
-                    old_imdb = topic.get('imdb_id')
-                    topic['imdb_id'] = imdb
-                    if imdb != old_imdb:
-                        topic['poster_url'] = ''
-                        topic.pop('_poster_failed', None)
-                if topic.get('source') == 'piratebay' and not topic.get('format'):
-                    fmt = fetch_piratebay_format(topic['topic_id'], topic['topic_url'], timeout=10, metadata_timeout=20)
-                    if fmt:
-                        topic['format'] = fmt
-        except Exception:
-            pass
-
-    if not is_world:
-        search_topic_kinopoisk(topic, russian_title, year, kp_cache)
-        if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
-            local_url = download_kinopoisk_poster(topic['kp_id'])
-            if local_url:
-                topic['poster_url'] = local_url
-                clear_poster_failed(topic)
-
-    if not topic.get('imdb_id'):
-        result = search_imdb(title, year)
-        if result is None:
-            result = search_imdb_deep(raw_name)
-        if result:
-            if isinstance(result, str):
-                topic['imdb_id'] = result
-            else:
-                topic['imdb_id'] = result.get('id')
-                if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and result.get('poster'):
-                    local_url = download_poster(topic['imdb_id'], result['poster'])
-                    if local_url:
-                        topic['poster_url'] = local_url
-                        clear_poster_failed(topic)
-                topic['cast'] = result.get('cast', '')
-
-    imdb_id = topic.get('imdb_id')
-    if imdb_id:
-        needs_genre = not topic.get('genre') or is_listing_category_genre(topic.get('genre'))
-        if needs_genre:
-            bdata = load_basics({imdb_id}).get(imdb_id)
-            genre = bdata.get('genres', '') if isinstance(bdata, dict) else ''
-            if genre:
-                topic['genre'] = clean_and_translate_genre(genre)
-        if not topic.get('imdb_rating'):
-            rdata = load_ratings({imdb_id}).get(imdb_id)
-            if isinstance(rdata, dict):
-                topic['imdb_rating'] = rdata.get('rating')
-                topic['imdb_votes'] = rdata.get('votes', '')
-        if needs_genre or not topic.get('imdb_rating'):
-            rating_data = fetch_imdb_rating(imdb_id)
-            if needs_genre and rating_data.get('genres'):
-                topic['genre'] = clean_and_translate_genre(rating_data['genres'])
-            if not topic.get('imdb_rating') and rating_data.get('rating'):
-                topic['imdb_rating'] = rating_data['rating']
-                topic['imdb_votes'] = rating_data.get('votes', '')
-            if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and rating_data.get('poster'):
-                local_url = download_poster(imdb_id, rating_data['poster'])
-                if local_url:
-                    topic['poster_url'] = local_url
-                    clear_poster_failed(topic)
-
-    cache_key = f"{title}|{year}".lower()
-    if is_world:
-        search_topic_kinopoisk(topic, russian_title, year, kp_cache)
-
-    if not _rutracker_fetch_failed and not has_real_poster(topic) and retry_poster and topic.get('kp_id'):
-        local_url = download_kinopoisk_poster(topic['kp_id'])
-        if local_url:
-            topic['poster_url'] = local_url
-            clear_poster_failed(topic)
-
-    if is_world and not has_real_poster(topic) and retry_poster:
-        local_url = download_impawards_poster(topic)
-        if local_url:
-            topic['poster_url'] = local_url
-            clear_poster_failed(topic)
-
-    if not has_real_poster(topic) and retry_poster:
-        mark_poster_failed(topic)
-
-    if include_trailer and not topic.get('youtube_url'):
-        yt_cache = load_json(YOUTUBE_CACHE) or {}
-        cached_url = yt_cache.get(cache_key)
-        if cached_url and (
-            is_verified_world_youtube_trailer(SESSION, cached_url, title, year)
-            if is_world_topic(topic)
-            else _validate_youtube_url(cached_url, title, year)
-        ):
-            topic['youtube_url'] = cached_url
-        else:
-            if cached_url:
-                yt_cache[cache_key] = None
-                save_json(YOUTUBE_CACHE, yt_cache)
-            yt_url = resolve_topic_trailer_url(topic)
-            topic['youtube_url'] = yt_url
-            yt_cache[cache_key] = yt_url
-            save_json(YOUTUBE_CACHE, yt_cache)
-
-    return topic
+    return verify_and_repair_topic(topic, include_trailer=include_trailer)
 
 
 def load_hidden_topic_ids() -> set[str]:
@@ -3981,6 +3871,8 @@ def main():
     refresh = '--refresh' in sys.argv
     quick = '--quick' in sys.argv
     fast = '--fast' in sys.argv
+    repair_titles = '--repair-titles' in sys.argv
+    repair_formats = '--repair-formats' in sys.argv
     topics_limit = MAX_TOPICS
     collection_arg = None
     refresh_failed = False
@@ -4347,6 +4239,20 @@ def main():
         coll_order = {k: i for i, k in enumerate(COLLECTIONS.keys())}
         topics.sort(key=lambda t: (coll_order.get(t.get('collection', ''), 999), t.get('listing_order', 999)))
         save_json(TORRENTS_CACHE, topics)
+
+    if repair_formats:
+        print("\nВосстановление форматов видео...")
+        from enrich_service import enrich_collection_formats
+
+        enrich_collection_formats(
+            topics,
+            collection=collection_arg,
+            worker_count=WORKER_COUNT,
+        )
+
+    if repair_titles:
+        print("\nВосстановление пробелов в заголовках из кеша...")
+        repair_cached_rutracker_titles(topics)
 
     print("\nИсправление битых заголовков (весь кеш)...")
     fix_bad_topics(topics)

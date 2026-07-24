@@ -10,7 +10,6 @@ from bs4 import BeautifulSoup
 
 WORLD_SOURCES = {"piratebay", "tpbparty"}
 WORLD_COLLECTIONS = {"piratebay_top", "tpbparty_top"}
-WORLD_MAX_DISPLAY = 60
 
 
 def is_world_source(source):
@@ -518,7 +517,8 @@ def world_page_hash(html):
     return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def filter_world_top(topics, max_display=WORLD_MAX_DISPLAY):
+def filter_world_top(topics, max_display=None):
+    """Keep World collections sorted by seeders without limiting their size."""
     world = []
     other = []
     for t in topics:
@@ -531,10 +531,8 @@ def filter_world_top(topics, max_display=WORLD_MAX_DISPLAY):
         by_collection.setdefault(t.get("collection", ""), []).append(t)
     for coll in by_collection:
         by_collection[coll].sort(key=lambda x: -(x.get("seeders") or 0))
-        removed = len(by_collection[coll]) - max_display
-        if removed > 0:
-            print(f"  {coll}: обрезано {removed} тем (оставлено топ-{max_display} по сидам)")
-        by_collection[coll] = by_collection[coll][:max_display]
+        if max_display and max_display > 0:
+            by_collection[coll] = by_collection[coll][:max_display]
     result = other[:]
     for coll in by_collection:
         result.extend(by_collection[coll])

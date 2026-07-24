@@ -100,7 +100,8 @@ data/posters/placeholder.png
 
 ## Важные файлы
 
-- `generate_page.py` - парсинг rutracker, обогащение данных, генерация `index-kino.html`.
+- `generate_page.py` - парсинг источников и генерация `index-kino.html`.
+- `enrich_service.py` - заполнение отсутствующих атрибутов без изменения уже заполненных данных.
 - `stream_server.py` - Flask-сервер, каталог, browse-страницы, авто-refresh, housekeeping, стриминг.
 - `engine.py` - libtorrent-движок, выбор видеофайла, приоритеты кусков, readahead.
 - `player.html` - страница плеера.

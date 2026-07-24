@@ -28,6 +28,30 @@ from activity_collections import record_watched_magnet
 
 _LOG_FILE: TextIO | None = None
 INDEX_INJECT_VERSION = 'v11'
+_KINO_BANNER = (
+    '*   *  *****  *   *   ****',
+    '*  *     *    **  *  *    *',
+    '***      *    * * *  *    *',
+    '*  *     *    *  **  *    *',
+    '*   *  *****  *   *   ****',
+)
+_GALLERY_BANNER = (
+    ' ****    *    *      *      *****  *****  *   *',
+    '*       * *   *      *      *      *   *   * *',
+    '*  **  *****  *      *      ****   *****    *',
+    '*   *  *   *  *      *      *      *  *     *',
+    ' ****  *   *  *****  *****  *****  *   *    *',
+)
+_PROJECT_NAME_ROWS = [
+    f'{kino:<28}    {gallery}'
+    for kino, gallery in zip(_KINO_BANNER, _GALLERY_BANNER)
+]
+_PROJECT_BANNER_BORDER = '*' * max(len(row) for row in _PROJECT_NAME_ROWS)
+PROJECT_BANNER = '\n'.join(
+    [_PROJECT_BANNER_BORDER, _PROJECT_BANNER_BORDER, '']
+    + _PROJECT_NAME_ROWS
+    + ['', _PROJECT_BANNER_BORDER, _PROJECT_BANNER_BORDER]
+)
 
 
 class _TimestampedStream:
@@ -803,41 +827,41 @@ def _ensure_enrich_worker():
 
 def _topic_enrich_needs(topic):
     is_world = gp.is_world_topic(topic)
-    poster_due = (
-        not gp.has_real_poster(topic)
-        and (gp.should_retry_poster(topic) or gp.should_try_external_poster_fallback(topic))
-    )
+    poster_due = not gp.has_real_poster(topic)
     imdb_id = topic.get('imdb_id')
-    genre_due = bool(imdb_id) and (
-        not topic.get('genre') or gp.is_listing_category_genre(topic.get('genre'))
+    genre_due = bool(imdb_id) and not topic.get('genre')
+    id_due = not topic.get('imdb_id') if is_world else not topic.get('kp_id')
+    rating_due = (
+        not topic.get('imdb_rating')
+        if is_world
+        else not topic.get('kp_rating')
     )
-    rating_due = not topic.get('kp_rating') and not topic.get('imdb_rating')
     trailer_due = not topic.get('youtube_url')
-    kp_due = (
-        bool(topic.get('topic_id', '').startswith('pb_'))
-        and (
-            (bool(topic.get('kp_id')) and not topic.get('_kp_validated'))
-            or (not topic.get('kp_id') and topic.get('_kp_validated') and not topic.get('_kp_retried'))
-        )
+    format_due = not topic.get('format')
+    required_due = (
+        not topic.get('magnet')
+        or poster_due
+        or format_due
+        or trailer_due
     )
     core_due = (
         not topic.get('magnet')
-        or topic.get('_magnet_failed')
         or poster_due
+        or id_due
         or rating_due
         or genre_due
-        or kp_due
-        or (not is_world and not topic.get('format'))
+        or format_due
     )
     return {
         'poster': poster_due,
         'rating': rating_due,
         'genre': genre_due,
         'trailer': trailer_due,
-        'kp': kp_due,
+        'id': id_due,
         'core': core_due,
-        'any': core_due,
-        'format_missing': not topic.get('format'),
+        'any': core_due or trailer_due,
+        'required': required_due,
+        'format_missing': format_due,
     }
 
 
@@ -846,7 +870,7 @@ def _enrich_priority(topic, needs):
         0 if needs['poster'] else 1,
         0 if needs['rating'] else 1,
         0 if needs.get('genre') else 1,
-        0 if (not topic.get('magnet') or topic.get('_magnet_failed')) else 1,
+        0 if not topic.get('magnet') else 1,
         0 if not topic.get('format') else 1,
         int(topic.get('listing_order') or 999),
     )
@@ -865,12 +889,6 @@ _ENRICH_TRACKED_FIELDS = {
     'format': 'format',
     'youtube_url': 'trailer',
     'cast': 'cast',
-    '_kp_validated': 'KP validation',
-    '_kp_retried': 'KP retry mark',
-    '_poster_failed_at': 'poster retry delay',
-    '_poster_failed': 'poster failed',
-    '_magnet_failed': 'magnet failed',
-    '_enrich_no_change_at': 'no-change retry delay',
 }
 
 
@@ -902,6 +920,44 @@ def _describe_enrich_changes(before, topic):
     if cleared:
         parts.append('очищено: ' + ', '.join(cleared))
     return '; '.join(parts) if parts else 'без изменений'
+
+
+def _describe_missing_enrich_fields(topic, needs):
+    is_world = gp.is_world_topic(topic)
+    missing = []
+    if not topic.get('magnet'):
+        missing.append('magnet-ссылка')
+    if needs.get('poster'):
+        missing.append('постер')
+    if needs.get('id'):
+        missing.append('IMDB ID' if is_world else 'Кинопоиск ID')
+    if needs.get('rating'):
+        missing.append('IMDB рейтинг' if is_world else 'Кинопоиск рейтинг')
+    if needs.get('genre'):
+        missing.append('жанр')
+    if needs.get('format_missing'):
+        missing.append('формат видео')
+    if needs.get('trailer'):
+        missing.append('YouTube-трейлер')
+    return ', '.join(missing) or 'неизвестные обязательные поля'
+
+
+def _format_incomplete_enrich_result(topic, needs, changes):
+    missing = _describe_missing_enrich_fields(topic, needs)
+    if changes == 'без изменений':
+        if needs.get('required'):
+            detail = (
+                f'ничего не добавлено; повтор по текущему расписанию '
+                f'(не раньше чем через {ENRICH_RETRY_COOLDOWN_MINUTES} мин.)'
+            )
+        else:
+            detail = (
+                f'ничего не добавлено; повтор не раньше чем через '
+                f'{ENRICH_NO_CHANGE_RETRY_DAYS} дн.'
+            )
+    else:
+        detail = changes
+    return f'не найдены: {missing} ({detail})'
 
 
 def _enrich_no_change_cooldown_active(topic):
@@ -966,9 +1022,18 @@ def _enrich_missing(force: bool = False):
                     changed = True
                 continue
             retries = topic.get('_enrich_retries', 0)
-            if not force and retries >= MAX_ENRICH_RETRIES and needs['core']:
+            if (
+                not force
+                and retries >= MAX_ENRICH_RETRIES
+                and needs['any']
+                and not needs['required']
+            ):
                 continue
-            if not force and not needs.get('poster') and _enrich_no_change_cooldown_active(topic):
+            if (
+                not force
+                and not needs['required']
+                and _enrich_no_change_cooldown_active(topic)
+            ):
                 continue
             if not force and _enrich_retry_cooldown_active(topic):
                 continue
@@ -994,18 +1059,20 @@ def _enrich_missing(force: bool = False):
             gp.enrich_topic(topic, force_poster_retry=force, include_trailer=include_trailer)
             still = _topic_enrich_needs(topic)
             changes = _describe_enrich_changes(before, topic)
-            if still['core'] and changes == 'без изменений':
-                topic['_enrich_no_change_at'] = date.today().isoformat()
-                changes = _describe_enrich_changes(before, topic)
+            if still['any'] and changes == 'без изменений':
+                if still['required']:
+                    topic.pop('_enrich_no_change_at', None)
+                else:
+                    topic['_enrich_no_change_at'] = date.today().isoformat()
             elif changes != 'без изменений':
                 topic.pop('_enrich_no_change_at', None)
-                changes = _describe_enrich_changes(before, topic)
-            if not still['core']:
+            if not still['any']:
                 topic.pop('_enrich_retries', None)
                 topic.pop('_enrich_no_change_at', None)
                 topic.pop('_enrich_attempt_at', None)
                 return topic.get('topic_id'), title, f'OK ({changes})'
-            return topic.get('topic_id'), title, f'ещё не все данные ({changes})'
+            result = _format_incomplete_enrich_result(topic, still, changes)
+            return topic.get('topic_id'), title, result
 
         if tasks:
             with ThreadPoolExecutor(max_workers=min(WORKER_COUNT, len(tasks))) as executor:
@@ -3597,6 +3664,7 @@ document.getElementById('root').addEventListener('click',e=>{{const h=e.target.c
 
 if __name__ == '__main__':
     import webbrowser
+    print(PROJECT_BANNER)
     log_path = str(DATA_DIR / '..' / 'logs' / 'server.log')
     _install_timestamped_logs(log_file=log_path)
     print(f'Лог-файл: {os.path.realpath(log_path)}')
