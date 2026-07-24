@@ -6,7 +6,9 @@ import json
 import os
 import copy
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -758,6 +760,8 @@ def detect_format_from_text(text):
     text = (text or '').lower()
     if 'mkv' in text or 'matroska' in text:
         return 'MKV'
+    if 'mov' in text or 'quicktime' in text:
+        return 'MOV'
     if 'mp4' in text or 'mpeg-4' in text:
         return 'MP4'
     if 'avi' in text or 'xvid' in text or 'divx' in text:
@@ -2109,10 +2113,88 @@ _PB_CONTAINER_MAP = {
     'matroska': 'MKV',
     'mpeg-4': 'MP4',
     'mpeg4': 'MP4',
+    'mov': 'MOV',
+    'quicktime': 'MOV',
     'avi': 'AVI',
     'webm': 'WEBM',
     'mpeg': 'MPEG',
 }
+
+_VIDEO_EXT_FORMATS = [
+    ('.mkv', 'MKV'),
+    ('.mp4', 'MP4'),
+    ('.m4v', 'MP4'),
+    ('.avi', 'AVI'),
+    ('.mov', 'MOV'),
+    ('.webm', 'WEBM'),
+    ('.mpeg', 'MPEG'),
+    ('.mpg', 'MPEG'),
+]
+
+
+def _format_from_file_text(text):
+    value = str(text or '').lower()
+    for ext, fmt in _VIDEO_EXT_FORMATS:
+        if re.search(rf'{re.escape(ext)}(?:$|[\s<>"\'&?/#])', value):
+            return fmt
+    return ''
+
+
+def _piratebay_magnet_from_html(html):
+    soup = BeautifulSoup(html or '', 'html.parser')
+    link = soup.select_one('a[href^="magnet:?xt=urn:btih:"]')
+    return link.get('href', '') if link else ''
+
+
+def _format_from_magnet_metadata(magnet, timeout=20):
+    if not magnet or timeout <= 0:
+        return ''
+    try:
+        import libtorrent as lt
+    except Exception:
+        return ''
+
+    temp_root = os.path.join(DATA_DIR, 'temp')
+    os.makedirs(temp_root, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix='metadata_', dir=temp_root)
+    handle = None
+    session = None
+    try:
+        session = lt.session({'listen_interfaces': '0.0.0.0:0'})
+        for host in ('router.bittorrent.com', 'router.utorrent.com', 'dht.transmissionbt.com'):
+            try:
+                session.add_dht_router(host, 6881)
+            except Exception:
+                pass
+        params = lt.parse_magnet_uri(magnet)
+        params.save_path = temp_dir
+        handle = session.add_torrent(params)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = handle.status()
+            if status.has_metadata:
+                files = handle.torrent_file().files()
+                best = ('', 0)
+                for i in range(files.num_files()):
+                    path = files.file_path(i)
+                    fmt = _format_from_file_text(path)
+                    if not fmt:
+                        continue
+                    size = files.file_size(i)
+                    if size > best[1]:
+                        best = (fmt, size)
+                return best[0]
+            time.sleep(0.5)
+    except Exception:
+        return ''
+    finally:
+        try:
+            if session is not None and handle is not None:
+                session.remove_torrent(handle)
+        except Exception:
+            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return ''
 
 
 def parse_piratebay_format(html):
@@ -2137,12 +2219,14 @@ def parse_piratebay_format(html):
     return ''
 
 
-def fetch_piratebay_format(topic_id, topic_url, timeout=10):
+def fetch_piratebay_format(topic_id, topic_url, timeout=10, metadata_timeout=0):
+    magnet = ''
     html = get_topic_html(topic_id, topic_url, timeout=timeout)
     if html:
         fmt = parse_piratebay_format(html)
         if fmt:
             return fmt
+        magnet = _piratebay_magnet_from_html(html)
     m = re.search(r'/torrent/(\d+)', topic_url)
     if m:
         torrent_id = m.group(1)
@@ -2150,11 +2234,13 @@ def fetch_piratebay_format(topic_id, topic_url, timeout=10):
             r = SESSION.get(f'https://1.piratebays.to/ajax_details_filelist.php?id={torrent_id}', timeout=timeout)
             if r.status_code == 200:
                 for line in r.text.splitlines():
-                    for ext, fmt in [('.mkv', 'MKV'), ('.mp4', 'MP4'), ('.avi', 'AVI'), ('.webm', 'WEBM'), ('.mpeg', 'MPEG')]:
-                        if ext in line.lower():
-                            return fmt
+                    fmt = _format_from_file_text(line)
+                    if fmt:
+                        return fmt
         except Exception:
             pass
+    if metadata_timeout > 0:
+        return _format_from_magnet_metadata(magnet, timeout=metadata_timeout)
     return ''
 
 
@@ -2207,7 +2293,7 @@ def parse_topic_for_magnet(html):
             poster = poster_el.get('title', '')
     fmt = ''
     known = {'avi', 'mkv', 'matroska', 'mp4', 'mpeg-4', 'mpeg', 'mov', 'webm'}
-    known_map = {'AVI': 'AVI', 'Matroska': 'MKV', 'MKV': 'MKV', 'MP4': 'MP4', 'MPEG-4': 'MP4', 'MPEG': 'MP4', 'MOV': 'MP4', 'WEBM': 'WEBM'}
+    known_map = {'AVI': 'AVI', 'Matroska': 'MKV', 'MKV': 'MKV', 'MP4': 'MP4', 'MPEG-4': 'MP4', 'MPEG': 'MP4', 'MOV': 'MOV', 'WEBM': 'WEBM'}
     text = re.sub(r'<[^>]+>', '', html)
     fmt_token = r'(AVI|MKV|Matroska|MP4|MPEG-4|MPEG|MOV|WEBM)'
     m = re.search(r'Формат(?:\s*\([^)]*\)|\s+видео)?\s*[:：]\s*' + fmt_token, text, re.I)
@@ -2215,6 +2301,9 @@ def parse_topic_for_magnet(html):
         m = re.search(r'Format(?:\s+video)?\s*[:：]\s*' + fmt_token, text, re.I)
     if m:
         candidate = m.group(1).strip().rstrip(':').rstrip(',')
+        line_tail = text[m.start():m.end() + 80]
+        if re.search(r'\bMOV\b', line_tail, re.I):
+            candidate = 'MOV'
         if candidate.lower() in known:
             fmt = known_map.get(candidate, candidate)
     if not fmt:
@@ -2225,6 +2314,8 @@ def parse_topic_for_magnet(html):
             ck = re.search(r'(?:Формат|Format)(?:\s*\([^)]*\)|\s+(?:видео|video))?\s*[:：]\s*' + fmt_token, line, re.I)
             if ck:
                 cand = ck.group(1).rstrip(':').rstrip(',')
+                if re.search(r'\bMOV\b', line, re.I):
+                    cand = 'MOV'
                 if cand.lower() in known:
                     fmt = known_map.get(cand, cand)
                     break
@@ -3194,11 +3285,13 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         cont_text = f"{cont} {topic.get('title', '')}".lower()
         if 'mkv' in cont_text or 'matroska' in cont_text:
             format_values.add('mkv')
+        elif 'mov' in cont_text or 'quicktime' in cont_text:
+            format_values.add('mov')
         elif 'mp4' in cont_text:
             format_values.add('mp4')
         elif 'avi' in cont_text or 'xvid' in cont_text or 'divx' in cont_text:
             format_values.add('avi')
-    format_labels = {'mkv': 'MKV', 'mp4': 'MP4', 'avi': 'AVI'}
+    format_labels = {'mkv': 'MKV', 'mp4': 'MP4', 'mov': 'MOV', 'avi': 'AVI'}
     fmt_opts = ''.join(f'<option value="{f}">{format_labels.get(f, f.upper())}</option>' for f in sorted(format_values))
     sort_opts = '''<option value="lo">Серверная</option><option value="dh">Сначала новые</option><option value="dl">Сначала старые</option><option value="na">Название А-Я</option><option value="nz">Название Я-А</option><option value="rh">Рейтинг (выс.)</option><option value="rl">Рейтинг (низ.)</option>'''
     filter_bar = '''<div class="gf"><span class="gl">Коллекция:</span><select class="gs" onchange="rc()" id="cs"><option value="">Все</option>''' + coll_opts + '''</select>
@@ -3256,17 +3349,20 @@ def generate_html(topics, hidden_ids: set[str] | None = None):
         cont_text = f"{cont} {t.get('title', '')}".lower()
         if 'mkv' in cont_text or 'matroska' in cont_text:
             container = 'mkv'
+        elif 'mov' in cont_text or 'quicktime' in cont_text:
+            container = 'mov'
         elif 'mp4' in cont_text:
             container = 'mp4'
         elif 'avi' in cont_text or 'xvid' in cont_text or 'divx' in cont_text:
             container = 'avi'
         else:
             container = ''
-        fmt_html = f'<span class="tile-format">Формат: {escape(cont)}</span>' if cont else ''
+        fmt_class = f' fmt-{container}' if container else ''
+        fmt_html = f'<span class="tile-format{fmt_class}">Формат: {escape(cont)}</span>' if cont else ''
         poster_html = f'<div class="pc" data-yt="{escape(trailer_url)}" onclick="pt(this)"><img loading="lazy" decoding="async" data-src="{escape(poster)}" class="ps" alt=""><span class="pb">▶</span></div>'
         cast_html = f'<p class="ca">{escape(cast_str)}</p>' if cast_str else ''
         genre_html = f'<p class="gn">{escape(genre)}</p>' if genre else ''
-        fmt_row = f'<p class="ff">Формат: {escape(cont)}</p>' if cont else ''
+        fmt_row = f'<p class="ff{fmt_class}">Формат: {escape(cont)}</p>' if cont else ''
         esize = escape(t['size_str'])
         magnet = t.get('magnet', '')
         collection = escape(t.get('collection', 'nashe_kino'))
@@ -3385,6 +3481,8 @@ td{{padding:12px 16px;font-size:14px;vertical-align:middle}}
 .wb:hover{{background:#d63850}}
 button.wb[data-container="avi"]{{background:#2563eb}}
 button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
+button.wb[data-container="mov"]{{background:#2563eb}}
+button.wb[data-container="mov"]:hover{{background:#1d4ed8}}
 .eb{{display:inline-block;padding:2px 6px;font-size:12px;font-weight:700;color:#fff;background:#7c4dff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap;vertical-align:middle;line-height:1.4}}
 .eb:hover{{background:#651fff}}
 .eb:disabled{{opacity:.4;cursor:wait}}
@@ -3400,6 +3498,7 @@ button.wb[data-container="avi"]:hover{{background:#1d4ed8}}
 .tile-info{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px}}
 .tile-genre{{font-size:18px;color:#888}}
 .tile-format{{font-size:18px;color:#e67e22;font-weight:600}}
+.tile-format.fmt-avi,.tile-format.fmt-mov,.ff.fmt-avi,.ff.fmt-mov{{color:#60a5fa}}
 .tile-size{{font-size:18px;color:#999}}
 .tile-cast{{font-size:18px;color:#555;line-height:1.4;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .tile-actions{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px}}
@@ -3501,8 +3600,9 @@ var currentWatchMeta=null;
 function fmtBytes(b){{if(!b)return'0 B';var u=['B','KB','MB','GB','TB'],i=0,v=b;while(v>=1024&&i<u.length-1){{v/=1024;i++}}return v.toFixed(1)+' '+u[i]}}
 function hashFromMagnet(m){{var x=(m||'').match(/btih:([A-Fa-f0-9]{{40}})/i);return x?x[1].toLowerCase():''}}
 function isStreamContainer(c){{c=(c||'').toLowerCase();return c==='mkv'||c==='mp4'}}
+function isSlowContainer(c){{c=(c||'').toLowerCase();return c==='avi'||c==='mov'}}
 function watchMetaFromEl(el){{var host=el.closest('[data-tid]')||{{}};return {{topic_id:host.getAttribute?host.getAttribute('data-tid')||'':'',title:el.getAttribute('data-topic-title')||el.getAttribute('data-title')||'',movie_title:el.getAttribute('data-title')||'',movie_year:el.getAttribute('data-year')||'',collection:el.getAttribute('data-collection')||'',format:el.getAttribute('data-container')||'',size_bytes:parseInt(el.getAttribute('data-size-bytes')||'0',10)||0,seeders:parseInt(el.getAttribute('data-seeders')||'0',10)||0,magnet:el.getAttribute('data-magnet')||''}}}}
-function findStreamReplacement(el){{var src={{magnet:el.getAttribute('data-magnet')||'',title:el.getAttribute('data-title')||'',year:el.getAttribute('data-year')||'',container:(el.getAttribute('data-container')||'').toLowerCase(),collection:el.getAttribute('data-collection')||'',hash:hashFromMagnet(el.getAttribute('data-magnet')||'')}};if(src.container!=='avi'||!src.title)return null;var best=null,bestScore=-1;[].forEach.call(document.querySelectorAll('button.wb[data-magnet]'),function(b){{var m=b.getAttribute('data-magnet')||'',h=hashFromMagnet(m),c=(b.getAttribute('data-container')||'').toLowerCase(),title=b.getAttribute('data-title')||'',year=b.getAttribute('data-year')||'';if(!m||!h||h===src.hash||!isStreamContainer(c)||title!==src.title)return;if(src.year&&year!==src.year)return;var score=parseInt(b.getAttribute('data-seeders')||'0',10)||0;if(c==='mp4')score+=5;if(b.getAttribute('data-collection')===src.collection)score+=3;if(score>bestScore){{bestScore=score;best=b}}}});if(!best)return null;return {{magnet:best.getAttribute('data-magnet')||'',container:(best.getAttribute('data-container')||'').toUpperCase(),title:best.getAttribute('data-topic-title')||best.getAttribute('data-title')||'',seeders:parseInt(best.getAttribute('data-seeders')||'0',10)||0}}}}
+function findStreamReplacement(el){{var src={{magnet:el.getAttribute('data-magnet')||'',title:el.getAttribute('data-title')||'',year:el.getAttribute('data-year')||'',container:(el.getAttribute('data-container')||'').toLowerCase(),collection:el.getAttribute('data-collection')||'',hash:hashFromMagnet(el.getAttribute('data-magnet')||'')}};if(!isSlowContainer(src.container)||!src.title)return null;var best=null,bestScore=-1;[].forEach.call(document.querySelectorAll('button.wb[data-magnet]'),function(b){{var m=b.getAttribute('data-magnet')||'',h=hashFromMagnet(m),c=(b.getAttribute('data-container')||'').toLowerCase(),title=b.getAttribute('data-title')||'',year=b.getAttribute('data-year')||'';if(!m||!h||h===src.hash||!isStreamContainer(c)||title!==src.title)return;if(src.year&&year!==src.year)return;var score=parseInt(b.getAttribute('data-seeders')||'0',10)||0;if(c==='mp4')score+=5;if(b.getAttribute('data-collection')===src.collection)score+=3;if(score>bestScore){{bestScore=score;best=b}}}});if(!best)return null;return {{magnet:best.getAttribute('data-magnet')||'',container:(best.getAttribute('data-container')||'').toUpperCase(),title:best.getAttribute('data-topic-title')||best.getAttribute('data-title')||'',seeders:parseInt(best.getAttribute('data-seeders')||'0',10)||0}}}}
 async function findExternalStreamReplacement(el){{var payload={{title:el.getAttribute('data-title')||'',raw_title:el.getAttribute('data-topic-title')||'',year:el.getAttribute('data-year')||'',container:(el.getAttribute('data-container')||'').toLowerCase(),size_bytes:parseInt(el.getAttribute('data-size-bytes')||'0',10)||0,topic_id:(el.closest('[data-tid]')||{{}}).getAttribute?el.closest('[data-tid]').getAttribute('data-tid'):''}};try{{var ctl=window.AbortController?new AbortController():null,timer=ctl?setTimeout(function(){{ctl.abort()}},22000):null;var r=await fetch('/stream_replacement',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),signal:ctl?ctl.signal:undefined}});if(timer)clearTimeout(timer);if(!r.ok)return null;var d=await r.json().catch(function(){{return {{}}}});return d.found&&d.replacement&&d.replacement.magnet?d.replacement:null}}catch(_e){{return null}}}}
 function newSession(h){{return h+'-'+Date.now()+'-'+Math.random().toString(36).slice(2)}}
 function streamUrl(kind,h){{var sid=encodeURIComponent(currentSession||'');return '/'+kind+'/'+h+(sid?'?sid='+sid:'')}}
@@ -3512,11 +3612,11 @@ function playPlayer(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}var p
 function useAacAudio(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}if(!currentHash)return;var p=document.getElementById('inline-player'),s=document.getElementById('player-status'),b=document.getElementById('aac-button');if(p.dataset.mode==='aac')return;p.dataset.mode='aac';p.pause();p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.src=streamUrl('transcode',currentHash);if(b)b.textContent='AAC включён';s.textContent='Запускаю совместимый AAC-звук...';p.play().catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска AAC-звука'}})}}
 function closePlayer(){{if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}var p=document.getElementById('inline-player');p.pause();p.removeAttribute('src');p.load();stopCurrentSession();document.getElementById('player-overlay').classList.add('hidden')}}
 function startStream(p, h) {{p.dataset.mode='stream';p.muted=true;p.src=streamUrl('stream',h);p.play().then(function(){{}}).catch(function(){{document.getElementById('player-status').textContent='Нажмите ▶ в плеере для запуска'}})}}
-function startTranscode(p, h) {{var s=document.getElementById('player-status');s.textContent='Перекодирование AVI в MP4...';p.dataset.mode='aac';p.muted=true;p.src=streamUrl('transcode',h);p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска'}})}}
+function startTranscode(p, h) {{var s=document.getElementById('player-status');s.textContent='Перекодирование видео в MP4...';p.dataset.mode='aac';p.muted=true;p.src=streamUrl('transcode',h);p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска'}})}}
 function stalledText(d){{var elapsed=currentWatchStartedAt?Math.floor((Date.now()-currentWatchStartedAt)/1000):0;if(elapsed>=120&&!(d.downloaded||0))return'Торрент не грузится: за 2 минуты нет входящей загрузки. peers '+(d.num_peers||0);return ''}}
 function pollPlayer(h){{var s=document.getElementById('player-status'),p=document.getElementById('inline-player');if(playerPoll)clearInterval(playerPoll);playerPoll=setInterval(async function(){{try{{var r=await fetch('/status/'+h);if(!r.ok){{s.textContent='Ожидание добавления...';return}}var d=await r.json();var stalled=stalledText(d);if(stalled){{s.textContent=stalled;return}}if(d.state==='pending'){{s.textContent='Получаю метаданные... '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);return}}if(d.state==='checking_files'){{s.textContent='Проверяю уже скачанные данные... '+fmtBytes(d.total)+' · peers '+(d.num_peers||0);return}}var pct=Math.round((d.progress||0)*1000)/10;s.textContent=(d.ready?'Видео готово, запускаю...':'Буферизация...')+' '+pct+'% · '+fmtBytes(d.downloaded)+' / '+fmtBytes(d.total)+' · '+fmtBytes(d.download_rate)+'/с · peers '+(d.num_peers||0);if(d.ready){{clearInterval(playerPoll);playerPoll=null;if(d.format==='avi'){{startTranscode(p,h)}}else{{startStream(p,h)}}}}}}catch(_e){{s.textContent='Нет связи с сервером'}}}},1500)}}
 async function startWatchMagnet(m,statusText,asyncOnly){{var h=hashFromMagnet(m),s=document.getElementById('player-status'),e=document.getElementById('player-error');if(!m)return '';if(!h){{window.open(m);return ''}}currentHash=h;currentSession=newSession(h);currentWatchStartedAt=Date.now();s.textContent=statusText||'Запускаю поток...';pollPlayer(h);try{{var payload={{magnet:m}};if(asyncOnly)payload.async_only=true;if(currentWatchMeta)payload.movie=currentWatchMeta;var r=await fetch('/watch_sync',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});var d=await r.json().catch(function(){{return {{}}}});if(!r.ok||!d.info_hash){{e.textContent=d.error||'Не удалось добавить kino';return ''}}if(d.info_hash.toLowerCase()!==h){{h=d.info_hash;currentHash=h;currentSession=newSession(h);pollPlayer(h)}}s.textContent=d.async_mode?'Получаю метаданные...':'Буферизация...';return h}}catch(_err){{e.textContent='Ошибка соединения с сервером';return ''}}}}
-async function watch(el){{currentWatchMeta=watchMetaFromEl(el);var m=el.getAttribute('data-magnet'),container=(el.getAttribute('data-container')||'').toLowerCase(),replacement=findStreamReplacement(el);stopCurrentSession();var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';e.textContent='';if(replacement){{await startWatchMagnet(replacement.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false);return}}if(container==='avi'){{var originalHash=hashFromMagnet(m);var originalSid='';var started=await startWatchMagnet(m,'Запускаю подготовку файла, параллельно ищу быстрый способ онлайн-просмотра...',true);originalSid=currentSession;try{{var _sr=await fetch('/status/'+started);if(_sr.ok){{var _sd=await _sr.json();if(_sd.progress>=1.0){{s.textContent='Файл уже загружен, запускаю поток...';if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}startTranscode(p,started);return}}}}}}catch(_e){{}}findExternalStreamReplacement(el).then(async function(rep){{if(!rep){{if(currentHash===originalHash||currentHash===started)s.textContent='Быстрый онлайн-вариант не найден, продолжаю подготовку файла...';return}}if(currentHash!==originalHash&&currentHash!==started)return;var oldHash=currentHash,oldSid=currentSession||originalSid;s.textContent='Найден быстрый способ онлайн-просмотра, переключаю...';try{{await fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{sid:oldSid,hash:oldHash}})}})}}catch(_e){{}}currentHash='';currentSession='';await startWatchMagnet(rep.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false)}});return}}await startWatchMagnet(m,'Запускаю поток...',false)}}
+async function watch(el){{currentWatchMeta=watchMetaFromEl(el);var m=el.getAttribute('data-magnet'),container=(el.getAttribute('data-container')||'').toLowerCase(),replacement=findStreamReplacement(el);stopCurrentSession();var o=document.getElementById('player-overlay'),p=document.getElementById('inline-player'),s=document.getElementById('player-status'),e=document.getElementById('player-error'),b=document.getElementById('sound-button'),ab=document.getElementById('aac-button');o.classList.remove('hidden');p.dataset.mode='stream';if(b)b.textContent='Звук';if(ab)ab.textContent='AAC-звук';e.textContent='';if(replacement){{await startWatchMagnet(replacement.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false);return}}if(isSlowContainer(container)){{var originalHash=hashFromMagnet(m);var originalSid='';var started=await startWatchMagnet(m,'Запускаю подготовку файла, параллельно ищу быстрый способ онлайн-просмотра...',true);originalSid=currentSession;try{{var _sr=await fetch('/status/'+started);if(_sr.ok){{var _sd=await _sr.json();if(_sd.progress>=1.0){{s.textContent='Файл уже загружен, запускаю поток...';if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}startTranscode(p,started);return}}}}}}catch(_e){{}}findExternalStreamReplacement(el).then(async function(rep){{if(!rep){{if(currentHash===originalHash||currentHash===started)s.textContent='Быстрый онлайн-вариант не найден, продолжаю подготовку файла...';return}}if(currentHash!==originalHash&&currentHash!==started)return;var oldHash=currentHash,oldSid=currentSession||originalSid;s.textContent='Найден быстрый способ онлайн-просмотра, переключаю...';try{{await fetch('/stop_session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{sid:oldSid,hash:oldHash}})}})}}catch(_e){{}}currentHash='';currentSession='';await startWatchMagnet(rep.magnet,'Найден быстрый способ онлайн-просмотра, запускаю...',false)}});return}}await startWatchMagnet(m,'Запускаю поток...',false)}}
 function ac(){{af()}}
 function af(){{var d=document.getElementById('ds').value,g=document.getElementById('gs').value,c=document.getElementById('cs').value,s=document.getElementById('ss').value,f=document.getElementById('fs').value,h=JSON.parse(localStorage.getItem('ph')||'[]');localStorage.setItem('dv',d);localStorage.setItem('cv',c);localStorage.setItem('sv',s);localStorage.setItem('fv',f);var n=Date.now()/1000,cut=d>0?n-d*86400:0;
 [].forEach.call(document.querySelectorAll('#tbl tbody tr,.tile-card'),function(r){{var show=true,dt=parseFloat(r.getAttribute('data-date')||'0'),rg=(r.getAttribute('data-genre')||'').toLowerCase(),t=r.getAttribute('data-title')||'',ct=(r.getAttribute('data-container')||'').toLowerCase();if(c&&r.getAttribute('data-collection')!==c)show=false;if(show&&f&&ct!==f)show=false;if(show&&cut&&dt<cut)show=false;if(show&&g&&rg.indexOf(g)===-1)show=false;if(show&&(sx.test(rg)||sx.test(t)))show=false;if(show&&h.indexOf(t)!==-1)show=false;r.style.display=show?'':'none'}});
@@ -3605,7 +3705,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
                         topic['poster_url'] = ''
                         topic.pop('_poster_failed', None)
                 if topic.get('source') == 'piratebay' and not topic.get('format'):
-                    fmt = fetch_piratebay_format(topic['topic_id'], topic['topic_url'], timeout=10)
+                    fmt = fetch_piratebay_format(topic['topic_id'], topic['topic_url'], timeout=10, metadata_timeout=20)
                     if fmt:
                         topic['format'] = fmt
         except Exception:

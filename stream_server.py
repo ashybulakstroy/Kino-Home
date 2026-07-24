@@ -2259,7 +2259,7 @@ h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
 .back{position:fixed;top:15px;right:20px;z-index:100;background:rgba(0,0,0,.7);color:#fff;border:1px solid #555;padding:6px 14px;border-radius:4px;font-size:13px;cursor:pointer}
 .back:hover{background:#e50914;border-color:#e50914}
 .avi-badge{position:absolute;right:4px;bottom:4px;min-width:18%;height:clamp(18px,12%,34px);padding:0 5px;display:flex;align-items:center;justify-content:center;background:#000;border:1px solid rgba(255,255,255,.65);border-radius:4px;font-size:clamp(9px,.8vw,14px);font-weight:800;letter-spacing:.4px;pointer-events:none;z-index:5;line-height:1;text-transform:uppercase;box-shadow:0 2px 8px rgba(0,0,0,.55)}
-.avi-badge.fmt-mp4{color:#ff4d4d;border-color:#ff4d4d}
+.avi-badge.fmt-mp4{color:#ff4d4d;border-color:#ff4d4d}.avi-badge.fmt-mov{color:#60a5fa;border-color:#60a5fa}
 .avi-badge.fmt-mkv{color:#4da3ff;border-color:#4da3ff}
 .avi-badge.fmt-avi{color:#60a5fa;border-color:#60a5fa}
 .avi-badge.fmt-webm{color:#46d369;border-color:#46d369}
@@ -2277,7 +2277,7 @@ h2{font-size:18px;font-weight:600;padding:10px 30px;color:#ccc}
 .tile-info{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
 .rb{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none;background:#f5c518;color:#111}
 .tile-genre,.tile-format,.tile-size,.tile-imdb{font-size:14px;color:#666;text-decoration:none}
-.tile-format{color:#e67e22;font-weight:600}
+.tile-format{color:#e67e22;font-weight:600}.tile-format.fmt-avi,.tile-format.fmt-mov{color:#60a5fa}
 .tile-cast{font-size:14px;color:#555;line-height:1.4;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tile-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .tile-actions a,.tile-actions button{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:700;text-decoration:none;border:0;cursor:pointer}
@@ -2378,7 +2378,8 @@ function kgOpenMovieCard(m){
   const ratingLabel=m.kp_rating?'KP':(m.imdb_rating?'IMDB':'');
   const ratingHtml=rating?'<span class="rb">'+kgEsc(ratingLabel+' '+rating)+'</span>':'';
   const genre=m.genre?'<span class="tile-genre">'+kgEsc(m.genre)+'</span>':'';
-  const fmt=m.format?'<span class="tile-format">Формат: '+kgEsc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
+  const fmtClass=String(m.format||'').toLowerCase();
+  const fmt=m.format?'<span class="tile-format fmt-'+kgEsc(fmtClass)+'">Формат: '+kgEsc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
   const size=kgSizeText(m)?'<span class="tile-size">'+kgEsc(kgSizeText(m))+'</span>':'<span class="tile-empty">размер ?</span>';
   const cast=m.cast?'<div class="tile-cast">'+kgEsc(m.cast).slice(0,120)+'</div>':'';
   const trailer=kgTrailerUrl(m);
@@ -2507,7 +2508,7 @@ def browse_carousel():
 .tile-info{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}}
 .rb{{display:inline-block;padding:2px 8px;font-size:11px;font-weight:700;border-radius:4px;white-space:nowrap;text-decoration:none;background:#f5c518;color:#111}}
 .tile-genre,.tile-format,.tile-size,.tile-imdb{{font-size:14px;color:#666;text-decoration:none}}
-.tile-format{{color:#e67e22;font-weight:600}}
+.tile-format{{color:#e67e22;font-weight:600}}.tile-format.fmt-avi,.tile-format.fmt-mov{{color:#60a5fa}}
 .tile-cast{{font-size:14px;color:#555;line-height:1.4;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .tile-actions{{display:flex;gap:6px;align-items:center;flex-wrap:wrap}}
 .tile-actions a,.tile-actions button{{display:inline-block;padding:5px 10px;border-radius:4px;font-size:12px;font-weight:700;text-decoration:none;border:0;cursor:pointer}}
@@ -2536,7 +2537,8 @@ function openCard(m){{
   const ratingLabel=m.kp_rating?'KP':(m.imdb_rating?'IMDB':'');
   const ratingHtml=rating?'<span class="rb">'+esc(ratingLabel+' '+rating)+'</span>':'';
   const genre=m.genre?'<span class="tile-genre">'+esc(m.genre)+'</span>':'';
-  const fmt=m.format?'<span class="tile-format">Формат: '+esc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
+  const fmtClass=String(m.format||'').toLowerCase();
+  const fmt=m.format?'<span class="tile-format fmt-'+esc(fmtClass)+'">Формат: '+esc(String(m.format).toUpperCase())+'</span>':'<span class="tile-empty">формат ?</span>';
   const size=sizeText(m)?'<span class="tile-size">'+esc(sizeText(m))+'</span>':'<span class="tile-empty">размер ?</span>';
   const cast=m.cast?'<div class="tile-cast">'+esc(m.cast).slice(0,120)+'</div>':'';
   const trailer=trailerUrl(m);
@@ -2609,7 +2611,7 @@ body{{background:#000;display:flex;align-items:center;justify-content:center}}
  <script>
 const MOVIES = {movies_json};
 function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 let idx = Math.floor(Math.random()*MOVIES.length);
 function show(i){{
 const m=MOVIES[i];if(!m)return;
@@ -2679,7 +2681,7 @@ body{{display:flex;padding:0}}
  <script>
 const MOVIES = {movies_json};
 function posterUrl(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function filter(){{
 const selGenres=new Set([...document.querySelectorAll('.fg:checked')].map(c=>c.value));
 const yrFrom=document.getElementById('yrFrom').value;
@@ -2842,7 +2844,7 @@ body{{background:#000;overflow:hidden;margin:0;cursor:none;font-family:system-ui
  <script>
 const MOVIES = {movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 let idx=Math.floor(Math.random()*MOVIES.length),paused=false,speed=5,timer=0,animating=false;
 const FRAME=106; // width+gap (100+6)
 const HALF=12;
@@ -2997,7 +2999,7 @@ h1{{font-size:22px;margin-bottom:20px;color:#888}}
 const MOVIES={movies_json};
 let i=Math.floor(Math.random()*MOVIES.length),score=0;
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function pick(n){{return MOVIES[(i+n)%MOVIES.length]}}
 function show(){{
 const a=pick(0),b=pick(1+Math.floor(Math.random()*(MOVIES.length-2)));
@@ -3046,7 +3048,7 @@ body{{background:#0a0a0a;color:#fff;font-family:system-ui,sans-serif;overflow-y:
 <script>
 const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function sc(){{
 const a=[...MOVIES];
 for(let i=a.length-1;i>0;i--){{const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
@@ -3159,7 +3161,7 @@ const maxG=Math.max(...Object.values(GENRES));
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function card(m){{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 document.getElementById('genre-bars').innerHTML=Object.entries(GENRES).map(([g,n],i)=>'<div class="bar" data-genre="'+esc(g)+'"><span class="bar-label">'+esc(g)+'</span><div class="bar-fill" style="width:'+(n/maxG*100)+'%;background:'+COLORS[i%COLORS.length]+'"></div><span class="bar-val">'+n+'</span></div>').join('');
 const maxC=Math.max(...COLLS.map(x=>x.count));
@@ -3241,7 +3243,7 @@ const MOVIES={movies_json};
 function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:m.poster_url?'/data/'+m.poster_url:'/data/posters/placeholder.png'}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function card(m){{const h=hash(m);return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+h+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 function render(q){{
 const ql=q.toLowerCase().trim();
@@ -3417,7 +3419,7 @@ const CHUNK=80;
 let token=0;
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function pu(m){{const p=m.poster_url||''; if(!p)return '/data/posters/placeholder.png'; return p.indexOf('data/')===0?'/'+p:p;}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function norm(s){{return String(s||'').toLowerCase().trim()}}
 function initFilters(){{
   const cols=[...new Map(ITEMS.map(x=>[x.collection,x.collection_label||x.collection])).entries()].filter(x=>x[0]).sort((a,b)=>a[1].localeCompare(b[1]));
@@ -3508,7 +3510,7 @@ function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:
 function rt(m){{return Math.max(parseFloat(m.kp_rating)||0,parseFloat(m.imdb_rating)||0)}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 document.getElementById('grid').innerHTML=MOVIES.map((m,i)=>{{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<span class="rank">'+(i+1)+'</span><span class="badge">★ '+(rt(m)||0).toFixed(1)+'</span><div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}).join('');
 document.getElementById('grid').addEventListener('click',e=>{{const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
 </script>{_browse_movie_modal_script()}</body></html>'''
@@ -3586,7 +3588,7 @@ function pu(m){{return (m.poster_url||'').indexOf('data/')===0?'/'+m.poster_url:
 function label(k){{return LABELS[k]||k}}
 function esc(s){{return String(s||'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function hash(m){{const x=(m.magnet||'').match(/btih:([A-Fa-f0-9]+)/);return x?x[1].toLowerCase():''}}
-function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
+function fmtBadge(m){{const f=(m.format||'').toUpperCase();if(!f)return '';const c=['MP4','MOV','MKV','AVI','WEBM'].includes(f)?f.toLowerCase():'other';return '<span class="avi-badge fmt-'+c+'">'+f+'</span>'}}
 function card(m){{return '<div class="card" data-tid="'+esc(m.topic_id||'')+'" data-hash="'+hash(m)+'" style="background-image:url('+pu(m)+')">'+fmtBadge(m)+'<div class="info">'+esc(m.movie_title||m.orig_title||'')+'<br>'+esc(m.movie_year||'')+'</div></div>'}}
 document.getElementById('root').innerHTML=Object.entries(GROUPS).map(([key,items],gi)=>'<div class="section"><h2><span class="arrow'+(gi===0?' open':'')+'">&#9660;</span>'+esc(label(key))+' <span class="cnt">('+items.length+')</span></h2><div class="grid"'+(gi>0?' style="display:none"':'')+'>'+items.map(card).join('')+'</div></div>').join('');
 document.getElementById('root').addEventListener('click',e=>{{const h=e.target.closest('h2');if(h){{const g=h.nextElementSibling;g.style.display=g.style.display==='none'?'':'none';h.querySelector('.arrow').classList.toggle('open');return}}const c=e.target.closest('.card[data-tid]');if(c)kgOpenMovieCardById(c.dataset.tid)}});
