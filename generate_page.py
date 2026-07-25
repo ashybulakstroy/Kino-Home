@@ -35,6 +35,7 @@ from world_sources import (
     world_topic_id,
 )
 from activity_collections import ACTIVITY_COLLECTIONS
+from trailer_fallback import search_topic_trailer_fallback
 
 COLLECTIONS = {
     'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22',     'age_cleanup': True,  'skip_topics': 2},
@@ -1702,8 +1703,24 @@ def resolve_topic_trailer_url(topic):
             yt_cache[cache_key] = yt_url
             save_json(YOUTUBE_CACHE, yt_cache)
             return yt_url
-        return None
-    return resolve_trailer_url(title, year, topic.get('kp_id'), topic.get('imdb_id'))
+    else:
+        trailer_url = resolve_trailer_url(
+            title,
+            year,
+            topic.get('kp_id'),
+            topic.get('imdb_id'),
+        )
+        if trailer_url:
+            return trailer_url
+
+    fallback_url = search_topic_trailer_fallback(SESSION, topic)
+    if fallback_url:
+        topic['_trailer_source'] = 'youtube-fallback'
+        print(
+            f"    [trailer-fallback] #{topic.get('topic_id')} "
+            f"{topic.get('movie_title') or title} -> {fallback_url}"
+        )
+    return fallback_url
 
 
 def download_poster(imdb_id, url):
