@@ -945,19 +945,33 @@ def _describe_missing_enrich_fields(topic, needs):
 def _format_incomplete_enrich_result(topic, needs, changes):
     missing = _describe_missing_enrich_fields(topic, needs)
     if changes == 'без изменений':
-        if needs.get('required'):
-            detail = (
-                f'ничего не добавлено; повтор по текущему расписанию '
-                f'(не раньше чем через {ENRICH_RETRY_COOLDOWN_MINUTES} мин.)'
-            )
-        else:
-            detail = (
-                f'ничего не добавлено; повтор не раньше чем через '
-                f'{ENRICH_NO_CHANGE_RETRY_DAYS} дн.'
-            )
-    else:
-        detail = changes
-    return f'не найдены: {missing} ({detail})'
+        return f'FAILURE (не найдены: {missing})'
+    return f'PARTIAL ({changes}; не найдены: {missing})'
+
+
+def _enrich_completeness(topics, hidden_ids):
+    visible_topics = [
+        topic for topic in topics
+        if not topic.get('_sanitized')
+        and str(topic.get('topic_id', '')) not in hidden_ids
+    ]
+    if not visible_topics:
+        return 100.0
+
+    complete_fields = 0
+    fields_per_topic = 7
+    for topic in visible_topics:
+        is_world = gp.is_world_topic(topic)
+        complete_fields += sum((
+            bool(topic.get('magnet')),
+            gp.has_real_poster(topic),
+            bool(topic.get('format')),
+            bool(topic.get('youtube_url')),
+            bool(topic.get('genre')),
+            bool(topic.get('imdb_id') if is_world else topic.get('kp_id')),
+            bool(topic.get('imdb_rating') if is_world else topic.get('kp_rating')),
+        ))
+    return complete_fields * 100.0 / (len(visible_topics) * fields_per_topic)
 
 
 def _enrich_no_change_cooldown_active(topic):
@@ -1009,6 +1023,8 @@ def _enrich_missing(force: bool = False):
 
         tasks = []
         hidden_ids = gp.load_hidden_topic_ids()
+        completeness_before = _enrich_completeness(topics, hidden_ids)
+        print(f'  [enrich] полнота атрибутов до: {completeness_before:.1f}%')
         for idx, topic in enumerate(topics):
             if topic.get('_sanitized') or str(topic.get('topic_id', '')) in hidden_ids:
                 if topic.get('_enrich_retries'):
@@ -1085,9 +1101,16 @@ def _enrich_missing(force: bool = False):
                         failed_topic = topics[future_map[future][1]]
                         topic_id = failed_topic.get('topic_id')
                         title = topic_log_title(failed_topic)
-                        result = f'ошибка: {e}'
+                        result = f'FAILURE (ошибка: {e})'
                     print(f'    [enrich] #{topic_id} {title} -> {result}')
 
+        completeness_after = _enrich_completeness(topics, hidden_ids)
+        completeness_delta = completeness_after - completeness_before
+        print(
+            f'  [enrich] полнота атрибутов: '
+            f'{completeness_before:.1f}% -> {completeness_after:.1f}% '
+            f'(дельта {completeness_delta:+.1f} п.п.)'
+        )
         if changed:
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)

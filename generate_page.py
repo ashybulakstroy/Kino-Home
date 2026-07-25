@@ -35,6 +35,7 @@ from world_sources import (
     world_topic_id,
 )
 from activity_collections import ACTIVITY_COLLECTIONS
+from kinopoisk_fallback import find_kinopoisk_id_fallback
 from trailer_fallback import search_topic_trailer_fallback
 
 COLLECTIONS = {
@@ -1224,12 +1225,35 @@ def find_kinopoisk_for_topic(topic, title, year, kp_cache=None):
 
     if kp_cache is None:
         kp_cache = load_json(KP_SEARCH_CACHE) or {}
-    if cache_key in kp_cache:
-        return kp_cache[cache_key]
+    result = kp_cache.get(cache_key)
+    if cache_key not in kp_cache:
+        result = search_kinopoisk(title, year)
+        kp_cache[cache_key] = result
+        save_json(KP_SEARCH_CACHE, kp_cache)
+    if result:
+        return result
 
-    result = search_kinopoisk(title, year)
+    fallback = find_kinopoisk_id_fallback(SESSION, topic, title, year)
+    if not fallback:
+        return None
+    kp_id = fallback['kp_id']
+    result = fetch_kinopoisk_by_id(kp_id, title, year, verify=False) or {
+        'kp_id': kp_id,
+        'kp_rating': '',
+        'kp_votes': '',
+    }
+    result = dict(result)
+    result['kp_id'] = kp_id
+    result['_fallback_source'] = fallback.get('source')
+    result['_wikidata_id'] = fallback.get('wikidata_id')
+    topic['_kp_source'] = fallback.get('source')
     kp_cache[cache_key] = result
     save_json(KP_SEARCH_CACHE, kp_cache)
+    print(
+        f"    [kp-fallback] #{topic.get('topic_id')} "
+        f"{topic.get('movie_title') or title} -> KP {kp_id} "
+        f"({fallback.get('source')})"
+    )
     return result
 
 
