@@ -1,6 +1,6 @@
 import unittest
 
-from trailer_fallback import score_candidate, topic_title_variants
+from enrich_service import score_trailer_candidate, trailer_title_variants
 
 
 class TrailerFallbackTests(unittest.TestCase):
@@ -12,7 +12,7 @@ class TrailerFallbackTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            topic_title_variants(topic),
+            trailer_title_variants(topic),
             [
                 "Невидимый бой",
                 "Nähtamatuvõitlus",
@@ -22,7 +22,7 @@ class TrailerFallbackTests(unittest.TestCase):
         )
 
     def test_accepts_matching_trailer_without_year(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {
                 "title": "The Invisible Fight | Official Trailer",
                 "channel": "North Sky Film",
@@ -34,7 +34,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertGreaterEqual(score, 85)
 
     def test_accepts_matching_teaser(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {"title": "18 килогерц - Тизер 1080p", "channel": "Что в кино"},
             ["18 килогерц", "18 kHz"],
             2020,
@@ -43,7 +43,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertGreaterEqual(score, 85)
 
     def test_rejects_wrong_movie_with_same_year(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {
                 "title": "Arrival Trailer (2016) - Paramount Pictures",
                 "channel": "Paramount Pictures",
@@ -55,7 +55,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertEqual(score, 0)
 
     def test_rejects_review(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {"title": "Районы (2016) обзор фильма", "channel": "Movie Blog"},
             ["Районы", "Rayony"],
             2016,
@@ -64,7 +64,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertEqual(score, 0)
 
     def test_rejects_ambiguous_one_word_title_without_year(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {
                 "title": "СТАРТРЕК: БЕСКОНЕЧНОСТЬ | Трейлер #3",
                 "channel": "Paramount Pictures",
@@ -76,7 +76,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertEqual(score, 0)
 
     def test_rejects_game_with_matching_title_and_year(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {
                 "title": "MARVEL ГЕРОИ ОМЕГА / PS4 - ТРЕЙЛЕР 2017",
                 "channel": "PlayStation",
@@ -88,7 +88,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertEqual(score, 0)
 
     def test_accepts_one_word_title_with_exact_year(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {
                 "title": "Владивосток — Трейлер - Фильм 2021",
                 "channel": "Киноафиша",
@@ -100,7 +100,7 @@ class TrailerFallbackTests(unittest.TestCase):
         self.assertGreaterEqual(score, 85)
 
     def test_accepts_exact_one_word_title_from_trusted_channel(self):
-        score = score_candidate(
+        score = score_trailer_candidate(
             {"title": "Зере - Трейлер", "channel": "что в кино"},
             ["Зере", "Zere"],
             2021,

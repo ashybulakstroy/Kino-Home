@@ -35,8 +35,10 @@ from world_sources import (
     world_topic_id,
 )
 from activity_collections import ACTIVITY_COLLECTIONS
-from kinopoisk_fallback import find_kinopoisk_id_fallback
-from trailer_fallback import search_topic_trailer_fallback
+from enrich_service import (
+    find_kinopoisk_id_fallback,
+    search_topic_trailer_fallback,
+)
 
 COLLECTIONS = {
     'nashe_kino':          {'name': 'Наше кино',                       'url': 'https://rutracker.net/forum/viewforum.php?f=22',     'age_cleanup': True,  'skip_topics': 2},
@@ -1421,6 +1423,14 @@ def _score_youtube_candidate(candidate, title, year):
     old_overlap_boosted = max(old_overlap, translit_boost * 0.5)
     unified_tokens = wanted_tokens | wanted_translit_tokens
     jaccard = len(unified_tokens & cand_tokens) / max(len(unified_tokens | cand_tokens), 1)
+    title_matches = (
+        old_overlap > 0
+        or translit_boost > 0
+        or (wanted and wanted in cand_title)
+        or (wanted_translit and wanted_translit in cand_title)
+    )
+    if not title_matches:
+        return 0
     blended_overlap = 0.7 * old_overlap_boosted + 0.3 * jaccard
     score = 0
     if wanted and (wanted in cand_title or (wanted_translit and wanted_translit in cand_title)):
@@ -1672,30 +1682,66 @@ def _validate_youtube_url(url, title, year):
     return None
 
 
+def invalidate_trailer_cache_for_topic(topic, trailer_url):
+    """Remove a rejected trailer from caches associated with this topic."""
+    if not trailer_url:
+        return 0
+    removed = 0
+    cache_keys = (
+        (KP_TRAILER_CACHE, str(topic.get('kp_id') or '')),
+        (IMDB_TRAILER_CACHE, str(topic.get('imdb_id') or '')),
+        (
+            YOUTUBE_CACHE,
+            f"{topic.get('orig_title') or topic.get('movie_title') or ''}|"
+            f"{topic.get('movie_year') or ''}".lower(),
+        ),
+    )
+    for cache_path, key in cache_keys:
+        if not key or key == '0':
+            continue
+        cache = load_json(cache_path) or {}
+        if cache.get(key) != trailer_url:
+            continue
+        cache.pop(key, None)
+        save_json(cache_path, cache)
+        removed += 1
+    return removed
+
+
 def resolve_trailer_url(title, year, kp_id=None, imdb_id=None):
     if kp_id and str(kp_id) != '0':
         kp_cache = load_json(KP_TRAILER_CACHE) or {}
         kp_key = str(kp_id)
         kp_url = kp_cache.get(kp_key)
+        if kp_url and _validate_youtube_url(kp_url, title, year):
+            return kp_url
+        if kp_url:
+            kp_cache.pop(kp_key, None)
+            save_json(KP_TRAILER_CACHE, kp_cache)
+            kp_url = None
         if not kp_url:
             kp_url = search_kinopoisk_trailer(kp_id)
-            if kp_url:
+            if kp_url and _validate_youtube_url(kp_url, title, year):
                 kp_cache[kp_key] = kp_url
                 save_json(KP_TRAILER_CACHE, kp_cache)
-        if kp_url:
-            return kp_url
+                return kp_url
 
     if imdb_id and str(imdb_id) != '0':
         imdb_cache = load_json(IMDB_TRAILER_CACHE) or {}
         imdb_key = str(imdb_id)
         imdb_url = imdb_cache.get(imdb_key)
+        if imdb_url and _validate_youtube_url(imdb_url, title, year):
+            return imdb_url
+        if imdb_url:
+            imdb_cache.pop(imdb_key, None)
+            save_json(IMDB_TRAILER_CACHE, imdb_cache)
+            imdb_url = None
         if not imdb_url:
             imdb_url = search_imdb_trailer(imdb_id)
-            if imdb_url:
+            if imdb_url and _validate_youtube_url(imdb_url, title, year):
                 imdb_cache[imdb_key] = imdb_url
                 save_json(IMDB_TRAILER_CACHE, imdb_cache)
-        if imdb_url:
-            return imdb_url
+                return imdb_url
 
     if kp_id and str(kp_id) != '0':
         kp_yt_url = search_youtube_by_kp_id(kp_id, title, year)
@@ -2762,6 +2808,18 @@ def repair_world_titles(topics):
     return topics
 
 
+def _score_topic_youtube_candidate(topic, candidate):
+    titles = {
+        str(topic.get('movie_title') or '').strip(),
+        str(topic.get('orig_title') or '').strip(),
+    }
+    titles.discard('')
+    return max(
+        (_score_youtube_candidate(candidate, title, topic.get('movie_year', '')) for title in titles),
+        default=0,
+    )
+
+
 def recheck_trailers(topics):
     """
     Generator that scores all youtube_urls, stores yt_score, replaces weak ones.
@@ -2797,7 +2855,7 @@ def recheck_trailers(topics):
                     'video_id': yt.split('v=')[-1].split('&')[0],
                     'length': '2:00',
                 }
-                score = _score_youtube_candidate(cand, title, year)
+                score = _score_topic_youtube_candidate(t, cand)
             else:
                 score = 0
         except Exception:
@@ -2837,17 +2895,24 @@ def recheck_trailers(topics):
         year = t.get('movie_year', '')
         tid = t['topic_id']
         new_yt = None
+        replacement_source = ''
         kp = t.get('kp_id')
         im = t.get('imdb_id')
+        invalidated = invalidate_trailer_cache_for_topic(t, yt)
+        if invalidated:
+            yield f'  [{tid}] удалено ошибочных записей кеша: {invalidated}'
         if kp and ('kp', str(kp)) in peer_url:
             new_yt = peer_url[('kp', str(kp))]
+            replacement_source = 'peer-kp'
             yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (kp={kp})'
         elif im and ('im', str(im)) in peer_url:
             new_yt = peer_url[('im', str(im))]
+            replacement_source = 'peer-imdb'
             yield f'  [{tid}] {title} ({year}) score {score} -> reused from peer (imdb={im})'
         if not new_yt:
             try:
                 new_yt = resolve_topic_trailer_url(t)
+                replacement_source = t.get('_trailer_source') or 'daily-recheck'
             except Exception:
                 new_yt = None
         if new_yt:
@@ -2855,6 +2920,8 @@ def recheck_trailers(topics):
                 if is_verified_world_youtube_trailer(SESSION, new_yt, title, year):
                     t['youtube_url'] = new_yt
                     t['yt_score'] = 100
+                    t['_trailer_source'] = replacement_source
+                    t['_trailer_checked_at'] = datetime.now().isoformat(timespec='seconds')
                     replaced_weak += 1
                     yield f'  [{tid}] {title} ({year}) score {score} -> 100: {new_yt}'
                     continue
@@ -2871,10 +2938,12 @@ def recheck_trailers(topics):
                         'video_id': new_yt.split('v=')[-1].split('&')[0],
                         'length': '2:00',
                     }
-                    new_score = _score_youtube_candidate(cand, title, year)
+                    new_score = _score_topic_youtube_candidate(t, cand)
                     if new_score >= 50:
                         t['youtube_url'] = new_yt
                         t['yt_score'] = new_score
+                        t['_trailer_source'] = replacement_source
+                        t['_trailer_checked_at'] = datetime.now().isoformat(timespec='seconds')
                         replaced_weak += 1
                         yield f'  [{tid}] {title} ({year}) score {score} -> {new_score}: {new_yt}'
                         continue
@@ -3658,7 +3727,7 @@ document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});doc
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
 function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss'),f=document.getElementById('fs');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value);if(f)localStorage.setItem('fv',f.value)}}
-function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r=';return}}function reloadFresh(){{window.location.href='/?r='}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running'&&n<3)setTimeout(function(){{poll(n+1)}},1500)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
+function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r=';return}}function reloadFresh(){{window.location.href='/?r='}}function finish(d){{if(d.status==='done'&&d.changed)reloadFresh()}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running'&&n<150)setTimeout(function(){{poll(n+1)}},2000)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
 function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}

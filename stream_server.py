@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import atexit
 import urllib.parse
+import filecmp
 import html as html_lib
 from pathlib import Path
 from typing import TextIO
@@ -385,18 +386,94 @@ def _copy_existing_refresh_data(staging_dir):
             shutil.copytree(src, staging_dir / name, dirs_exist_ok=True)
 
 
-def _publish_staging_refresh(staging_dir):
+def _publish_staging_refresh(staging_dir, skip_files=None, skip_dirs=None):
+    skip_files = set(skip_files or ())
+    skip_dirs = set(skip_dirs or ())
     for name in REFRESH_DIRS:
+        if name in skip_dirs:
+            continue
         src = staging_dir / name
         dst = DATA_DIR / name
         if src.exists():
             shutil.copytree(src, dst, dirs_exist_ok=True)
     for name in REFRESH_FILES:
+        if name in skip_files:
+            continue
         src = staging_dir / name
         dst = DATA_DIR / name
         if src.exists():
             with file_lock(dst):
                 os.replace(src, dst)
+
+
+def _files_have_same_content(left: Path, right: Path) -> bool:
+    if not left.exists() or not right.exists():
+        return left.exists() == right.exists()
+    try:
+        return filecmp.cmp(left, right, shallow=False)
+    except OSError:
+        return False
+
+
+def _json_files_equal(left: Path, right: Path) -> bool:
+    if not left.exists() or not right.exists():
+        return left.exists() == right.exists()
+    try:
+        return json.loads(left.read_text('utf-8')) == json.loads(right.read_text('utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return _files_have_same_content(left, right)
+
+
+def _directories_have_same_content(left: Path, right: Path) -> bool:
+    if not left.exists() or not right.exists():
+        return left.exists() == right.exists()
+    left_files = {
+        path.relative_to(left): path
+        for path in left.rglob('*')
+        if path.is_file()
+    }
+    right_files = {
+        path.relative_to(right): path
+        for path in right.rglob('*')
+        if path.is_file()
+    }
+    if left_files.keys() != right_files.keys():
+        return False
+    for name in left_files:
+        try:
+            left_stat = left_files[name].stat()
+            right_stat = right_files[name].stat()
+        except OSError:
+            return False
+        if left_stat.st_size != right_stat.st_size:
+            return False
+        if left_stat.st_mtime_ns == right_stat.st_mtime_ns:
+            continue
+        if not _files_have_same_content(left_files[name], right_files[name]):
+            return False
+    return True
+
+
+def _light_refresh_catalog_changed(staging_dir: Path) -> bool:
+    comparisons = (
+        _json_files_equal(
+            DATA_DIR / 'torrents_data.json',
+            staging_dir / 'torrents_data.json',
+        ),
+        _json_files_equal(
+            DATA_DIR / 'hidden_topics.json',
+            staging_dir / 'hidden_topics.json',
+        ),
+        _files_have_same_content(
+            DATA_DIR / 'index-kino.html',
+            staging_dir / 'index-kino.html',
+        ),
+        _directories_have_same_content(
+            DATA_DIR / 'posters',
+            staging_dir / 'posters',
+        ),
+    )
+    return not all(comparisons)
 
 
 def _run_refresh_process(collection=None, fast=False):
@@ -498,17 +575,29 @@ def _run_light_refresh_collection(collection: str):
         code = proc.wait()
         elapsed = _format_duration(time.monotonic() - started_at)
         if code == 0:
-            _publish_staging_refresh(REFRESH_STAGING_DIR)
+            changed = _light_refresh_catalog_changed(REFRESH_STAGING_DIR)
+            skip_files = set()
+            skip_dirs = set()
+            if not changed:
+                skip_files = {'torrents_data.json', 'hidden_topics.json', 'index-kino.html'}
+                skip_dirs = {'posters'}
+            _publish_staging_refresh(
+                REFRESH_STAGING_DIR,
+                skip_files=skip_files,
+                skip_dirs=skip_dirs,
+            )
             with _light_refresh_status_lock:
                 _light_refresh_status[collection] = {
                     'status': 'done',
+                    'changed': changed,
                     'collection': collection,
                     'label': label,
                     'duration': elapsed,
                     'finished_at': datetime.now().isoformat(timespec='seconds'),
                     'last_success_monotonic': time.monotonic(),
                 }
-            print(f'Light refresh: {collection} готово за {elapsed}')
+            result_label = 'каталог обновлён' if changed else 'изменений нет'
+            print(f'Light refresh: {collection} готово за {elapsed}, {result_label}')
         else:
             with _light_refresh_status_lock:
                 _light_refresh_status[collection] = {
@@ -1023,8 +1112,6 @@ def _enrich_missing(force: bool = False):
 
         tasks = []
         hidden_ids = gp.load_hidden_topic_ids()
-        completeness_before = _enrich_completeness(topics, hidden_ids)
-        print(f'  [enrich] полнота атрибутов до: {completeness_before:.1f}%')
         for idx, topic in enumerate(topics):
             if topic.get('_sanitized') or str(topic.get('topic_id', '')) in hidden_ids:
                 if topic.get('_enrich_retries'):
@@ -1056,8 +1143,18 @@ def _enrich_missing(force: bool = False):
             tasks.append((_enrich_priority(topic, needs), idx, needs, retries))
 
         tasks.sort(key=lambda item: item[0])
-        if tasks:
-            print(f'  [enrich] задач: {len(tasks)}, воркеров: {WORKER_COUNT}')
+        if not tasks:
+            if changed:
+                with file_lock(data_path):
+                    atomic_write_json_unlocked(data_path, topics)
+                    gen_path = DATA_DIR / 'index-kino.html'
+                    atomic_write_text_unlocked(gen_path, _generate_display_html(topics))
+            print('  [enrich] SKIP: очередь пуста')
+            return
+
+        completeness_before = _enrich_completeness(topics, hidden_ids)
+        print(f'  [enrich] полнота атрибутов до: {completeness_before:.1f}%')
+        print(f'  [enrich] задач: {len(tasks)}, воркеров: {WORKER_COUNT}')
 
         def topic_log_title(topic):
             title = topic.get('movie_title') or topic.get('title') or '?'
@@ -1159,7 +1256,7 @@ def _sync_listing_order(cache_only: bool = False):
 
 
 def _periodic_enrich():
-    print(f'Автообогащение запущено, интервал {ENRICH_INTERVAL_MINUTES} мин')
+    print(f'Планировщик автообогащения запущен, проверка каждые {ENRICH_INTERVAL_MINUTES} мин')
     while True:
         if _daily_refresh_lock.locked():
             print('  [enrich] пропуск: refresh выполняется')
@@ -1195,47 +1292,75 @@ def _run_daily_world_trailer_recheck_if_due(reason: str = 'timer'):
     if _read_stamp_date(WORLD_TRAILER_RECHECK_STAMP) == _today_stamp():
         return
     if _daily_refresh_lock.locked():
-        print('World трейлеры: пропуск, refresh выполняется')
+        print('Трейлеры World + Новинки 2026: SKIP, refresh выполняется')
         return
     if not _world_trailer_recheck_lock.acquire(blocking=False):
-        print('World трейлеры: проверка уже выполняется')
+        print('Трейлеры World + Новинки 2026: проверка уже выполняется')
         return
+    enrich_lock_acquired = False
     started_at = time.monotonic()
     data_path = DATA_DIR / 'torrents_data.json'
     try:
+        enrich_lock_acquired = _background_enrich_lock.acquire(blocking=False)
+        if not enrich_lock_acquired:
+            print('Трейлеры World + Новинки 2026: SKIP, enrich выполняется')
+            return
         if not data_path.exists():
             return
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
         hidden = gp.load_hidden_topic_ids()
-        world_ids = {
+        audit_ids = {
             str(t.get('topic_id'))
             for t in topics
-            if gp.is_world_topic(t)
+            if (gp.is_world_topic(t) or t.get('collection') == 'novinki_2026')
             and not t.get('_sanitized')
             and str(t.get('topic_id', '')) not in hidden
         }
-        if not world_ids:
+        if not audit_ids:
             _write_stamp_date(WORLD_TRAILER_RECHECK_STAMP)
-            print('World трейлеры: нет видимых тем для проверки')
+            print('Трейлеры World + Новинки 2026: нет видимых тем для проверки')
             return
-        world_topics = [t for t in topics if str(t.get('topic_id')) in world_ids]
-        print(f'World трейлеры: ежедневная проверка ({reason}), тем: {len(world_topics)}')
-        changed = False
-        before = {str(t.get('topic_id')): t.get('youtube_url') for t in world_topics}
-        for line in gp.recheck_trailers(world_topics):
+        audit_topics = [t for t in topics if str(t.get('topic_id')) in audit_ids]
+        print(f'Трейлеры World + Новинки 2026: ежедневная проверка ({reason}), тем: {len(audit_topics)}')
+        before = {
+            str(t.get('topic_id')): (
+                t.get('youtube_url'),
+                t.get('_trailer_source'),
+                t.get('_trailer_checked_at'),
+            )
+            for t in audit_topics
+        }
+        for line in gp.recheck_trailers(audit_topics):
             print(f'  [trailers] {line}')
-        after = {str(t.get('topic_id')): t.get('youtube_url') for t in world_topics}
+        after = {
+            str(t.get('topic_id')): (
+                t.get('youtube_url'),
+                t.get('_trailer_source'),
+                t.get('_trailer_checked_at'),
+            )
+            for t in audit_topics
+        }
         changed = before != after
         if changed:
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
                 atomic_write_text_unlocked(DATA_DIR / 'index-kino.html', _generate_display_html(topics))
         _write_stamp_date(WORLD_TRAILER_RECHECK_STAMP)
-        print(f'World трейлеры: готово за {_format_duration(time.monotonic() - started_at)}, изменено: {sum(1 for k in before if before.get(k) != after.get(k))}')
+        changed_urls = sum(
+            1 for key in before
+            if before.get(key, (None,))[0] != after.get(key, (None,))[0]
+        )
+        print(
+            f'Трейлеры World + Новинки 2026: '
+            f'готово за {_format_duration(time.monotonic() - started_at)}, '
+            f'заменено: {changed_urls}'
+        )
     except Exception as e:
-        print(f'World трейлеры: ошибка за {_format_duration(time.monotonic() - started_at)}: {e}')
+        print(f'Трейлеры World + Новинки 2026: ошибка за {_format_duration(time.monotonic() - started_at)}: {e}')
     finally:
+        if enrich_lock_acquired:
+            _background_enrich_lock.release()
         _world_trailer_recheck_lock.release()
 
 
@@ -2076,7 +2201,7 @@ def index():
         ".then(function(r){return r.json()}).then(function(d){"
         "if(d.status==='running')poll(0);else done()}).catch(done)}"
     )
-    light_collection_reload = (
+    current_light_collection_reload = (
         "function rc(){sf();localStorage.removeItem('gv');"
         "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
         "var c=document.getElementById('cs'),v=c?c.value:'';"
@@ -2092,8 +2217,27 @@ def index():
         "if(d.status==='done')reloadFresh();else if(d.status==='running')poll(0)"
         "}).catch(function(){})}"
     )
+    light_collection_reload = (
+        "function rc(){sf();localStorage.removeItem('gv');"
+        "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
+        "var c=document.getElementById('cs'),v=c?c.value:'';"
+        "if(!v){window.location.href='/?r=';return}"
+        "function reloadFresh(){window.location.href='/?r='}"
+        "function finish(d){if(d.status==='done'&&d.changed)reloadFresh()}"
+        "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='done')finish(d);"
+        "else if(d.status==='running'&&n<150)setTimeout(function(){poll(n+1)},2000)"
+        "}).catch(function(){})}"
+        "fetch('/refresh_light?collection='+encodeURIComponent(v),{method:'POST'})"
+        ".then(function(r){return r.json()}).then(function(d){"
+        "if(d.status==='done')finish(d);else if(d.status==='running')poll(0)"
+        "}).catch(function(){})}"
+    )
     if old_blocking_light_reload in html:
         html = html.replace(old_blocking_light_reload, light_collection_reload, 1)
+    elif current_light_collection_reload in html:
+        html = html.replace(current_light_collection_reload, light_collection_reload, 1)
     else:
         html = html.replace(old_collection_reload, light_collection_reload, 1)
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'

@@ -1,11 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from kinopoisk_fallback import (
+from enrich_service import (
     find_kinopoisk_id_fallback,
-    score_title_candidate,
-    select_title_candidate,
-    topic_title_variants,
+    kinopoisk_title_variants,
+    score_kinopoisk_title_candidate,
+    select_kinopoisk_title_candidate,
 )
 
 
@@ -18,7 +18,7 @@ class KinopoiskFallbackTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            topic_title_variants(topic),
+            kinopoisk_title_variants(topic),
             [
                 "Невидимый бой",
                 "Nähtamatuvõitlus",
@@ -35,7 +35,11 @@ class KinopoiskFallbackTests(unittest.TestCase):
         }
 
         self.assertGreaterEqual(
-            score_title_candidate("Временные трудности", 2018, candidate),
+            score_kinopoisk_title_candidate(
+                "Временные трудности",
+                2018,
+                candidate,
+            ),
             90,
         )
 
@@ -47,7 +51,11 @@ class KinopoiskFallbackTests(unittest.TestCase):
         }
 
         self.assertGreaterEqual(
-            score_title_candidate("Таинственная стена", 1968, candidate),
+            score_kinopoisk_title_candidate(
+                "Таинственная стена",
+                1968,
+                candidate,
+            ),
             90,
         )
 
@@ -59,7 +67,11 @@ class KinopoiskFallbackTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            score_title_candidate("Семейное счастье", 1970, candidate),
+            score_kinopoisk_title_candidate(
+                "Семейное счастье",
+                1970,
+                candidate,
+            ),
             0,
         )
 
@@ -70,7 +82,10 @@ class KinopoiskFallbackTests(unittest.TestCase):
             "kp_id": "1",
         }
 
-        self.assertEqual(score_title_candidate("Комбат", 2021, candidate), 0)
+        self.assertEqual(
+            score_kinopoisk_title_candidate("Комбат", 2021, candidate),
+            0,
+        )
 
     def test_rejects_ambiguous_candidates(self):
         candidates = [
@@ -78,10 +93,15 @@ class KinopoiskFallbackTests(unittest.TestCase):
             {"label": "Кукла", "years": [2026], "kp_id": "200"},
         ]
 
-        self.assertIsNone(select_title_candidate(["Кукла"], 2026, candidates))
+        self.assertIsNone(
+            select_kinopoisk_title_candidate(["Кукла"], 2026, candidates)
+        )
 
-    @patch("kinopoisk_fallback._lookup_by_title")
-    @patch("kinopoisk_fallback._lookup_by_imdb", return_value=(True, None))
+    @patch("enrich_service._kinopoisk_lookup_by_title")
+    @patch(
+        "enrich_service._kinopoisk_lookup_by_imdb",
+        return_value=(True, None),
+    )
     def test_does_not_use_title_fallback_when_imdb_is_known(
         self,
         _imdb_lookup,

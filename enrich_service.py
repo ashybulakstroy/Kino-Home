@@ -6,8 +6,18 @@ existing values belongs to the explicit repair path.
 
 from __future__ import annotations
 
+import json
+import re
+import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from html import unescape
+
+from config import DATA_DIR, ENRICH_NO_CHANGE_RETRY_DAYS
+from project_io import atomic_write_json
 
 
 def _backend():
@@ -408,3 +418,594 @@ def repair_topic(topic, include_trailer=True):
     if title:
         gp.search_topic_kinopoisk(topic, russian_title, year)
     return enrich_topic(topic, force_poster_retry=True, include_trailer=include_trailer)
+
+
+# Trailer fallback
+
+TRAILER_POSITIVE_WORDS = ("trailer", "трейлер", "teaser", "тизер")
+TRAILER_NEGATIVE_WORDS = (
+    "review", "reaction", "explained", "ending", "soundtrack", "song",
+    "clip", "scene", "interview", "behind the scenes", "gameplay",
+    "season", "series", "episode", "ps4", "ps5", "xbox", "nintendo",
+    "обзор", "реакция", "разбор", "концовка", "саундтрек", "песня",
+    "клип", "сцена", "интервью", "со съемок", "серия", "эпизод",
+    "сезон", "сериал", "игра",
+)
+TRAILER_TRUSTED_CHANNEL_WORDS = (
+    "kinopoisk", "кинопоиск", "netflix", "disney", "warner",
+    "paramount", "universal", "sony", "film festival", "киноафиша",
+    "трейлеры", "что в кино", "arrow video",
+)
+
+_TRAILER_CYRILLIC_TO_LATIN = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
+    "е": "e", "ё": "yo", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def _trailer_json_text(value):
+    if not value:
+        return ""
+    try:
+        return unescape(json.loads(f'"{value}"'))
+    except Exception:
+        return unescape(value)
+
+
+def _trailer_compact(value):
+    value = unescape(str(value or "")).lower().replace("ё", "е")
+    value = value.replace("khz", "kilohertz").replace("кгц", "килогерц")
+    value = re.sub(r"[^a-zа-я0-9]+", " ", value, flags=re.I)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _trailer_latin(value):
+    return _trailer_compact(value).translate(_TRAILER_CYRILLIC_TO_LATIN)
+
+
+def _trailer_identity_tokens(value):
+    ignored = {
+        "official", "trailer", "teaser", "movie", "film", "hd", "russkiy",
+        "ofitsialnyy", "treyler", "tizer", "kino", "subtitry",
+    }
+    return {
+        token for token in _trailer_latin(value).split()
+        if token not in ignored and not re.fullmatch(r"(?:19|20)\d{2}", token)
+        and len(token) >= 2
+    }
+
+
+def trailer_title_variants(topic):
+    """Return distinct parsed names without changing persisted topic titles."""
+    values = [topic.get("movie_title"), topic.get("orig_title")]
+    raw = str(topic.get("title") or "")
+    title_part = raw.split("(", 1)[0].split("[", 1)[0]
+    values.extend(part.strip() for part in title_part.split("/"))
+
+    result = []
+    seen = set()
+    for value in values:
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ._-")
+        key = _trailer_compact(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result[:5]
+
+
+def _trailer_youtube_candidates(html):
+    candidates = []
+    seen = set()
+    for match in re.finditer(r'"videoId":"([a-zA-Z0-9_-]{11})"', html or ""):
+        video_id = match.group(1)
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        chunk = html[match.start():match.start() + 3500]
+        title_match = re.search(r'"title":\{"runs":\[\{"text":"(.*?)"', chunk)
+        if not title_match:
+            title_match = re.search(r'"title":\{"simpleText":"(.*?)"', chunk)
+        if not title_match:
+            continue
+        channel_match = re.search(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', chunk)
+        candidates.append({
+            "video_id": video_id,
+            "title": _trailer_json_text(title_match.group(1)),
+            "channel": (
+                _trailer_json_text(channel_match.group(1))
+                if channel_match else ""
+            ),
+        })
+        if len(candidates) >= 20:
+            break
+    return candidates
+
+
+def score_trailer_candidate(candidate, title_variants, year):
+    """Score identity and trailer intent; return zero for unsafe matches."""
+    candidate_title = _trailer_compact(candidate.get("title"))
+    candidate_latin = _trailer_latin(candidate_title)
+    channel = _trailer_compact(candidate.get("channel"))
+    if (
+        not candidate_title
+        or any(word in candidate_title for word in TRAILER_NEGATIVE_WORDS)
+    ):
+        return 0
+    if not any(word in candidate_title for word in TRAILER_POSITIVE_WORDS):
+        return 0
+
+    candidate_tokens = _trailer_identity_tokens(candidate_title)
+    best_identity = 0
+    best_variant_tokens = set()
+    for variant in title_variants:
+        variant_latin = _trailer_latin(variant)
+        variant_tokens = _trailer_identity_tokens(variant)
+        if not variant_latin or not variant_tokens:
+            continue
+        score = 0
+        if variant_latin in candidate_latin:
+            score += 60
+        overlap = len(variant_tokens & candidate_tokens) / max(
+            len(variant_tokens),
+            1,
+        )
+        score += int(overlap * 45)
+        score += int(
+            SequenceMatcher(None, variant_latin, candidate_latin).ratio() * 20
+        )
+        if score > best_identity:
+            best_identity = score
+            best_variant_tokens = variant_tokens
+
+    if best_identity < 45:
+        return 0
+
+    candidate_years = {
+        int(value)
+        for value in re.findall(
+            r"(?<!\d)(?:19|20)\d{2}(?!\d)",
+            candidate_title,
+        )
+    }
+    try:
+        wanted_year = int(year or 0)
+    except (TypeError, ValueError):
+        wanted_year = 0
+
+    year_distance = None
+    if wanted_year and candidate_years:
+        year_distance = min(abs(value - wanted_year) for value in candidate_years)
+        if year_distance > 1:
+            return 0
+
+    trusted_channel = any(
+        word in channel for word in TRAILER_TRUSTED_CHANNEL_WORDS
+    )
+    if len(best_variant_tokens) == 1:
+        extra_tokens = candidate_tokens - best_variant_tokens
+        exact_year_match = year_distance == 0 and len(extra_tokens) <= 1
+        trusted_exact_match = (
+            not candidate_years and not extra_tokens and trusted_channel
+        )
+        if not exact_year_match and not trusted_exact_match:
+            return 0
+
+    score = best_identity
+    if "trailer" in candidate_title or "трейлер" in candidate_title:
+        score += 30
+    else:
+        score += 22
+    if "official" in candidate_title or "официальн" in candidate_title:
+        score += 8
+    if trusted_channel:
+        score += 8
+    if wanted_year and candidate_years:
+        if year_distance == 0:
+            score += 15
+        elif year_distance == 1:
+            score -= 5
+    return score
+
+
+def _trailer_oembed(session, video_url):
+    url = (
+        "https://www.youtube.com/oembed?format=json&url="
+        + urllib.parse.quote(video_url, safe="")
+    )
+    response = session.get(url, timeout=8)
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+
+def search_topic_trailer_fallback(session, topic):
+    """Search all known title variants and return a verified YouTube URL."""
+    variants = trailer_title_variants(topic)
+    if not variants:
+        return None
+    year = topic.get("movie_year") or topic.get("year") or ""
+
+    queries = []
+    for variant in variants[:3]:
+        if re.search(r"[а-яё]", variant, flags=re.I):
+            queries.append(f'"{variant}" {year} трейлер тизер')
+        queries.append(f'"{variant}" {year} trailer teaser')
+
+    ranked = {}
+    for query in queries[:6]:
+        try:
+            url = (
+                "https://www.youtube.com/results?search_query="
+                + urllib.parse.quote(query)
+            )
+            response = session.get(url, timeout=10)
+            if response.status_code != 200:
+                continue
+        except Exception:
+            continue
+        for candidate in _trailer_youtube_candidates(response.text):
+            score = score_trailer_candidate(candidate, variants, year)
+            video_id = candidate["video_id"]
+            if score > ranked.get(video_id, {}).get("score", 0):
+                ranked[video_id] = {**candidate, "score": score}
+
+    ranked_candidates = sorted(
+        ranked.values(),
+        key=lambda item: item["score"],
+        reverse=True,
+    )[:3]
+    for candidate in ranked_candidates:
+        if candidate["score"] < 95:
+            continue
+        video_url = f'https://www.youtube.com/watch?v={candidate["video_id"]}'
+        try:
+            metadata = _trailer_oembed(session, video_url)
+        except Exception:
+            continue
+        if not metadata:
+            continue
+        verified = {
+            "title": metadata.get("title", ""),
+            "channel": metadata.get("author_name", ""),
+        }
+        if score_trailer_candidate(verified, variants, year) >= 85:
+            return video_url
+    return None
+
+
+# Kinopoisk ID fallback
+
+KINOPOISK_SPARQL_URL = "https://query.wikidata.org/sparql"
+KINOPOISK_FALLBACK_CACHE_PATH = DATA_DIR / "kp_fallback_cache.json"
+KINOPOISK_USER_AGENT = "KinoGallery/1.0 (local media catalog)"
+
+_KINOPOISK_REQUEST_SLOTS = threading.BoundedSemaphore(3)
+_KINOPOISK_CACHE_LOCK = threading.Lock()
+_KINOPOISK_KEY_LOCKS: dict[str, threading.Lock] = {}
+_KINOPOISK_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _kinopoisk_normalize(value):
+    value = str(value or "").lower().replace("ё", "е")
+    value = re.sub(r"[^a-zа-я0-9]+", " ", value, flags=re.I)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _kinopoisk_title_tokens(value):
+    ignored = {"film", "movie", "фильм", "кино"}
+    return {
+        token for token in _kinopoisk_normalize(value).split()
+        if token not in ignored and len(token) >= 2
+    }
+
+
+def kinopoisk_title_variants(topic, fallback_title=""):
+    values = [
+        topic.get("movie_title"),
+        topic.get("orig_title"),
+        fallback_title,
+    ]
+    raw = str(topic.get("title") or "")
+    title_part = raw.split("(", 1)[0].split("[", 1)[0]
+    values.extend(part.strip() for part in title_part.split("/"))
+
+    result = []
+    seen = set()
+    for value in values:
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ._-")
+        key = _kinopoisk_normalize(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result[:5]
+
+
+def score_kinopoisk_title_candidate(wanted_title, wanted_year, candidate):
+    label = candidate.get("label") or ""
+    wanted = _kinopoisk_normalize(wanted_title)
+    actual = _kinopoisk_normalize(label)
+    wanted_tokens = _kinopoisk_title_tokens(wanted)
+    actual_tokens = _kinopoisk_title_tokens(actual)
+    if not wanted or not actual or not wanted_tokens or not actual_tokens:
+        return 0
+
+    try:
+        year = int(wanted_year or 0)
+    except (TypeError, ValueError):
+        year = 0
+    years = {
+        int(value)
+        for value in candidate.get("years", [])
+        if str(value).isdigit()
+    }
+    if year and (
+        not years or min(abs(value - year) for value in years) > 1
+    ):
+        return 0
+
+    overlap = len(wanted_tokens & actual_tokens) / max(len(wanted_tokens), 1)
+    exact_tokens = wanted_tokens == actual_tokens
+    if len(wanted_tokens) == 1 and not exact_tokens:
+        return 0
+    if not exact_tokens and overlap < 0.8:
+        return 0
+
+    score = (
+        100 if wanted == actual
+        else 75 if exact_tokens
+        else int(overlap * 70)
+    )
+    score += int(SequenceMatcher(None, wanted, actual).ratio() * 20)
+    if year and years:
+        distance = min(abs(value - year) for value in years)
+        score += 20 if distance == 0 else 10
+    return score
+
+
+def select_kinopoisk_title_candidate(title_variants, year, candidates):
+    ranked = []
+    for candidate in candidates:
+        kp_id = str(candidate.get("kp_id") or "")
+        if not kp_id.isdigit():
+            continue
+        score = max(
+            (
+                score_kinopoisk_title_candidate(title, year, candidate)
+                for title in title_variants
+            ),
+            default=0,
+        )
+        if score:
+            ranked.append((score, kp_id, candidate))
+    if not ranked:
+        return None
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_id, best = ranked[0]
+    competing_ids = {
+        kp_id
+        for score, kp_id, _candidate in ranked
+        if score >= best_score - 5
+    }
+    if len(competing_ids) > 1:
+        return None
+    return {**best, "kp_id": best_id, "score": best_score}
+
+
+def _kinopoisk_sparql_rows(session, query):
+    headers = {
+        "User-Agent": KINOPOISK_USER_AGENT,
+        "Accept": "application/sparql-results+json",
+    }
+    for attempt in range(3):
+        try:
+            with _KINOPOISK_REQUEST_SLOTS:
+                response = session.get(
+                    KINOPOISK_SPARQL_URL,
+                    params={"query": query, "format": "json"},
+                    headers=headers,
+                    timeout=60,
+                )
+            if response.status_code == 200:
+                data = response.json()
+                return True, data.get("results", {}).get("bindings", [])
+            if response.status_code not in (429, 500, 502, 503, 504):
+                return True, []
+        except Exception:
+            pass
+        time.sleep(attempt + 1)
+    return False, []
+
+
+def _kinopoisk_sparql_literal(value):
+    return json.dumps(str(value or ""), ensure_ascii=False)
+
+
+def _kinopoisk_lookup_by_imdb(session, imdb_id):
+    query = (
+        "SELECT ?item ?kp WHERE { "
+        f"?item wdt:P345 {_kinopoisk_sparql_literal(imdb_id)}; "
+        "wdt:P2603 ?kp. "
+        "} LIMIT 5"
+    )
+    ok, rows = _kinopoisk_sparql_rows(session, query)
+    if not ok:
+        return False, None
+    candidates = []
+    for row in rows:
+        kp_id = str(row.get("kp", {}).get("value") or "")
+        qid = str(row.get("item", {}).get("value") or "").rsplit("/", 1)[-1]
+        if kp_id.isdigit():
+            candidates.append((kp_id, qid))
+    unique_ids = {kp_id for kp_id, _qid in candidates}
+    if len(unique_ids) != 1:
+        return True, None
+    kp_id, qid = candidates[0]
+    return True, {
+        "kp_id": kp_id,
+        "wikidata_id": qid,
+        "source": "wikidata-imdb",
+    }
+
+
+def _kinopoisk_entity_search_query(title):
+    return f"""
+SELECT ?item ?itemLabel ?kp ?date WHERE {{
+  SERVICE wikibase:mwapi {{
+    bd:serviceParam wikibase:endpoint "www.wikidata.org";
+                    wikibase:api "EntitySearch";
+                    mwapi:search {_kinopoisk_sparql_literal(title)};
+                    mwapi:language "ru".
+    ?item wikibase:apiOutputItem mwapi:item.
+  }}
+  ?item wdt:P2603 ?kp.
+  OPTIONAL {{ ?item wdt:P577 ?date. }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "ru,en". }}
+}}
+LIMIT 12
+""".strip()
+
+
+def _kinopoisk_rows_to_candidates(rows):
+    grouped = {}
+    for row in rows:
+        kp_id = str(row.get("kp", {}).get("value") or "")
+        qid = str(row.get("item", {}).get("value") or "").rsplit("/", 1)[-1]
+        if not kp_id.isdigit() or not qid:
+            continue
+        key = (qid, kp_id)
+        candidate = grouped.setdefault(key, {
+            "kp_id": kp_id,
+            "wikidata_id": qid,
+            "label": str(row.get("itemLabel", {}).get("value") or ""),
+            "years": set(),
+            "source": "wikidata-title",
+        })
+        date_value = str(row.get("date", {}).get("value") or "")
+        match = re.match(r"([+-]?\d{4})", date_value)
+        if match:
+            candidate["years"].add(abs(int(match.group(1))))
+    result = []
+    for candidate in grouped.values():
+        candidate["years"] = sorted(candidate["years"])
+        result.append(candidate)
+    return result
+
+
+def _kinopoisk_lookup_by_title(session, variants, year):
+    all_candidates = []
+    request_succeeded = False
+    for title in variants[:3]:
+        ok, rows = _kinopoisk_sparql_rows(
+            session,
+            _kinopoisk_entity_search_query(title),
+        )
+        request_succeeded = request_succeeded or ok
+        if ok:
+            all_candidates.extend(_kinopoisk_rows_to_candidates(rows))
+        candidate = select_kinopoisk_title_candidate(
+            variants,
+            year,
+            all_candidates,
+        )
+        if candidate and candidate.get("score", 0) >= 90:
+            return True, candidate
+    return request_succeeded, select_kinopoisk_title_candidate(
+        variants,
+        year,
+        all_candidates,
+    )
+
+
+def _kinopoisk_cache_key(topic, title, year):
+    imdb_id = str(topic.get("imdb_id") or "").strip()
+    if imdb_id and imdb_id != "0":
+        return f"imdb:{imdb_id}"
+    return f"title:{_kinopoisk_normalize(title)}|{year or ''}"
+
+
+def _kinopoisk_key_lock(key):
+    with _KINOPOISK_KEY_LOCKS_GUARD:
+        return _KINOPOISK_KEY_LOCKS.setdefault(key, threading.Lock())
+
+
+def _kinopoisk_read_cache_entry(key):
+    with _KINOPOISK_CACHE_LOCK:
+        try:
+            cache = json.loads(
+                KINOPOISK_FALLBACK_CACHE_PATH.read_text("utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return False, None
+        entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return False, None
+    try:
+        checked = datetime.fromisoformat(str(entry.get("checked_at"))).date()
+    except (TypeError, ValueError):
+        return False, None
+    ttl = max(1, ENRICH_NO_CHANGE_RETRY_DAYS)
+    if date.today() - checked >= timedelta(days=ttl):
+        return False, None
+    return True, entry.get("result")
+
+
+def _kinopoisk_write_cache_entry(key, result):
+    with _KINOPOISK_CACHE_LOCK:
+        try:
+            cache = json.loads(
+                KINOPOISK_FALLBACK_CACHE_PATH.read_text("utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+        cache[key] = {
+            "checked_at": date.today().isoformat(),
+            "result": result,
+        }
+        atomic_write_json(KINOPOISK_FALLBACK_CACHE_PATH, cache)
+
+
+def find_kinopoisk_id_fallback(
+    session,
+    topic,
+    title,
+    year,
+    use_cache=True,
+):
+    variants = kinopoisk_title_variants(topic, title)
+    if not variants:
+        return None
+    key = _kinopoisk_cache_key(topic, variants[0], year)
+
+    with _kinopoisk_key_lock(key):
+        if use_cache:
+            cached, result = _kinopoisk_read_cache_entry(key)
+            if cached:
+                return result
+
+        imdb_id = str(topic.get("imdb_id") or "").strip()
+        request_ok = False
+        result = None
+        if imdb_id and imdb_id != "0":
+            request_ok, result = _kinopoisk_lookup_by_imdb(
+                session,
+                imdb_id,
+            )
+        else:
+            title_ok, result = _kinopoisk_lookup_by_title(
+                session,
+                variants,
+                year,
+            )
+            request_ok = request_ok or title_ok
+
+        if use_cache and request_ok:
+            _kinopoisk_write_cache_entry(key, result)
+        return result
