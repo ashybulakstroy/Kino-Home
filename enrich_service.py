@@ -84,6 +84,21 @@ def _download_imdb_poster(topic, imdb_id, poster_url):
     return True
 
 
+def _search_known_imdb_poster(topic, title, year):
+    """Recover a poster through IMDb search when the title page is unavailable."""
+    gp = _backend()
+    imdb_id = str(topic.get('imdb_id') or '')
+    if not imdb_id or not title or gp.has_real_poster(topic):
+        return False
+
+    result = gp.search_imdb(title, year)
+    if not isinstance(result, dict):
+        return False
+    if str(result.get('id') or '') != imdb_id:
+        return False
+    return _download_imdb_poster(topic, imdb_id, result.get('poster'))
+
+
 def _download_kp_poster(topic):
     gp = _backend()
     if gp.has_real_poster(topic) or not topic.get('kp_id'):
@@ -115,6 +130,8 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
 
     if poster_missing:
         gp.resolve_existing_local_poster(topic)
+    if not gp.has_real_poster(topic) and poster_allowed:
+        gp.resolve_catalog_duplicate_poster(topic)
     if not gp.has_real_poster(topic) and poster_allowed:
         gp.localize_existing_poster(topic)
 
@@ -226,10 +243,14 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if poster_allowed and not gp.has_real_poster(topic):
         if is_world:
             _download_imdb_poster(topic, imdb_id, imdb_page.get('poster'))
+            if not gp.has_real_poster(topic) and imdb_search is None:
+                _search_known_imdb_poster(topic, title, year)
             _download_kp_poster(topic)
         else:
             _download_kp_poster(topic)
             _download_imdb_poster(topic, imdb_id, imdb_page.get('poster'))
+            if not gp.has_real_poster(topic) and imdb_search is None:
+                _search_known_imdb_poster(topic, title, year)
 
     if is_world and poster_allowed and not gp.has_real_poster(topic):
         local_url = gp.download_impawards_poster(topic)

@@ -2,6 +2,7 @@
 """Парсинг rutracker f=22, обогащение IMDB, генерация index-kino.html."""
 
 import gzip
+import hashlib
 import json
 import os
 import copy
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html import escape, unescape
@@ -211,7 +213,12 @@ POSTERS_DIR = os.path.join(DATA_DIR, "posters")
 POSTERS_URL = "data/posters"
 POSTER_PLACEHOLDER_URL = f"{POSTERS_URL}/placeholder.png"
 POSTER_RETRY_DAYS = 7
+INVALID_POSTER_SHA256 = {
+    # Kinopoisk CDN "image unavailable" logo.
+    'fbf36d5f304807e57113972f88ab9170f428fc57d27607bf1bd889b974513fde',
+}
 TOPIC_CACHE_DIR = os.path.join(DATA_DIR, "topic_cache")
+RUTRACKER_ATOM_URL = "https://feed.rutracker.cc/atom/f/{forum_id}.atom"
 WORLD_HASH_CACHE_DIR = os.path.join(DATA_DIR, "world_hash")
 WORLD_LISTING_SNAPSHOT_DIR = os.path.join(DATA_DIR, "world_listing_snapshot")
 WORLD_LEGACY_SOURCE_CACHE = {
@@ -503,6 +510,12 @@ def get_topic_html(topic_id, topic_url, timeout=10):
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 r = SESSION.get(topic_url, timeout=timeout)
+                if is_cloudflare_challenge_response(r):
+                    print(
+                        f"  [topic {topic_id}] Cloudflare challenge; "
+                        "detail-запрос отложен"
+                    )
+                    return None
                 r.raise_for_status()
                 raw = r.content
                 with open(cache_path, 'wb') as f:
@@ -1820,7 +1833,7 @@ def download_kinopoisk_poster(kp_id):
     for ext in ('jpg', 'jpeg', 'png', 'webp'):
         filename = f"kp_{kp_id}.{ext}"
         local_path = os.path.join(POSTERS_DIR, filename)
-        if os.path.exists(local_path):
+        if os.path.exists(local_path) and not is_invalid_poster_file(local_path):
             return f"{POSTERS_URL}/{filename}"
     urls = [
         f"https://st.kp.yandex.net/images/film_big/{kp_id}.jpg",
@@ -1840,7 +1853,12 @@ def download_kinopoisk_poster(kp_id):
                 ext = 'png'
             elif r.content.startswith(b'RIFF') and b'WEBP' in r.content[:16]:
                 ext = 'webp'
-            if r.status_code == 200 and 'image' in content_type and ext:
+            if (
+                r.status_code == 200
+                and 'image' in content_type
+                and ext
+                and not is_invalid_poster_content(r.content)
+            ):
                 filename = f"kp_{kp_id}.{ext}"
                 local_path = os.path.join(POSTERS_DIR, filename)
                 with open(local_path, 'wb') as f:
@@ -2149,6 +2167,91 @@ def parse_forum_page(html, collection='nashe_kino', skip_topics=0):
             'youtube_url': None,
         })
     return topics
+
+
+def is_cloudflare_challenge_response(response):
+    server = str(response.headers.get('server') or '').lower()
+    body = (response.text or '')[:8192].lower()
+    return (
+        response.status_code in (403, 429, 503)
+        and (
+            'cloudflare' in server
+            or 'just a moment' in body
+            or 'cf-chl-' in body
+        )
+    )
+
+
+def parse_rutracker_atom_feed(xml_data, collection='nashe_kino', skip_topics=0):
+    """Parse Rutracker's public Atom feed into listing-compatible topics."""
+    root = ET.fromstring(xml_data)
+    namespace = {'atom': 'http://www.w3.org/2005/Atom'}
+    topics = []
+    entries = root.findall('atom:entry', namespace)
+    for entry in entries[skip_topics:]:
+        title_node = entry.find('atom:title', namespace)
+        id_node = entry.find('atom:id', namespace)
+        updated_node = entry.find('atom:updated', namespace)
+        link_node = entry.find('atom:link', namespace)
+        title = (title_node.text or '').strip() if title_node is not None else ''
+        title = re.sub(r'^\s*\[Обновлено\]\s*', '', title, flags=re.I)
+        atom_id = (id_node.text or '').strip() if id_node is not None else ''
+        topic_match = re.search(r'/t/(\d+)\b', atom_id)
+        topic_url = link_node.get('href', '') if link_node is not None else ''
+        if not topic_match:
+            topic_match = re.search(r'[?&]t=(\d+)\b', topic_url)
+        if not title or not topic_match:
+            continue
+
+        topic_id = topic_match.group(1)
+        updated = (updated_node.text or '').strip() if updated_node is not None else ''
+        date_str = ''
+        if updated:
+            try:
+                date_str = datetime.fromisoformat(
+                    updated.replace('Z', '+00:00')
+                ).astimezone().strftime('%Y-%m-%d %H:%M')
+            except ValueError:
+                date_str = updated
+
+        size_matches = re.findall(
+            r'\[\s*([\d.,]+\s*(?:TiB|GiB|MiB|KiB|TB|GB|MB|KB|B))\s*\]',
+            title,
+            flags=re.I,
+        )
+        size_str = size_matches[-1] if size_matches else ''
+        size_bytes, _ = parse_size(size_str) if size_str else (0, '')
+        movie_title, orig_title, movie_year, genre, quality = parse_rutracker_title(title)
+        topics.append({
+            'topic_id': topic_id,
+            'title': title,
+            'movie_title': movie_title,
+            'orig_title': orig_title,
+            'movie_year': movie_year,
+            'genre': genre,
+            'quality': quality,
+            'collection': collection,
+            'size_str': size_str,
+            'size_bytes': size_bytes,
+            'date_str': date_str,
+            'added_at': now_text(),
+            'topic_url': topic_url or TOPIC_URL_T.format(topic_id),
+            'listing_order': len(topics),
+            'magnet': '',
+            '_listing_source': 'rutracker_atom',
+        })
+    return topics
+
+
+def fetch_rutracker_atom_listing(forum_id, collection, skip_topics=0):
+    url = RUTRACKER_ATOM_URL.format(forum_id=forum_id)
+    response = SESSION.get(url, timeout=30)
+    response.raise_for_status()
+    return parse_rutracker_atom_feed(
+        response.content,
+        collection=collection,
+        skip_topics=skip_topics,
+    )
 
 
 def parse_piratebay_page(html, collection='piratebay_top'):
@@ -2503,6 +2606,22 @@ def is_placeholder_poster_url(poster_url):
     return poster_url.endswith('/placeholder.png') or poster_url == 'placeholder.png'
 
 
+def is_invalid_poster_content(content):
+    if not content:
+        return True
+    return hashlib.sha256(content).hexdigest() in INVALID_POSTER_SHA256
+
+
+def is_invalid_poster_file(path):
+    try:
+        if os.path.getsize(path) > 64 * 1024:
+            return False
+        with open(path, 'rb') as poster_file:
+            return is_invalid_poster_content(poster_file.read())
+    except OSError:
+        return True
+
+
 def normalize_poster_url(poster_url):
     poster_url = (poster_url or '').replace('\\', '/')
     if poster_url.startswith('posters/'):
@@ -2531,6 +2650,8 @@ def has_real_poster(topic):
         return False
     local_path = local_poster_path(poster_url)
     if not (local_path and os.path.exists(local_path)):
+        return False
+    if is_invalid_poster_file(local_path):
         return False
     imdb_id = topic.get('imdb_id', '')
     if imdb_id and re.search(r'/tt\d+', poster_url):
@@ -2563,7 +2684,7 @@ def resolve_existing_local_poster(topic):
             if imdb_id:
                 filename = f"{imdb_id}.jpg"
                 local_path = os.path.join(POSTERS_DIR, filename)
-                if os.path.exists(local_path):
+                if os.path.exists(local_path) and not is_invalid_poster_file(local_path):
                     topic['poster_url'] = f"{POSTERS_URL}/{filename}"
                     clear_poster_failed(topic)
                     return True
@@ -2573,17 +2694,42 @@ def resolve_existing_local_poster(topic):
                 for ext in ('jpg', 'jpeg', 'png', 'webp'):
                     filename = f"kp_{kp_id}.{ext}"
                     local_path = os.path.join(POSTERS_DIR, filename)
-                    if os.path.exists(local_path):
+                    if os.path.exists(local_path) and not is_invalid_poster_file(local_path):
                         topic['poster_url'] = f"{POSTERS_URL}/{filename}"
                         clear_poster_failed(topic)
                         return True
     return False
 
 
+def resolve_catalog_duplicate_poster(topic):
+    """Reuse a valid poster from another cached topic for the same movie."""
+    identifiers = []
+    for prefix, field in movie_id_fields_by_priority(topic):
+        value = str(topic.get(field) or '').strip()
+        if value and value != '0':
+            identifiers.append((field, value))
+    if not identifiers:
+        return False
+
+    for candidate in load_json(TORRENTS_CACHE) or []:
+        if candidate.get('topic_id') == topic.get('topic_id'):
+            continue
+        if not any(
+            str(candidate.get(field) or '').strip() == value
+            for field, value in identifiers
+        ):
+            continue
+        if not has_real_poster(candidate):
+            continue
+        topic['poster_url'] = candidate['poster_url']
+        clear_poster_failed(topic)
+        return True
+    return False
+
+
 def display_poster_url(topic):
     poster_url = topic.get('poster_url', '') or ''
-    local_path = local_poster_path(poster_url)
-    if local_path and os.path.exists(local_path):
+    if has_real_poster(topic):
         return normalize_poster_url(poster_url)
     return POSTER_PLACEHOLDER_URL
 
@@ -3363,8 +3509,21 @@ def repair_fast_visible_missing_posters(topics, display_topics, hidden_ids, coll
     return candidates
 
 
-def sync_listing_order_for_collection(collection: str, cache_only: bool = False) -> dict[str, int]:
-    """Return {topic_id: listing_order} for page 1. If cache_only, skip network."""
+def _listing_state(topics):
+    return {
+        str(topic['topic_id']): {
+            'listing_order': int(topic.get('listing_order', index)),
+            'date_str': topic.get('date_str') or '',
+        }
+        for index, topic in enumerate(topics)
+    }
+
+
+def sync_listing_state_for_collection(
+    collection: str,
+    cache_only: bool = False,
+) -> dict[str, dict]:
+    """Return page-1 order and last-post time keyed by topic ID."""
     coll_info = COLLECTIONS.get(collection)
     if not coll_info:
         return {}
@@ -3379,11 +3538,14 @@ def sync_listing_order_for_collection(collection: str, cache_only: bool = False)
             html = raw.decode('cp1251', errors='replace')
             skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
             topics = parse_forum_page(html, collection=collection, skip_topics=skip)
-            return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+            return _listing_state(topics)
         return {}
+    last_error = None
     for attempt in range(1, MAX_RETRY + 1):
         try:
             r = SESSION.get(base_url, timeout=30)
+            if is_cloudflare_challenge_response(r):
+                raise RuntimeError('Cloudflare challenge (HTTP 403)')
             r.raise_for_status()
             raw = r.content
             html = raw.decode('cp1251', errors='replace')
@@ -3393,19 +3555,105 @@ def sync_listing_order_for_collection(collection: str, cache_only: bool = False)
                 os.makedirs(TOPIC_CACHE_DIR, exist_ok=True)
                 with open(cache_path, 'wb') as f:
                     f.write(raw)
-            return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+            return _listing_state(topics)
         except Exception as e:
+            last_error = e
+            if 'Cloudflare challenge' in str(e):
+                break
             if attempt < MAX_RETRY:
                 time.sleep(2)
                 continue
-            if listing_cache_is_valid(cache_path):
-                with open(cache_path, 'rb') as f:
-                    raw = f.read()
-                html = raw.decode('cp1251', errors='replace')
-                skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
-                topics = parse_forum_page(html, collection=collection, skip_topics=skip)
-                return {t['topic_id']: t.get('listing_order', i) for i, t in enumerate(topics)}
+
+    try:
+        skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+        topics = fetch_rutracker_atom_listing(
+            forum_id,
+            collection,
+            skip_topics=skip,
+        )
+        if topics:
+            print(
+                f'  [listing_order] {collection}: Atom fallback '
+                f'({len(topics)} тем; HTML: {last_error})'
+            )
+            return _listing_state(topics)
+    except Exception:
+        pass
+
+    if listing_cache_is_valid(cache_path):
+        with open(cache_path, 'rb') as f:
+            raw = f.read()
+        html = raw.decode('cp1251', errors='replace')
+        skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
+        topics = parse_forum_page(html, collection=collection, skip_topics=skip)
+        return _listing_state(topics)
     return {}
+
+
+def sync_listing_order_for_collection(
+    collection: str,
+    cache_only: bool = False,
+) -> dict[str, int]:
+    """Backward-compatible page-1 topic order."""
+    state = sync_listing_state_for_collection(collection, cache_only=cache_only)
+    return {
+        topic_id: values['listing_order']
+        for topic_id, values in state.items()
+    }
+
+
+def apply_collection_listing_state(topics, collection, listing_state):
+    """Apply current page order, then place historical topics after it."""
+    if not listing_state:
+        return False
+
+    changed = False
+    current_ids = set(listing_state)
+    collection_topics = [
+        topic for topic in topics
+        if topic.get('collection', 'nashe_kino') == collection
+    ]
+    by_id = {
+        str(topic.get('topic_id')): topic
+        for topic in collection_topics
+        if topic.get('topic_id')
+    }
+
+    for topic_id, values in listing_state.items():
+        topic = by_id.get(topic_id)
+        if not topic:
+            continue
+        new_order = int(values.get('listing_order', 999999))
+        if topic.get('listing_order') != new_order:
+            topic['listing_order'] = new_order
+            changed = True
+        last_post_at = values.get('date_str') or ''
+        if last_post_at and topic.get('date_str') != last_post_at:
+            topic['date_str'] = last_post_at
+            changed = True
+
+    historical = [
+        topic for topic in collection_topics
+        if str(topic.get('topic_id')) not in current_ids
+    ]
+    historical.sort(
+        key=lambda topic: (
+            -date_to_timestamp(topic.get('date_str') or ''),
+            int(
+                topic.get('listing_order')
+                if topic.get('listing_order') is not None
+                else 999999
+            ),
+            str(topic.get('topic_id') or ''),
+        )
+    )
+    offset = len(listing_state)
+    for index, topic in enumerate(historical):
+        new_order = offset + index
+        if topic.get('listing_order') != new_order:
+            topic['listing_order'] = new_order
+            changed = True
+    return changed
 
 
 def generate_html(topics, hidden_ids: set[str] | None = None):
@@ -3929,9 +4177,13 @@ def load_collection_listing(collection, coll_info, topics_limit):
         page_topics = []
         print(f"  Страница {page + 1} (start={start})...", end=' ', flush=True)
         last_error = None
+        cloudflare_blocked = False
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 r = SESSION.get(url, timeout=30)
+                if is_cloudflare_challenge_response(r):
+                    cloudflare_blocked = True
+                    raise RuntimeError('Cloudflare challenge (HTTP 403)')
                 r.raise_for_status()
                 raw = r.content
                 html = raw.decode('cp1251', errors='replace')
@@ -3949,10 +4201,36 @@ def load_collection_listing(collection, coll_info, topics_limit):
                 break
             except Exception as e:
                 last_error = e
+                if cloudflare_blocked:
+                    break
                 if attempt < MAX_RETRY:
                     print(f"\n  попытка {attempt}/{MAX_RETRY}: {e}; жду 2с", flush=True)
                     time.sleep(2)
-        else:
+
+        if not page_topics and page == 0:
+            try:
+                page_topics = fetch_rutracker_atom_listing(
+                    forum_id,
+                    collection,
+                    skip_topics=COLLECTIONS.get(collection, {}).get('skip_topics', 0),
+                )
+                if page_topics:
+                    page1_ok = True
+                    print(
+                        f"HTML недоступен ({last_error}); "
+                        f"Atom fallback: {len(page_topics)} тем, ",
+                        end='',
+                        flush=True,
+                    )
+            except Exception as atom_error:
+                if last_error is None:
+                    last_error = atom_error
+                else:
+                    last_error = RuntimeError(
+                        f'{last_error}; Atom fallback: {atom_error}'
+                    )
+
+        if not page_topics:
             listing_errors += 1
             if listing_cache_is_valid(listing_cache_path):
                 with open(listing_cache_path, 'rb') as f:
@@ -3973,8 +4251,10 @@ def load_collection_listing(collection, coll_info, topics_limit):
         print(f"{len(page_topics)} тем")
         all_topics.extend(page_topics)
         if topics_limit and len(all_topics) >= topics_limit:
-            all_topics = all_topics[:topics_limit]
-            print(f"  Берём {topics_limit} тем (MAX_TOPICS)")
+            print(
+                f"  MAX_TOPICS={topics_limit} будет применён "
+                "только к новым темам"
+            )
             break
         time.sleep(0.5)
     return all_topics, listing_errors, page1_ok, page1_used_cache, skip_ids
@@ -4133,9 +4413,16 @@ def main():
             # Add only genuinely new topics (not already in cache)
             new_current: list[dict] = []
             skipped_same_movie = 0
+            skipped_new_limit = 0
             forbidden_keys = load_forbidden_topic_keys()
             for t in all_topics:
                 if t['topic_id'] not in existing_ids:
+                    if (
+                        coll_topics_limit
+                        and len(new_current) >= coll_topics_limit
+                    ):
+                        skipped_new_limit += 1
+                        continue
                     if is_world_source(source) and not t.get('_world_listing_new_movie'):
                         skipped_same_movie += 1
                         continue
@@ -4147,16 +4434,41 @@ def main():
             new_enrich_current = new_current
 
             merged = other + existing_current + new_current
+            apply_collection_listing_state(
+                merged,
+                collection,
+                _listing_state(all_topics),
+            )
             print(f"  В кеше: {len(cache_by_id)}, свежих (всего): {len(all_topics)}, "
                   f"новых: {len(new_current)}, "
                   f"из других коллекций: {len(other)}, всего: {len(merged)}")
+            if skipped_new_limit:
+                print(
+                    f"  MAX_TOPICS: отложено новых тем: {skipped_new_limit}"
+                )
             if skipped_same_movie:
                 print(f"  World snapshot: {skipped_same_movie} новых torrent/hash уже известны как фильмы, enrich пропущен")
 
             if is_world_source(source):
                 need_fetch = []
             else:
-                need_fetch = [t for t in new_current if not t.get('_magnet_failed') and (not t.get('magnet') or not has_real_poster(t))]
+                atom_deferred = [
+                    t for t in new_current
+                    if t.get('_listing_source') == 'rutracker_atom'
+                ]
+                need_fetch = [
+                    t for t in new_current
+                    if t not in atom_deferred
+                    and not t.get('_sanitized')
+                    and not t.get('_magnet_failed')
+                    and (not t.get('magnet') or not has_real_poster(t))
+                ]
+                if atom_deferred:
+                    print(
+                        f"  Atom fallback: {len(atom_deferred)} новых тем "
+                        "отложены до доступности detail-страниц "
+                        "(magnet в Atom отсутствует)"
+                    )
             if need_fetch:
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} новых тем...")
                 magnet_stats = fetch_magnets(need_fetch)

@@ -1232,19 +1232,22 @@ def _sync_listing_order(cache_only: bool = False):
         with file_lock(data_path):
             topics = json.loads(data_path.read_text('utf-8'))
         changed = False
-        from generate_page import REFRESH_COLLECTIONS, sync_listing_order_for_collection
+        from generate_page import (
+            REFRESH_COLLECTIONS,
+            apply_collection_listing_state,
+            sync_listing_state_for_collection,
+        )
         for coll, info in REFRESH_COLLECTIONS.items():
             if info.get('source', 'rutracker') != 'rutracker':
                 continue
-            order_map = sync_listing_order_for_collection(coll, cache_only=cache_only)
-            if not order_map:
+            listing_state = sync_listing_state_for_collection(
+                coll,
+                cache_only=cache_only,
+            )
+            if not listing_state:
                 continue
-            for t in topics:
-                if t.get('collection') == coll and t['topic_id'] in order_map:
-                    new_order = order_map[t['topic_id']]
-                    if t.get('listing_order') != new_order:
-                        t['listing_order'] = new_order
-                        changed = True
+            if apply_collection_listing_state(topics, coll, listing_state):
+                changed = True
         if changed:
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
