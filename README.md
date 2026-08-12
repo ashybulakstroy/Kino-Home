@@ -120,6 +120,7 @@ data/posters/placeholder.png
 - `data/temp/` - временные скачанные видео.
 - `data/posters/` - постеры и заглушка.
 - `data/topic_cache/` - кеш страниц rutracker.
+- `data/rutracker_pending_topics.json` - новые темы из Atom Rutracker, которые ожидают восстановления detail-страниц и получения magnet.
 - `data/imdb/` - локальные IMDB справочники `title.ratings.tsv.gz` и `title.basics.tsv.gz`; если ID не найден в старом файле, скачивается свежий файл и становится основным.
 - `data/staging_refresh/` - временные данные refresh.
 - `data/torrents_data.json` - основной каталог.

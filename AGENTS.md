@@ -89,6 +89,8 @@ Refresh должен сливать новые темы с существующ�
 
 Кеш листинга форума `data/topic_cache/f*_p*.html` не должен скрывать новые темы. При refresh сначала скачивается свежий `viewforum.php`; локальный listing-cache используется только как fallback при сетевой ошибке и только если он не старше `LISTING_CACHE_MAX_AGE_DAYS` из `.env` (по умолчанию 1 день).
 
+Если HTML-листинг Rutracker заблокирован Cloudflare, Atom используется для обнаружения новых тем. Поскольку Atom не содержит magnet, такие темы сохраняются в `data/rutracker_pending_topics.json` и не показываются пользователю. После восстановления detail-страниц pending-темы повторно проверяются, успешно получившие magnet переносятся в основной каталог, а затем удаляются из pending-кеша.
+
 Pipeline при `--refresh`:
 1. Парсинг страниц форума
 2. Слияние с кешем (только новые темы)
@@ -272,6 +274,7 @@ if imdb_id and re.search(r'/tt\d+', poster_url):
 - `data/torrents_data.json` — каталог.
 - `data/posters/` — постеры.
 - `data/topic_cache/` — кеш тем.
+- `data/rutracker_pending_topics.json` — новые Atom-темы Rutracker, ожидающие magnet с detail-страницы.
 - `data/imdb/` — полные локальные IMDB справочники `title.ratings.tsv.gz` и `title.basics.tsv.gz`; JSON-кеши хранят выжимку по найденным ID.
 - `data/temp/` — временные видеофайлы.
 - `data/staging_refresh/` — staging во время refresh.

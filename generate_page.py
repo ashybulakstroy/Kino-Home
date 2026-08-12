@@ -208,6 +208,7 @@ IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
 WORLD_TITLE_IDENTITY_CACHE = os.path.join(DATA_DIR, "world_title_identity_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
+RUTRACKER_PENDING_TOPICS = os.path.join(DATA_DIR, "rutracker_pending_topics.json")
 HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
 FORBIDDEN_TOPICS_CACHE = os.path.join(DATA_DIR, "forbidden_topics_cache.json")
 POSTERS_DIR = os.path.join(DATA_DIR, "posters")
@@ -563,6 +564,136 @@ def load_json(path):
 
 def save_json(path, data):
     atomic_write_json(path, data)
+
+
+_PENDING_LISTING_FIELDS = (
+    'title', 'movie_title', 'orig_title', 'movie_year', 'genre', 'quality',
+    'collection', 'size_str', 'size_bytes', 'date_str', 'topic_url',
+    'listing_order', '_listing_source',
+)
+
+
+def load_rutracker_pending_topics():
+    data = load_json(RUTRACKER_PENDING_TOPICS)
+    if isinstance(data, dict):
+        data = data.get('items', [])
+    if not isinstance(data, list):
+        return []
+    items = []
+    seen = set()
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        topic = copy.deepcopy(raw)
+        topic_id = str(topic.get('topic_id') or '').strip()
+        collection = str(topic.get('collection') or '').strip()
+        if not topic_id or not collection or topic_id in seen:
+            continue
+        topic['topic_id'] = topic_id
+        topic['magnet'] = ''
+        topic.pop('_magnet_failed', None)
+        items.append(topic)
+        seen.add(topic_id)
+    return items
+
+
+def save_rutracker_pending_topics(items):
+    clean_items = []
+    seen = set()
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        topic = copy.deepcopy(raw)
+        topic_id = str(topic.get('topic_id') or '').strip()
+        collection = str(topic.get('collection') or '').strip()
+        if (
+            not topic_id
+            or not collection
+            or topic_id in seen
+            or topic.get('magnet')
+            or topic.get('_sanitized')
+        ):
+            continue
+        topic['topic_id'] = topic_id
+        topic['magnet'] = ''
+        topic.pop('_magnet_failed', None)
+        clean_items.append(topic)
+        seen.add(topic_id)
+    clean_items.sort(key=lambda topic: (
+        str(topic.get('collection') or ''),
+        int(topic.get('listing_order') or 999999),
+        str(topic.get('topic_id') or ''),
+    ))
+    if clean_items == load_rutracker_pending_topics():
+        return False
+    atomic_write_json(RUTRACKER_PENDING_TOPICS, {
+        'version': 1,
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'items': clean_items,
+    })
+    return True
+
+
+def merge_rutracker_pending_topics(items, candidates, reason, attempted=False):
+    by_id = {
+        str(topic.get('topic_id')): copy.deepcopy(topic)
+        for topic in items or []
+        if isinstance(topic, dict) and topic.get('topic_id')
+    }
+    added = 0
+    now = datetime.now().isoformat(timespec='seconds')
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict) or candidate.get('magnet') or candidate.get('_sanitized'):
+            continue
+        topic_id = str(candidate.get('topic_id') or '').strip()
+        collection = str(candidate.get('collection') or '').strip()
+        if not topic_id or not collection:
+            continue
+        previous = by_id.get(topic_id, {})
+        merged = copy.deepcopy(previous)
+        for field in _PENDING_LISTING_FIELDS:
+            value = candidate.get(field)
+            if value not in (None, ''):
+                merged[field] = value
+        merged['topic_id'] = topic_id
+        merged['collection'] = collection
+        merged['magnet'] = ''
+        merged['_pending_first_seen_at'] = previous.get('_pending_first_seen_at') or now
+        merged['_pending_reason'] = reason
+        if attempted:
+            merged['_pending_last_attempt_at'] = now
+            merged['_pending_attempts'] = int(previous.get('_pending_attempts') or 0) + 1
+        merged.pop('_magnet_failed', None)
+        by_id[topic_id] = merged
+        if not previous:
+            added += 1
+    return list(by_id.values()), added
+
+
+def remove_rutracker_pending_topics(items, topic_ids):
+    remove_ids = {str(topic_id) for topic_id in topic_ids if topic_id}
+    return [
+        topic for topic in items or []
+        if str(topic.get('topic_id') or '') not in remove_ids
+    ]
+
+
+def rutracker_pending_candidates(items, collection, excluded_ids=()):
+    excluded = {str(topic_id) for topic_id in excluded_ids if topic_id}
+    candidates = []
+    for topic in items or []:
+        topic_id = str(topic.get('topic_id') or '')
+        if topic.get('collection') != collection or not topic_id or topic_id in excluded:
+            continue
+        candidate = copy.deepcopy(topic)
+        candidate['_listing_source'] = 'rutracker_pending'
+        candidate.pop('_magnet_failed', None)
+        candidates.append(candidate)
+    candidates.sort(key=lambda topic: (
+        int(topic.get('listing_order') or 999999),
+        str(topic.get('_pending_first_seen_at') or ''),
+    ))
+    return candidates
 
 
 def parse_size(text):
@@ -4353,6 +4484,7 @@ def main():
         sync_forbidden_topic_cache(topics)
         original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
+        pending_topics = load_rutracker_pending_topics()
 
         for col_idx, collection in enumerate(collections_to_process):
             coll_info = COLLECTIONS[collection]
@@ -4404,6 +4536,39 @@ def main():
             ]
             existing_ids = {t['topic_id'] for t in existing_current}
             source = coll_info.get('source', 'rutracker')
+            is_rutracker = not is_world_source(source)
+            atom_listing_active = bool(all_topics) and all(
+                t.get('_listing_source') == 'rutracker_atom'
+                for t in all_topics
+            )
+            pending_topics = remove_rutracker_pending_topics(
+                pending_topics,
+                existing_ids,
+            )
+            pending_ids = {
+                str(t.get('topic_id') or '')
+                for t in pending_topics
+                if t.get('collection') == collection
+            }
+
+            if is_rutracker and atom_listing_active:
+                atom_candidates = [
+                    t for t in all_topics
+                    if t.get('topic_id') not in existing_ids
+                ]
+                pending_topics, pending_added = merge_rutracker_pending_topics(
+                    pending_topics,
+                    atom_candidates,
+                    reason='atom_without_magnet',
+                )
+                save_rutracker_pending_topics(pending_topics)
+                pending_ids.update(
+                    str(t.get('topic_id') or '') for t in atom_candidates
+                )
+                print(
+                    f"  Atom pending: в очереди {sum(1 for t in pending_topics if t.get('collection') == collection)}, "
+                    f"новых {pending_added}"
+                )
 
             # Update listing_order for topics still on the current page
             fresh_by_id = {t['topic_id']: t for t in all_topics}
@@ -4426,14 +4591,27 @@ def main():
             new_current: list[dict] = []
             skipped_same_movie = 0
             skipped_new_limit = 0
+            limit_deferred: list[dict] = []
             forbidden_keys = load_forbidden_topic_keys()
-            for t in all_topics:
+            new_candidates = list(all_topics)
+            if is_rutracker and not atom_listing_active:
+                fresh_ids = {str(t.get('topic_id') or '') for t in all_topics}
+                new_candidates.extend(rutracker_pending_candidates(
+                    pending_topics,
+                    collection,
+                    excluded_ids=existing_ids | fresh_ids,
+                ))
+            for t in new_candidates:
                 if t['topic_id'] not in existing_ids:
+                    if atom_listing_active and t.get('_listing_source') == 'rutracker_atom':
+                        continue
                     if (
                         coll_topics_limit
                         and len(new_current) >= coll_topics_limit
                     ):
                         skipped_new_limit += 1
+                        if is_rutracker and not t.get('magnet'):
+                            limit_deferred.append(t)
                         continue
                     if is_world_source(source) and not t.get('_world_listing_new_movie'):
                         skipped_same_movie += 1
@@ -4444,6 +4622,14 @@ def main():
                         print(f"  {t.get('movie_title','')}: скрыто по кешу запрещённых")
                     new_current.append(t)
             new_enrich_current = new_current
+
+            if limit_deferred:
+                pending_topics, _ = merge_rutracker_pending_topics(
+                    pending_topics,
+                    limit_deferred,
+                    reason='refresh_limit',
+                )
+                save_rutracker_pending_topics(pending_topics)
 
             merged = other + existing_current + new_current
             apply_collection_listing_state(
@@ -4464,23 +4650,14 @@ def main():
             if is_world_source(source):
                 need_fetch = []
             else:
-                atom_deferred = [
-                    t for t in new_current
-                    if t.get('_listing_source') == 'rutracker_atom'
-                ]
                 need_fetch = [
                     t for t in new_current
-                    if t not in atom_deferred
-                    and not t.get('_sanitized')
-                    and not t.get('_magnet_failed')
+                    if not t.get('_sanitized')
                     and (not t.get('magnet') or not has_real_poster(t))
                 ]
-                if atom_deferred:
-                    print(
-                        f"  Atom fallback: {len(atom_deferred)} новых тем "
-                        "отложены до доступности detail-страниц "
-                        "(magnet в Atom отсутствует)"
-                    )
+                for t in need_fetch:
+                    if str(t.get('topic_id') or '') in pending_ids:
+                        t.pop('_magnet_failed', None)
             if need_fetch:
                 print(f"\n3. Загрузка магнетов и постеров для {len(need_fetch)} новых тем...")
                 magnet_stats = fetch_magnets(need_fetch)
@@ -4490,6 +4667,35 @@ def main():
                         print(f"  {t.get('movie_title','')}: запрещённая тема, скрыто")
             else:
                 magnet_stats = {'total': 0, 'ok': 0, 'failed': 0}
+
+            if is_rutracker:
+                completed_pending_ids = {
+                    str(t.get('topic_id') or '')
+                    for t in new_current
+                    if t.get('magnet') or t.get('_sanitized')
+                }
+                pending_topics = remove_rutracker_pending_topics(
+                    pending_topics,
+                    completed_pending_ids,
+                )
+                failed_detail_topics = [
+                    t for t in need_fetch
+                    if not t.get('magnet') and not t.get('_sanitized')
+                ]
+                if failed_detail_topics:
+                    pending_topics, _ = merge_rutracker_pending_topics(
+                        pending_topics,
+                        failed_detail_topics,
+                        reason='detail_unavailable',
+                        attempted=True,
+                    )
+                save_rutracker_pending_topics(pending_topics)
+                pending_count = sum(
+                    1 for t in pending_topics
+                    if t.get('collection') == collection
+                )
+                if pending_count:
+                    print(f"  Rutracker pending: ожидают magnet {pending_count} тем")
 
             topics = clean_catalog_topics(merged)
             topic_ids = {t.get('topic_id') for t in topics}
