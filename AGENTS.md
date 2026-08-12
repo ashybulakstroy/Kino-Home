@@ -48,6 +48,7 @@ Start-Process -FilePath "cmd.exe" -ArgumentList '/c', '.venv\Scripts\python.exe 
 |------|------------|
 | `generate_page.py` | Коллекции, парсинг rutracker, magnet, генерация каталога, санитизация запрещённых тем |
 | `enrich_service.py` | Заполнение пустых атрибутов фильмов; отдельный явный режим проверки и ремонта существующих данных |
+| `movie_metadata_cache.py` | Единый кеш метаданных фильма и распространение общих атрибутов между torrent-раздачами |
 | `stream_server.py` | Flask-сервер, стриминг, browse-страницы, авто-refresh, housekeeping, плеер |
 | `engine.py` | libtorrent-движок: magnet, выбор видеофайла, приоритеты кусков, readahead |
 | `player.html` | Страница плеера |
@@ -71,6 +72,8 @@ Start-Process -FilePath "cmd.exe" -ArgumentList '/c', '.venv\Scripts\python.exe 
 World-коллекции не ограничиваются топ-60: все сохранённые уникальные темы показываются с сортировкой по количеству сидов и не удаляются возрастной очисткой.
 
 Темы без magnet не нужны для приложения и не должны попадать в итоговый каталог.
+
+Общие атрибуты фильма (`IMDb/KP ID`, рейтинги, постер, трейлер, жанры, актёры) сохраняются в `data/movie_metadata_cache.json`. Они заполняют только пустые поля дубликатов. Torrent-атрибуты (`magnet`, формат, размер, сиды, URL темы, коллекция) не переносятся. IMDb считается сильным ключом; совпадение только по KP используется для объединения лишь при одинаковом нормализованном названии и годе.
 
 ## Парсинг rutracker
 
@@ -272,6 +275,7 @@ if imdb_id and re.search(r'/tt\d+', poster_url):
 Основные локальные данные:
 
 - `data/torrents_data.json` — каталог.
+- `data/movie_metadata_cache.json` — единые метаданные фильмов, используемые всеми их torrent-раздачами.
 - `data/posters/` — постеры.
 - `data/topic_cache/` — кеш тем.
 - `data/rutracker_pending_topics.json` — новые Atom-темы Rutracker, ожидающие magnet с detail-страницы.

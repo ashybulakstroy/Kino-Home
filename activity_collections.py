@@ -2,10 +2,12 @@ import re
 from datetime import datetime
 
 from config import DATA_DIR
+from movie_metadata_cache import sync_movie_metadata_cache
 from project_io import atomic_write_json_unlocked, file_lock
 
 
 CATALOG_FILE = DATA_DIR / 'torrents_data.json'
+MOVIE_METADATA_FILE = DATA_DIR / 'movie_metadata_cache.json'
 
 DISCOVERED_COLLECTION = 'discovered'
 WATCHED_COLLECTION = 'watched'
@@ -122,13 +124,16 @@ def normalize_activity_topic(source, collection):
 
 def upsert_activity_topic(source, collection):
     source_topic = dict(source or {})
-    key = activity_key(source_topic)
-    topic = normalize_activity_topic(source, collection)
-    if not key or not topic.get('magnet'):
+    if not source_topic.get('magnet'):
         return None
-    topic.pop('listing_order', None)
     with file_lock(CATALOG_FILE):
         catalog = _load_catalog()
+        sync_movie_metadata_cache(catalog + [source_topic], MOVIE_METADATA_FILE)
+        key = activity_key(source_topic)
+        topic = normalize_activity_topic(source_topic, collection)
+        if not key or not topic.get('magnet'):
+            return None
+        topic.pop('listing_order', None)
         kept = []
         for item in catalog:
             if not isinstance(item, dict):
@@ -138,6 +143,7 @@ def upsert_activity_topic(source, collection):
                 continue
             kept.append(item)
         kept.append(topic)
+        sync_movie_metadata_cache(kept, MOVIE_METADATA_FILE)
         atomic_write_json_unlocked(CATALOG_FILE, kept)
     return topic
 

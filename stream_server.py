@@ -897,10 +897,17 @@ def _enrich_worker():
                         _enrich_status[topic_id] = 'error: not found'
                     continue
                 gp.enrich_topic(topic, force_poster_retry=True)
+                metadata_stats = gp.sync_movie_metadata_cache(topics)
                 atomic_write_json_unlocked(data_path, topics)
                 gen_path = DATA_DIR / 'index-kino.html'
                 html = _generate_display_html(topics)
                 atomic_write_text(gen_path, html)
+                if metadata_stats['topics_updated']:
+                    print(
+                        f"  [enrich] кеш фильмов распространил "
+                        f"{metadata_stats['fields_applied']} полей на "
+                        f"{metadata_stats['topics_updated']} тем"
+                    )
             with _enrich_lock:
                 _enrich_status[topic_id] = 'done'
         except Exception as e:
@@ -1109,6 +1116,14 @@ def _enrich_missing(force: bool = False):
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
             changed = True
+        metadata_stats = gp.sync_movie_metadata_cache(topics)
+        if metadata_stats['topics_updated']:
+            changed = True
+            print(
+                f"  [enrich] кеш фильмов: заполнено "
+                f"{metadata_stats['fields_applied']} полей у "
+                f"{metadata_stats['topics_updated']} тем"
+            )
 
         tasks = []
         hidden_ids = gp.load_hidden_topic_ids()
@@ -1200,6 +1215,15 @@ def _enrich_missing(force: bool = False):
                         title = topic_log_title(failed_topic)
                         result = f'FAILURE (ошибка: {e})'
                     print(f'    [enrich] #{topic_id} {title} -> {result}')
+
+        metadata_stats = gp.sync_movie_metadata_cache(topics)
+        if metadata_stats['topics_updated']:
+            changed = True
+            print(
+                f"  [enrich] кеш фильмов распространил "
+                f"{metadata_stats['fields_applied']} полей на "
+                f"{metadata_stats['topics_updated']} тем"
+            )
 
         completeness_after = _enrich_completeness(topics, hidden_ids)
         completeness_delta = completeness_after - completeness_before
@@ -1345,6 +1369,27 @@ def _run_daily_world_trailer_recheck_if_due(reason: str = 'timer'):
             for t in audit_topics
         }
         changed = before != after
+        changed_trailer_topics = [
+            topic for topic in audit_topics
+            if before.get(str(topic.get('topic_id')), (None,))[0]
+            != topic.get('youtube_url')
+        ]
+        for topic in changed_trailer_topics:
+            if topic.get('youtube_url'):
+                gp.sync_movie_metadata_cache(
+                    [topic],
+                    replace_fields=('youtube_url',),
+                )
+            else:
+                gp.invalidate_cached_movie_metadata(topic, ('youtube_url',))
+        metadata_stats = gp.sync_movie_metadata_cache(topics)
+        if metadata_stats['topics_updated']:
+            changed = True
+            print(
+                f"  [trailers] кеш фильмов заполнил "
+                f"{metadata_stats['fields_applied']} полей у "
+                f"{metadata_stats['topics_updated']} тем"
+            )
         if changed:
             with file_lock(data_path):
                 atomic_write_json_unlocked(data_path, topics)
@@ -2224,8 +2269,11 @@ def index():
         "function rc(){sf();localStorage.removeItem('gv');"
         "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();"
         "var c=document.getElementById('cs'),v=c?c.value:'';"
-        "if(!v){window.location.href='/?r=';return}"
-        "function reloadFresh(){window.location.href='/?r='}"
+        "function playerActive(){var o=document.getElementById('player-overlay');"
+        "return(typeof currentSession!=='undefined'&&!!currentSession)||"
+        "(typeof currentHash!=='undefined'&&!!currentHash)||(o&&!o.classList.contains('hidden'))}"
+        "function reloadFresh(){if(playerActive())return false;window.location.href='/?r=';return true}"
+        "if(!v){reloadFresh();return}"
         "function finish(d){if(d.status==='done'&&d.changed)reloadFresh()}"
         "function poll(n){fetch('/refresh_light/status?collection='+encodeURIComponent(v))"
         ".then(function(r){return r.json()}).then(function(d){"
@@ -2255,18 +2303,17 @@ def index():
         "<script>(function(){"
         f"var KG_CATALOG_VERSION={json.dumps(etag_val)};"
         f"var KG_ACTIVITY_COLLECTIONS={json.dumps(list(gp.ACTIVITY_COLLECTIONS.keys()))};"
-        "var checking=false,lastCheck=0,pendingVersion='';"
+        "var checking=false,lastCheck=0;"
         "function selectedActivity(){var s=document.getElementById('cs'),v=s?s.value:'';return KG_ACTIVITY_COLLECTIONS.indexOf(v)!==-1}"
         "function playerActive(){var o=document.getElementById('player-overlay');"
         "return (typeof currentSession!=='undefined'&&!!currentSession)||"
         "(typeof currentHash!=='undefined'&&!!currentHash)||(o&&!o.classList.contains('hidden'))}"
-        "function reloadFresh(version){if(playerActive()){pendingVersion=version||pendingVersion||'1';return false}"
+        "function reloadFresh(version){if(playerActive())return false;"
         "window.location.href='/?r=';return true}"
         "function checkFresh(force){var now=Date.now();if(checking||(!force&&now-lastCheck<5000))return;checking=true;lastCheck=now;"
         "fetch('/catalog_version',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
         "if(d&&d.version&&d.version!==KG_CATALOG_VERSION)reloadFresh(d.version)"
         "}).catch(function(){}).finally(function(){checking=false})}"
-        "window.kgApplyPendingCatalog=function(){if(pendingVersion&&!playerActive())reloadFresh(pendingVersion)};"
         "window.kgCheckCatalogFresh=checkFresh;"
         "window.addEventListener('focus',function(){checkFresh(false)});"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)checkFresh(false)});"

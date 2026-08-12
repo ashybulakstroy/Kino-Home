@@ -117,11 +117,14 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
     if topic.get('_sanitized') or topic.get('imdb_id') == '0':
         return topic
 
+    gp.apply_cached_movie_metadata(topic)
+
     title = topic.get('orig_title') or topic.get('movie_title') or ''
     russian_title = topic.get('movie_title') or title
     raw_name = topic.get('title') or title
     year = topic.get('movie_year') or ''
     if not title:
+        gp.sync_movie_metadata_cache([topic])
         return topic
 
     is_world = gp.is_world_topic(topic)
@@ -286,6 +289,7 @@ def enrich_topic(topic, force_poster_retry=False, include_trailer=True):
             youtube_cache[cache_key] = trailer_url
             gp.save_json(gp.YOUTUBE_CACHE, youtube_cache)
 
+    gp.sync_movie_metadata_cache([topic])
     return topic
 
 

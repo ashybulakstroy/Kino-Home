@@ -102,6 +102,7 @@ data/posters/placeholder.png
 
 - `generate_page.py` - парсинг источников и генерация `index-kino.html`.
 - `enrich_service.py` - заполнение отсутствующих атрибутов без изменения уже заполненных данных.
+- `movie_metadata_cache.py` - единый кеш рейтингов, постеров, трейлеров и ID фильма для разных torrent-раздач.
 - `stream_server.py` - Flask-сервер, каталог, browse-страницы, авто-refresh, housekeeping, стриминг.
 - `engine.py` - libtorrent-движок, выбор видеофайла, приоритеты кусков, readahead.
 - `player.html` - страница плеера.
@@ -124,6 +125,7 @@ data/posters/placeholder.png
 - `data/imdb/` - локальные IMDB справочники `title.ratings.tsv.gz` и `title.basics.tsv.gz`; если ID не найден в старом файле, скачивается свежий файл и становится основным.
 - `data/staging_refresh/` - временные данные refresh.
 - `data/torrents_data.json` - основной каталог.
+- `data/movie_metadata_cache.json` - общие метаданные фильмов; magnet, формат, размер и сиды остаются атрибутами конкретной раздачи.
 - `data/topics_archive.json` - архив удаленных старых тем.
 - `data/last_refresh_date.txt` - дата последнего успешного авто-refresh.
 - `data/index-kino.html` - сгенерированная HTML-страница.

@@ -1129,6 +1129,7 @@ def _enrich_discover_item(data, record=True):
                 result['activity_error'] = str(e)
         return result
     topic = _make_discover_topic(data)
+    gp.apply_cached_movie_metadata(topic)
     before = _topic_card_payload(topic, 'До обогащения', 'Discover')
     result = {'topic_id': topic.get('topic_id'), 'status': 'enriching'}
     if _has_real_topic_url(topic) and 'rutracker.net/forum/viewtopic.php' in topic.get('topic_url', ''):
@@ -1149,6 +1150,7 @@ def _enrich_discover_item(data, record=True):
     _restore_input_video_fields(topic, data)
     _fill_video_fields_from_topic_page(topic)
     _ensure_discover_poster(topic)
+    gp.sync_movie_metadata_cache([topic])
     payload = _topic_card_payload(topic, 'Обогащён', 'Discover')
     best_after = _find_best_discover_match(payload)
     if best_after:

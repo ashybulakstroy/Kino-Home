@@ -22,6 +22,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from config import IMDB_DATASET_MAX_AGE_DAYS, LISTING_CACHE_MAX_AGE_DAYS, WORKER_COUNT
+from movie_metadata_cache import (
+    apply_cached_movie_metadata as _apply_cached_movie_metadata,
+    invalidate_cached_movie_metadata as _invalidate_cached_movie_metadata,
+    sync_movie_metadata_cache as _sync_movie_metadata_cache,
+)
 from project_io import atomic_write_json, atomic_write_text, file_lock
 from world_sources import (
     deduplicate_world_topics,
@@ -208,6 +213,7 @@ IMDB_TRAILER_CACHE = os.path.join(DATA_DIR, "imdb_trailer_cache.json")
 WORLD_TITLE_IDENTITY_CACHE = os.path.join(DATA_DIR, "world_title_identity_cache.json")
 OUTPUT_FILE = os.path.join(DATA_DIR, "index-kino.html")
 TORRENTS_CACHE = os.path.join(DATA_DIR, "torrents_data.json")
+MOVIE_METADATA_CACHE = os.path.join(DATA_DIR, "movie_metadata_cache.json")
 RUTRACKER_PENDING_TOPICS = os.path.join(DATA_DIR, "rutracker_pending_topics.json")
 HIDDEN_TOPICS_FILE = os.path.join(DATA_DIR, "hidden_topics.json")
 FORBIDDEN_TOPICS_CACHE = os.path.join(DATA_DIR, "forbidden_topics_cache.json")
@@ -564,6 +570,30 @@ def load_json(path):
 
 def save_json(path, data):
     atomic_write_json(path, data)
+
+
+def apply_cached_movie_metadata(topic, replace_fields=()):
+    return _apply_cached_movie_metadata(
+        topic,
+        MOVIE_METADATA_CACHE,
+        replace_fields=replace_fields,
+    )
+
+
+def sync_movie_metadata_cache(topics, replace_fields=()):
+    return _sync_movie_metadata_cache(
+        topics,
+        MOVIE_METADATA_CACHE,
+        replace_fields=replace_fields,
+    )
+
+
+def invalidate_cached_movie_metadata(topic, fields):
+    return _invalidate_cached_movie_metadata(
+        topic,
+        MOVIE_METADATA_CACHE,
+        fields,
+    )
 
 
 _PENDING_LISTING_FIELDS = (
@@ -4118,7 +4148,7 @@ document.querySelectorAll('th .ar').forEach(function(e){{e.textContent=''}});doc
 function td(el){{var r=el.closest('td').querySelector('.dtc');if(!r)return;var on=r.style.display!=='none';if(on){{r.style.display='none';el.textContent='+';return}};r.querySelectorAll('img[data-src]').forEach(function(img){{img.src=img.getAttribute('data-src');img.removeAttribute('data-src')}});r.style.display='';el.textContent='−'}}
 function pt(el){{var u=el.getAttribute('data-yt');if(!u)return;window.open(u,'tr','width=960,height=540,menubar=no,toolbar=no,location=no')}}
 function sf(){{var d=document.getElementById('ds'),c=document.getElementById('cs'),s=document.getElementById('ss'),f=document.getElementById('fs');if(d)localStorage.setItem('dv',d.value);if(c)localStorage.setItem('cv',c.value);if(s)localStorage.setItem('sv',s.value);if(f)localStorage.setItem('fv',f.value)}}
-function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';if(!v){{window.location.href='/?r=';return}}function reloadFresh(){{window.location.href='/?r='}}function finish(d){{if(d.status==='done'&&d.changed)reloadFresh()}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running'&&n<150)setTimeout(function(){{poll(n+1)}},2000)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
+function rc(){{sf();localStorage.removeItem('gv');if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();var c=document.getElementById('cs'),v=c?c.value:'';function playerActive(){{var o=document.getElementById('player-overlay');return(typeof currentSession!=='undefined'&&!!currentSession)||(typeof currentHash!=='undefined'&&!!currentHash)||(o&&!o.classList.contains('hidden'))}}function reloadFresh(){{if(playerActive())return false;window.location.href='/?r=';return true}}if(!v){{reloadFresh();return}}function finish(d){{if(d.status==='done'&&d.changed)reloadFresh()}}function poll(n){{fetch('/refresh_light/status?collection='+encodeURIComponent(v)).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running'&&n<150)setTimeout(function(){{poll(n+1)}},2000)}}).catch(function(){{}})}}fetch('/refresh_light?collection='+encodeURIComponent(v),{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(d){{if(d.status==='done')finish(d);else if(d.status==='running')poll(0)}}).catch(function(){{}})}}
 function hm(el){{sf();var tr=el.closest('tr'),tid=tr.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function htm(el){{sf();var card=el.closest('.tile-card'),tid=card.getAttribute('data-tid');if(!tid)return;fetch('/hide/'+tid,{{method:'POST'}}).then(function(){{location.reload()}}).catch(function(){{location.reload()}})}}
 function hideSaved(sel){{var h=JSON.parse(localStorage.getItem('ph')||'[]');[].forEach.call(document.querySelectorAll(sel),function(r){{if(h.indexOf(r.getAttribute('data-title'))!==-1)r.style.display='none'}})}}
@@ -4153,7 +4183,7 @@ function stopCurrentSession(){{stopPlayerHeartbeat();if(!currentSession&&!curren
 function unmutePlayer(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}var p=document.getElementById('inline-player'),s=document.getElementById('player-status'),b=document.getElementById('sound-button');p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');if(b)b.textContent='Звук включён';s.textContent='Звук включён';p.play().catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска со звуком'}})}}
 function playPlayer(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}var p=document.getElementById('inline-player'),s=document.getElementById('player-status');p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(err){{s.textContent='Не удалось запустить: '+(err&&err.name?err.name:'ошибка')}})}}
 function useAacAudio(ev){{if(ev){{ev.preventDefault();ev.stopPropagation()}}if(!currentHash)return;var p=document.getElementById('inline-player'),s=document.getElementById('player-status'),b=document.getElementById('aac-button');if(p.dataset.mode==='aac')return;p.dataset.mode='aac';p.pause();p.muted=false;p.defaultMuted=false;p.removeAttribute('muted');p.src=streamUrl('transcode',currentHash);if(b)b.textContent='AAC включён';s.textContent='Запускаю совместимый AAC-звук...';p.play().catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска AAC-звука'}})}}
-function closePlayer(){{if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}var p=document.getElementById('inline-player');p.pause();p.removeAttribute('src');p.load();stopCurrentSession();document.getElementById('player-overlay').classList.add('hidden');if(typeof window.kgApplyPendingCatalog==='function')setTimeout(window.kgApplyPendingCatalog,100)}}
+function closePlayer(){{if(playerPoll){{clearInterval(playerPoll);playerPoll=null}}var p=document.getElementById('inline-player');p.pause();p.removeAttribute('src');p.load();stopCurrentSession();document.getElementById('player-overlay').classList.add('hidden')}}
 function startStream(p, h) {{p.dataset.mode='stream';p.muted=true;startPlayerHeartbeat(h);p.src=streamUrl('stream',h);p.play().then(function(){{}}).catch(function(){{document.getElementById('player-status').textContent='Нажмите ▶ в плеере для запуска'}})}}
 function startTranscode(p, h) {{var s=document.getElementById('player-status');s.textContent='Перекодирование видео в MP4...';p.dataset.mode='aac';p.muted=true;startPlayerHeartbeat(h);p.src=streamUrl('transcode',h);p.play().then(function(){{s.textContent='Воспроизведение запущено'}}).catch(function(){{s.textContent='Нажмите ▶ в плеере для запуска'}})}}
 function stalledText(d){{var elapsed=currentWatchStartedAt?Math.floor((Date.now()-currentWatchStartedAt)/1000):0;if(elapsed>=120&&!(d.downloaded||0))return'Торрент не грузится: за 2 минуты нет входящей загрузки. peers '+(d.num_peers||0);return ''}}
@@ -4456,6 +4486,13 @@ def main():
         if len(cleaned_topics) != len(topics):
             topics = cleaned_topics
             save_json(TORRENTS_CACHE, topics)
+        metadata_stats = sync_movie_metadata_cache(topics)
+        if metadata_stats['topics_updated']:
+            save_json(TORRENTS_CACHE, topics)
+            print(
+                f"  Кеш фильмов: заполнено {metadata_stats['fields_applied']} "
+                f"полей у {metadata_stats['topics_updated']} тем"
+            )
         changed = False
         for t in topics:
             if not t.get('_sanitized') and is_forbidden_topic(t):
@@ -4482,6 +4519,12 @@ def main():
             if t.get('listing_order') is None:
                 t['listing_order'] = i
         sync_forbidden_topic_cache(topics)
+        metadata_stats = sync_movie_metadata_cache(topics)
+        if metadata_stats['topics_updated']:
+            print(
+                f"  Кеш фильмов: заполнено {metadata_stats['fields_applied']} "
+                f"полей у {metadata_stats['topics_updated']} тем"
+            )
         original_topics_snapshot = json.loads(json.dumps(topics, ensure_ascii=False))
         all_new_topics: list[dict] = []
         pending_topics = load_rutracker_pending_topics()
@@ -4620,6 +4663,8 @@ def main():
                     if matches_forbidden_topic_cache(t, forbidden_keys):
                         sanitize_topic(t)
                         print(f"  {t.get('movie_title','')}: скрыто по кешу запрещённых")
+                    else:
+                        apply_cached_movie_metadata(t)
                     new_current.append(t)
             new_enrich_current = new_current
 
@@ -4902,6 +4947,13 @@ def main():
     print("\nВосстановление названий world-тем...")
     repair_world_titles(topics)
     topics = clean_catalog_topics(topics)
+    metadata_stats = sync_movie_metadata_cache(topics)
+    if metadata_stats['topics_updated']:
+        print(
+            f"\nКеш фильмов: заполнено {metadata_stats['fields_applied']} "
+            f"полей у {metadata_stats['topics_updated']} тем; "
+            f"записей {metadata_stats['records']}"
+        )
     save_json(TORRENTS_CACHE, topics)
 
     hidden_ids = load_hidden_topic_ids()
