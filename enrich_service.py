@@ -700,6 +700,172 @@ def search_topic_trailer_fallback(session, topic):
     return None
 
 
+VIDEO_FALLBACK_INTENTS = (
+    (
+        "full-movie",
+        ("full movie", "complete movie", "полный фильм", "фильм полностью"),
+    ),
+    (
+        "fragment",
+        ("fragment", "clip", "scene", "фрагмент", "отрывок"),
+    ),
+    (
+        "episode",
+        ("episode", "season", "серия", "сезон"),
+    ),
+)
+VIDEO_FALLBACK_NEGATIVE_WORDS = (
+    "review", "reaction", "explained", "ending", "soundtrack", "song",
+    "interview", "behind the scenes", "gameplay", "walkthrough",
+    "обзор", "реакция", "разбор", "концовка", "саундтрек", "песня",
+    "интервью", "со съемок", "игра", "прохождение",
+)
+
+
+def score_video_fallback_candidate(candidate, title_variants, year):
+    """Return (score, kind) for a verified non-trailer movie video."""
+    candidate_title = _trailer_compact(candidate.get("title"))
+    candidate_latin = _trailer_latin(candidate_title)
+    if (
+        not candidate_title
+        or any(word in candidate_title for word in VIDEO_FALLBACK_NEGATIVE_WORDS)
+    ):
+        return 0, ""
+
+    kind = ""
+    intent_score = 0
+    for index, (candidate_kind, words) in enumerate(VIDEO_FALLBACK_INTENTS):
+        if any(word in candidate_title for word in words):
+            kind = candidate_kind
+            intent_score = (35, 24, 16)[index]
+            break
+    generic_movie_intent = bool(
+        {"film", "movie", "фильм"} & set(candidate_title.split())
+    )
+    if not kind and generic_movie_intent:
+        kind = "full-movie"
+        intent_score = 22
+    if not kind:
+        return 0, ""
+
+    candidate_tokens = _trailer_identity_tokens(candidate_title)
+    best_identity = 0
+    best_tokens = set()
+    exact_phrase = False
+    for variant in title_variants:
+        variant_latin = _trailer_latin(variant)
+        variant_tokens = _trailer_identity_tokens(variant)
+        if not variant_latin or not variant_tokens:
+            continue
+        phrase_match = variant_latin in candidate_latin
+        overlap = len(variant_tokens & candidate_tokens) / max(len(variant_tokens), 1)
+        identity = (65 if phrase_match else 0) + int(overlap * 45)
+        identity += int(
+            SequenceMatcher(None, variant_latin, candidate_latin).ratio() * 15
+        )
+        if identity > best_identity:
+            best_identity = identity
+            best_tokens = variant_tokens
+            exact_phrase = phrase_match
+    if best_identity < 55:
+        return 0, ""
+
+    candidate_years = {
+        int(value)
+        for value in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", candidate_title)
+    }
+    try:
+        wanted_year = int(year or 0)
+    except (TypeError, ValueError):
+        wanted_year = 0
+    if wanted_year and candidate_years:
+        distance = min(abs(value - wanted_year) for value in candidate_years)
+        if distance > 1:
+            return 0, ""
+        year_score = 15 if distance == 0 else -5
+    else:
+        year_score = 0
+
+    if generic_movie_intent and (
+        not wanted_year
+        or wanted_year not in candidate_years
+        or not exact_phrase
+    ):
+        return 0, ""
+
+    if len(best_tokens) == 1 and not exact_phrase:
+        return 0, ""
+    if len(best_tokens) == 1 and wanted_year and wanted_year not in candidate_years:
+        return 0, ""
+    return best_identity + intent_score + year_score, kind
+
+
+def search_topic_video_fallback(session, topic):
+    """Find a full movie, fragment, or episode when no trailer exists."""
+    variants = trailer_title_variants(topic)
+    if not variants:
+        return None
+    year = topic.get("movie_year") or topic.get("year") or ""
+    query_suffixes = (
+        ("full-movie", "полный фильм", "full movie"),
+        ("fragment", "фрагмент отрывок", "clip scene"),
+        ("episode", "серия сезон", "episode season"),
+    )
+
+    for wanted_kind, ru_suffix, en_suffix in query_suffixes:
+        ranked = {}
+        for variant in variants[:2]:
+            suffix = ru_suffix if re.search(r"[а-яё]", variant, flags=re.I) else en_suffix
+            query = f'"{variant}" {year} {suffix}'
+            try:
+                response = session.get(
+                    "https://www.youtube.com/results?search_query="
+                    + urllib.parse.quote(query),
+                    timeout=10,
+                )
+                if response.status_code != 200:
+                    continue
+            except Exception:
+                continue
+            for candidate in _trailer_youtube_candidates(response.text):
+                score, kind = score_video_fallback_candidate(
+                    candidate,
+                    variants,
+                    year,
+                )
+                if kind != wanted_kind:
+                    continue
+                video_id = candidate["video_id"]
+                if score > ranked.get(video_id, {}).get("score", 0):
+                    ranked[video_id] = {**candidate, "score": score, "kind": kind}
+
+        for candidate in sorted(
+            ranked.values(),
+            key=lambda item: item["score"],
+            reverse=True,
+        )[:3]:
+            if candidate["score"] < 90:
+                continue
+            video_url = f'https://www.youtube.com/watch?v={candidate["video_id"]}'
+            try:
+                metadata = _trailer_oembed(session, video_url)
+            except Exception:
+                continue
+            if not metadata:
+                continue
+            verified_score, verified_kind = score_video_fallback_candidate(
+                {
+                    "title": metadata.get("title", ""),
+                    "channel": metadata.get("author_name", ""),
+                },
+                variants,
+                year,
+            )
+            if verified_kind == wanted_kind and verified_score >= 85:
+                return {"url": video_url, "kind": wanted_kind}
+    return None
+
+
 # Kinopoisk ID fallback
 
 KINOPOISK_SPARQL_URL = "https://query.wikidata.org/sparql"

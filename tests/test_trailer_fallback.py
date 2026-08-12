@@ -1,6 +1,10 @@
 import unittest
 
-from enrich_service import score_trailer_candidate, trailer_title_variants
+from enrich_service import (
+    score_trailer_candidate,
+    score_video_fallback_candidate,
+    trailer_title_variants,
+)
 
 
 class TrailerFallbackTests(unittest.TestCase):
@@ -107,6 +111,63 @@ class TrailerFallbackTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(score, 85)
+
+    def test_accepts_matching_full_movie_fallback(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Русский треугольник (2007) полный фильм"},
+            ["Русский треугольник", "Rusuli samkudhedi"],
+            2007,
+        )
+
+        self.assertEqual(kind, "full-movie")
+        self.assertGreaterEqual(score, 90)
+
+    def test_accepts_generic_film_label_with_exact_title_and_year(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Русский треугольник (2007) фильм"},
+            ["Русский треугольник", "Rusuli samkudhedi"],
+            2007,
+        )
+
+        self.assertEqual(kind, "full-movie")
+        self.assertGreaterEqual(score, 90)
+
+    def test_rejects_generic_film_label_without_year(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Доверие - фильм"},
+            ["Доверие"],
+            1975,
+        )
+
+        self.assertEqual((score, kind), (0, ""))
+
+    def test_accepts_matching_fragment_fallback(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Мустафа Шокай (2008) - фрагмент фильма"},
+            ["Мустафа Шокай", "Mustafa Shokai"],
+            2008,
+        )
+
+        self.assertEqual(kind, "fragment")
+        self.assertGreaterEqual(score, 90)
+
+    def test_rejects_full_movie_with_wrong_year(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Доверие (2016) полный фильм"},
+            ["Доверие"],
+            1975,
+        )
+
+        self.assertEqual((score, kind), (0, ""))
+
+    def test_rejects_review_as_video_fallback(self):
+        score, kind = score_video_fallback_candidate(
+            {"title": "Сваты (2008) полный фильм обзор"},
+            ["Сваты"],
+            2008,
+        )
+
+        self.assertEqual((score, kind), (0, ""))
 
 
 if __name__ == "__main__":

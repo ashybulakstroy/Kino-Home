@@ -40,6 +40,7 @@ from activity_collections import ACTIVITY_COLLECTIONS
 from enrich_service import (
     find_kinopoisk_id_fallback,
     search_topic_trailer_fallback,
+    search_topic_video_fallback,
 )
 
 COLLECTIONS = {
@@ -1803,7 +1804,18 @@ def resolve_topic_trailer_url(topic):
             f"    [trailer-fallback] #{topic.get('topic_id')} "
             f"{topic.get('movie_title') or title} -> {fallback_url}"
         )
-    return fallback_url
+        return fallback_url
+
+    video_fallback = search_topic_video_fallback(SESSION, topic)
+    if video_fallback:
+        topic['_trailer_source'] = f"youtube-{video_fallback['kind']}-fallback"
+        print(
+            f"    [video-fallback:{video_fallback['kind']}] "
+            f"#{topic.get('topic_id')} {topic.get('movie_title') or title} "
+            f"-> {video_fallback['url']}"
+        )
+        return video_fallback['url']
+    return None
 
 
 def download_poster(imdb_id, url):
