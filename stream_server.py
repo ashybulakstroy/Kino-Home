@@ -28,7 +28,7 @@ from activity_collections import record_watched_magnet
 
 
 _LOG_FILE: TextIO | None = None
-INDEX_INJECT_VERSION = 'v13'
+INDEX_INJECT_VERSION = 'v14'
 _KINO_BANNER = (
     '*   *  *****  *   *   ****',
     '*  *     *    **  *  *    *',
@@ -2312,7 +2312,7 @@ def index():
         html = html.replace(old_collection_reload, light_collection_reload, 1)
     refresh_btn = '' if PUBLIC_MODE else '<a class="rf" href="/refresh" title="Обновить данные" style="font-size:14px;margin-left:8px;text-decoration:none;cursor:pointer" onclick="var s=document.getElementById(\'cs\'),c=s?s.value:\'\';this.href=c?\'/refresh?collection=\'+encodeURIComponent(c):\'/refresh\'">🔄</a>'
     html = html.replace('</span>', f'{refresh_btn}</span>', 1)
-    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/discover">Найти фильм</a><a href="/browse/missing">Вне витрины</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
+    browse_links = '''<div class="bl"><a href="/test">Каталог</a><a href="/browse/carousel">Карусель</a><a href="/browse/random">Случайный</a><a href="/browse/filter">Фильтр</a><a href="/browse/timeline">Хронология</a><a href="/browse/shuffle">ТВ</a><a href="/browse/duel">Дуэль</a><a href="/browse/matrix">Матрица</a><a href="/browse/stats">Статистика</a><a href="/browse/search">Поиск</a><a href="/browse/discover">Найти фильм</a><a href="/?collection=discovered">Смотрел трейлеры</a><a href="/?collection=watched">Недавно смотрел</a><a href="/browse/top">Топ</a><a href="/browse/collections">Коллекции</a></div>\n'''
     if 'class="bl"' not in html:
         html = html.replace('<table id="tbl">', f'{browse_links}<table id="tbl">', 1)
     public_style = '.rmv,.eb{display:none!important}' if PUBLIC_MODE else ''
@@ -2323,6 +2323,10 @@ def index():
         f"var KG_CATALOG_VERSION={json.dumps(etag_val)};"
         f"var KG_ACTIVITY_COLLECTIONS={json.dumps(list(gp.ACTIVITY_COLLECTIONS.keys()))};"
         "var checking=false,lastCheck=0;"
+        "function applyRequestedCollection(){var p=new URLSearchParams(window.location.search),v=p.get('collection');"
+        "if(KG_ACTIVITY_COLLECTIONS.indexOf(v)===-1)return;var s=document.getElementById('cs');if(!s)return;"
+        "for(var i=0;i<s.options.length;i++){if(s.options[i].value===v){s.value=v;localStorage.setItem('cv',v);"
+        "if(typeof af==='function')af();if(typeof sortTiles==='function')sortTiles();break}}}"
         "function selectedActivity(){var s=document.getElementById('cs'),v=s?s.value:'';return KG_ACTIVITY_COLLECTIONS.indexOf(v)!==-1}"
         "function playerActive(){var o=document.getElementById('player-overlay');"
         "return (typeof currentSession!=='undefined'&&!!currentSession)||"
@@ -2337,6 +2341,7 @@ def index():
         "window.addEventListener('focus',function(){checkFresh(false)});"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)checkFresh(false)});"
         "document.addEventListener('change',function(e){if(e.target&&e.target.id==='cs'&&selectedActivity())checkFresh(true)},true);"
+        "if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',applyRequestedCollection);else applyRequestedCollection();"
         "})();</script>"
     )
     html = html.replace('</body>', f'{freshness_script}</body>', 1)
