@@ -255,15 +255,34 @@ REFRESH_FILES = [
     'imdb_ratings_cache.json',
     'imdb_search_cache.json',
     'kp_search_cache.json',
+    'kp_details_cache.json',
+    'kp_fallback_cache.json',
     'youtube_cache.json',
     'kinopoisk_trailer_cache.json',
     'imdb_trailer_cache.json',
+    'world_title_identity_cache.json',
+    'movie_metadata_cache.json',
+    'rutracker_pending_topics.json',
+    'piratebay_page.html',
+    'piratebay_hash.txt',
+    'tpbparty_page.html',
+    'tpbparty_hash.txt',
     'hidden_topics.json',
     'forbidden_topics_cache.json',
     'last_world_trailer_recheck_date.txt',
     'index-kino.html',
 ]
-REFRESH_DIRS = ['posters', 'topic_cache', 'imdb', 'world_listing_snapshot']
+REFRESH_INPUT_FILES = [
+    'kp_manual_ids.json',
+    'torrents_data_tpbparty.json',
+]
+REFRESH_DIRS = [
+    'posters',
+    'topic_cache',
+    'imdb',
+    'world_hash',
+    'world_listing_snapshot',
+]
 
 
 def load_display_topics():
@@ -376,7 +395,7 @@ def _copy_existing_refresh_data(staging_dir):
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
-    for name in REFRESH_FILES:
+    for name in dict.fromkeys(REFRESH_FILES + REFRESH_INPUT_FILES):
         src = DATA_DIR / name
         if src.exists():
             shutil.copy2(src, staging_dir / name)
