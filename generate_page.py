@@ -2355,13 +2355,13 @@ def is_cloudflare_challenge_response(response):
     )
 
 
-def parse_rutracker_atom_feed(xml_data, collection='nashe_kino', skip_topics=0):
+def parse_rutracker_atom_feed(xml_data, collection='nashe_kino'):
     """Parse Rutracker's public Atom feed into listing-compatible topics."""
     root = ET.fromstring(xml_data)
     namespace = {'atom': 'http://www.w3.org/2005/Atom'}
     topics = []
     entries = root.findall('atom:entry', namespace)
-    for entry in entries[skip_topics:]:
+    for entry in entries:
         title_node = entry.find('atom:title', namespace)
         id_node = entry.find('atom:id', namespace)
         updated_node = entry.find('atom:updated', namespace)
@@ -2416,14 +2416,13 @@ def parse_rutracker_atom_feed(xml_data, collection='nashe_kino', skip_topics=0):
     return topics
 
 
-def fetch_rutracker_atom_listing(forum_id, collection, skip_topics=0):
+def fetch_rutracker_atom_listing(forum_id, collection):
     url = RUTRACKER_ATOM_URL.format(forum_id=forum_id)
     response = SESSION.get(url, timeout=30)
     response.raise_for_status()
     return parse_rutracker_atom_feed(
         response.content,
         collection=collection,
-        skip_topics=skip_topics,
     )
 
 
@@ -3738,11 +3737,9 @@ def sync_listing_state_for_collection(
                 continue
 
     try:
-        skip = COLLECTIONS.get(collection, {}).get('skip_topics', 0)
         topics = fetch_rutracker_atom_listing(
             forum_id,
             collection,
-            skip_topics=skip,
         )
         if topics:
             print(
@@ -4385,10 +4382,10 @@ def load_collection_listing(collection, coll_info, topics_limit):
                 page_topics = fetch_rutracker_atom_listing(
                     forum_id,
                     collection,
-                    skip_topics=COLLECTIONS.get(collection, {}).get('skip_topics', 0),
                 )
                 if page_topics:
                     page1_ok = True
+                    listing_errors += 1
                     print(
                         f"HTML недоступен ({last_error}); "
                         f"Atom fallback: {len(page_topics)} тем, ",
@@ -4584,6 +4581,8 @@ def main():
                 t.get('_listing_source') == 'rutracker_atom'
                 for t in all_topics
             )
+            pending_added = 0
+            pending_count = 0
             pending_topics = remove_rutracker_pending_topics(
                 pending_topics,
                 existing_ids,
@@ -4748,15 +4747,28 @@ def main():
             save_json(TORRENTS_CACHE, topics)
             if critical_collection_error:
                 refresh_failed = True
+            listing_source = (
+                'atom' if atom_listing_active
+                else 'cache' if page1_used_cache
+                else source
+            )
+            collection_status = (
+                'failed' if critical_collection_error
+                else 'degraded' if atom_listing_active or page1_used_cache
+                else 'ok'
+            )
             collection_summaries.append({
                 'collection': collection,
-                'status': 'failed' if critical_collection_error else 'ok',
+                'status': collection_status,
+                'listing_source': listing_source,
                 'listing_errors': listing_errors,
                 'fresh': len(all_topics),
                 'new': len(new_current),
                 'magnet_ok': magnet_stats['ok'],
                 'magnet_failed': magnet_stats['failed'],
                 'page1_cache': page1_used_cache,
+                'pending': pending_count,
+                'pending_added': pending_added,
             })
 
         # Fetch IMDB IDs from PirateBay detail pages before title-based search
@@ -4979,10 +4991,15 @@ def main():
         print("\nИтог refresh по коллекциям:")
         for s in collection_summaries:
             cache_note = ", page1 cache" if s.get('page1_cache') else ""
+            source_note = f", source={s.get('listing_source', 'unknown')}"
+            pending_note = ""
+            if s.get('pending'):
+                pending_note = f", pending={s['pending']} (+{s.get('pending_added', 0)})"
             print(
                 f"  {s['collection']}: {s['status']}, "
                 f"listing errors={s['listing_errors']}, fresh={s['fresh']}, new={s['new']}, "
-                f"magnet ok={s['magnet_ok']}, magnet failed={s['magnet_failed']}{cache_note}"
+                f"magnet ok={s['magnet_ok']}, magnet failed={s['magnet_failed']}"
+                f"{source_note}{pending_note}{cache_note}"
             )
     if refresh_failed:
         if refresh:
